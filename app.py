@@ -49,10 +49,11 @@ ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "")
 HUBSPOT_OWNER_ID = os.environ.get("HUBSPOT_OWNER_ID", "")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8080")  # Your deployed URL
-NOTIFY_VIA = os.environ.get("NOTIFY_VIA", "email")  # "email", "slack", "teams", or comma-separated: "email,teams"
+NOTIFY_VIA = os.environ.get("NOTIFY_VIA", "email")  # "email" (per-organizer), "teams" (shared ops channel), or "email,teams" for both
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Teams Incoming Webhook (channel-level)
-TEAMS_NOTIFY_VIA_GRAPH = os.environ.get("TEAMS_NOTIFY_VIA_GRAPH", "false").lower() == "true"  # Use Graph API for 1:1 chat
+TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared ops channel for admin visibility
+BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@negevlabs.com (shared mailbox)
+BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
 
 # Track processed transcripts and pending approvals
 PROCESSED_FILE = "processed_transcripts.json"
@@ -479,7 +480,6 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
     # ── Teams (Incoming Webhook — posts to a channel) ──
     if "teams" in channels and TEAMS_WEBHOOK_URL:
         try:
-            # Adaptive Card format for Teams incoming webhook
             card_payload = {
                 "type": "message",
                 "attachments": [
@@ -500,7 +500,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
                                 },
                                 {
                                     "type": "TextBlock",
-                                    "text": f"Claude extracted action items and a follow-up email draft. Review, edit, or delete before they're created in HubSpot, Asana, and Outlook.",
+                                    "text": "Claude extracted action items and a follow-up email draft. Review, edit, or delete before they're created in HubSpot, Asana, and Outlook.",
                                     "wrap": True,
                                     "spacing": "small",
                                 },
@@ -530,62 +530,6 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
         except Exception as e:
             logger.warning(f"Teams webhook notification failed: {e}")
 
-    # ── Teams (Graph API — 1:1 chat message to organizer) ──
-    if "teams" in channels and TEAMS_NOTIFY_VIA_GRAPH and MS_GRAPH_CLIENT_ID:
-        try:
-            token = get_ms_graph_token()
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-            # Step 1: Create or get 1:1 chat with organizer
-            chat_payload = {
-                "chatType": "oneOnOne",
-                "members": [
-                    {
-                        "@odata.type": "#microsoft.graph.aadUserConversationMember",
-                        "roles": ["owner"],
-                        "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{organizer_email}')",
-                    }
-                ],
-            }
-
-            # For app-only: use /chats endpoint; for delegated: need current user too
-            if MS_GRAPH_REFRESH_TOKEN:
-                # Delegated flow — include the app user as second member
-                # The /me reference auto-resolves to the authenticated user
-                me_resp = requests.get(f"{MS_GRAPH_BASE}/me", headers=headers, timeout=10)
-                me_data = me_resp.json()
-                my_id = me_data.get("id", "")
-                chat_payload["members"].insert(0, {
-                    "@odata.type": "#microsoft.graph.aadUserConversationMember",
-                    "roles": ["owner"],
-                    "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{my_id}')",
-                })
-
-            chat_resp = requests.post(f"{MS_GRAPH_BASE}/chats", json=chat_payload,
-                                      headers=headers, timeout=15)
-            chat_resp.raise_for_status()
-            chat_id = chat_resp.json().get("id")
-
-            # Step 2: Send message to the chat
-            message_payload = {
-                "body": {
-                    "contentType": "html",
-                    "content": (
-                        f"<h3>📞 Meeting Processed: {meeting_title}</h3>"
-                        f"<p>Claude extracted action items and a follow-up email draft from your meeting.</p>"
-                        f"<p><b>Review, edit, or delete tasks before they're created:</b></p>"
-                        f'<p><a href="{review_url}">👉 Review & Approve Tasks</a></p>'
-                        f"<p><i>This link expires in 48 hours.</i></p>"
-                    ),
-                }
-            }
-            msg_resp = requests.post(f"{MS_GRAPH_BASE}/chats/{chat_id}/messages",
-                                     json=message_payload, headers=headers, timeout=15)
-            msg_resp.raise_for_status()
-            logger.info(f"Teams 1:1 chat message sent to {organizer_email}")
-        except Exception as e:
-            logger.warning(f"Teams Graph chat notification failed: {e}")
-
     # ── Email (via Outlook / Graph API) ──
     if "email" in channels and MS_GRAPH_CLIENT_ID:
         try:
@@ -597,23 +541,28 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
                     "body": {
                         "contentType": "HTML",
                         "content": (
-                            f"<h3>Meeting processed: {meeting_title}</h3>"
-                            f"<p>Claude extracted action items and drafted a follow-up email from your meeting.</p>"
-                            f"<p><strong>Review, edit, or delete before they're created:</strong></p>"
+                            f"<h3>📞 Meeting processed: {meeting_title}</h3>"
+                            f"<p>Hi! I've extracted action items and drafted a follow-up email from your meeting.</p>"
+                            f"<p><strong>Review, edit, or delete before they're created in HubSpot, Asana, and Outlook:</strong></p>"
                             f'<p><a href="{review_url}" style="background:#2563eb;color:white;padding:12px 24px;'
                             f'text-decoration:none;border-radius:6px;font-weight:bold;">Review & Approve Tasks</a></p>'
-                            f"<p style='color:#666;font-size:12px;'>This link expires in 48 hours.</p>"
+                            f"<p style='color:#666;font-size:12px;'>— {BOT_SENDER_NAME}</p>"
                         ),
                     },
                     "toRecipients": [{"emailAddress": {"address": organizer_email}}],
                 },
             }
+            # Send from Sara's shared mailbox if configured
+            if BOT_SENDER_EMAIL:
+                send_payload["message"]["from"] = {
+                    "emailAddress": {"name": BOT_SENDER_NAME, "address": BOT_SENDER_EMAIL}
+                }
             if MS_GRAPH_REFRESH_TOKEN:
                 url = f"{MS_GRAPH_BASE}/me/sendMail"
             else:
-                url = f"{MS_GRAPH_BASE}/users/{organizer_email}/sendMail"
+                url = f"{MS_GRAPH_BASE}/users/{BOT_SENDER_EMAIL or organizer_email}/sendMail"
             requests.post(url, json=send_payload, headers=headers, timeout=15)
-            logger.info(f"Email notification sent to {organizer_email}")
+            logger.info(f"Email notification sent to {organizer_email} from {BOT_SENDER_EMAIL or 'self'}")
         except Exception as e:
             logger.warning(f"Email notification failed: {e}")
 
@@ -726,11 +675,13 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
         # Asana task
         try:
             notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {item.get('due_context', 'TBD')}"
-            # Look up Asana user by owner email
+            # Look up Asana user by owner email, fallback to organizer
             assignee_gid = None
             owner_email = item.get("owner_email", "")
             if owner_email:
                 assignee_gid = find_asana_user_by_email(owner_email)
+            if not assignee_gid and organizer_email:
+                assignee_gid = find_asana_user_by_email(organizer_email)
             create_asana_task(item["task"], notes, due_date, assignee_gid)
             results["actions"].append(f"✅ Asana task: {item['task'][:60]}")
         except Exception as e:
