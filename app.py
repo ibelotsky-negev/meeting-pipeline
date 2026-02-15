@@ -58,12 +58,23 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared ops channel for admin visibility
 BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@negevlabs.com (shared mailbox)
 BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
-# HubSpot owner map: JSON string mapping email → owner ID, e.g. {"bk@negevlabs.com":"241153249","sr@negevlabs.com":"241153250"}
-HUBSPOT_OWNER_MAP_RAW = os.environ.get("HUBSPOT_OWNER_MAP", "{}")
-try:
-    HUBSPOT_OWNER_MAP = json.loads(HUBSPOT_OWNER_MAP_RAW)
-except (json.JSONDecodeError, TypeError):
-    HUBSPOT_OWNER_MAP = {}
+# HubSpot owner map: maps organizer email → HubSpot owner ID
+# Supports two formats:
+#   JSON:   {"bk@negevlabs.com":"241153249","shlomi@negevlabs.com":"241153250"}
+#   Simple: bk@negevlabs.com:241153249,shlomi@negevlabs.com:241153250,dan@negevlabs.com:31299775
+HUBSPOT_OWNER_MAP_RAW = os.environ.get("HUBSPOT_OWNER_MAP", "")
+HUBSPOT_OWNER_MAP = {}
+if HUBSPOT_OWNER_MAP_RAW:
+    try:
+        HUBSPOT_OWNER_MAP = json.loads(HUBSPOT_OWNER_MAP_RAW)
+    except (json.JSONDecodeError, TypeError):
+        # Parse simple format: email:id,email:id
+        for pair in HUBSPOT_OWNER_MAP_RAW.split(","):
+            pair = pair.strip()
+            if ":" in pair:
+                email, owner_id = pair.rsplit(":", 1)
+                HUBSPOT_OWNER_MAP[email.strip()] = owner_id.strip()
+    logger.info(f"Parsed HUBSPOT_OWNER_MAP: {HUBSPOT_OWNER_MAP}")
 
 # Track processed transcripts and pending approvals
 PROCESSED_FILE = "processed_transcripts.json"
@@ -1114,6 +1125,7 @@ def config_check():
         "graph_client_id_set": bool(MS_GRAPH_CLIENT_ID),
         "graph_tenant_id_set": bool(MS_GRAPH_TENANT_ID),
         "bot_sender": BOT_SENDER_EMAIL or "(not set)",
+        "hubspot_owner_map_raw": HUBSPOT_OWNER_MAP_RAW[:200] if HUBSPOT_OWNER_MAP_RAW else "(empty)",
         "hubspot_owner_map_entries": len(HUBSPOT_OWNER_MAP),
         "hubspot_owner_map_emails": list(HUBSPOT_OWNER_MAP.keys()),
         "hubspot_fallback_owner": HUBSPOT_OWNER_ID or "(not set)",
