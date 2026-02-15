@@ -631,8 +631,9 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
                 f'{insights_section}'
                 # CTA Button
                 '<div style="padding:28px;text-align:center;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
-                f'<a href="{review_url}" style="display:inline-block;background:#2563eb;color:white;padding:14px 36px;text-decoration:none;border-radius:8px;font-weight:600;font-size:15px;">Review &amp; Approve Tasks</a>'
-                '<div style="margin-top:12px;font-size:12px;color:#94a3b8;">Review, edit, or delete items before they are created in HubSpot, Asana, and Outlook</div>'
+                f'<p style="margin:0 0 16px 0;"><a href="{review_url}">✅ Review &amp; Approve Tasks</a></p>'
+                f'<p style="margin:0;font-size:13px;color:#64748b;">{review_url}</p>'
+                '<p style="margin:8px 0 0 0;font-size:12px;color:#94a3b8;">Review, edit, or delete items before they are created in HubSpot, Asana, and Outlook</p>'
                 '</div>'
                 # Footer
                 '<div style="background:#f1f5f9;padding:16px 28px;border-radius:0 0 12px 12px;border:1px solid #e2e8f0;border-top:none;">'
