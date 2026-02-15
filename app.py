@@ -158,10 +158,27 @@ def extract_meeting_intelligence(transcript: dict) -> dict:
     summary = transcript.get("summary", {})
     sentences = transcript.get("sentences", [])
     transcript_text = "\n".join(
-        [f"{s.get('speaker_name', 'Unknown')}: {s.get('text', '')}" for s in sentences[:200]]
+        [f"{s.get('speaker_name', 'Unknown')}: {s.get('text', '')}" for s in sentences]
     )
 
-    prompt = f"""Analyze this meeting transcript and extract structured intelligence.
+    # Business context — loaded from file if available, else env var, else default
+    business_context = ""
+    context_file = os.environ.get("BUSINESS_CONTEXT_FILE", "business_context.md")
+    if os.path.exists(context_file):
+        with open(context_file, "r") as f:
+            business_context = f.read()
+        logger.info(f"Loaded business context from {context_file} ({len(business_context)} chars)")
+    elif os.environ.get("BUSINESS_CONTEXT"):
+        business_context = os.environ["BUSINESS_CONTEXT"]
+    else:
+        business_context = "No specific business context provided. Extract general meeting intelligence."
+
+    prompt = f"""You are an expert biotech venture capital analyst and chief of staff.
+
+BUSINESS CONTEXT:
+{business_context}
+
+Analyze this meeting transcript and extract structured intelligence.
 
 MEETING INFO:
 - Title: {transcript.get('title', 'Unknown')}
@@ -174,7 +191,7 @@ SUMMARY: {summary.get('short_summary', 'No summary available')}
 ACTION ITEMS (from Fireflies): {summary.get('action_items', 'None extracted')}
 KEY TOPICS: {summary.get('overview', '')}
 
-TRANSCRIPT (first ~200 sentences):
+FULL TRANSCRIPT:
 {transcript_text}
 
 ---
@@ -222,6 +239,11 @@ Return a JSON object with exactly this structure:
 }}
 
 RULES:
+- Use the BUSINESS CONTEXT above to understand what matters in this meeting and extract high-value action items
+- Distinguish internal team members (@negevlabs.com, @ariadnebio.com, etc.) from external contacts
+- For investor/BD meetings: capture interest signals, objections, and next steps that matter for deal flow
+- For portfolio company meetings: capture strategic decisions, blockers, and deliverables
+- Action items should be specific, actionable, and reflect what was actually committed to in the conversation — not generic tasks
 - The follow-up email is FROM the organizer TO the other meeting participants (NOT to the organizer themselves)
 - to_recipients must NEVER include the organizer ({transcript.get('organizer_email', '')}). The email is sent BY the organizer, not TO them.
 - to_recipients should include the key external participants identified from the transcript speakers and discussion
@@ -238,7 +260,7 @@ RULES:
 
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=4000,
+        max_tokens=8000,
         messages=[{"role": "user", "content": prompt}],
     )
     response_text = message.content[0].text.strip()
