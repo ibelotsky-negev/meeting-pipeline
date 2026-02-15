@@ -479,27 +479,71 @@ def find_asana_user_by_email(email: str) -> Optional[str]:
 #  NOTIFICATION — Alert organizer to review
 # ═══════════════════════════════════════════════════════════════════════════
 
-def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str):
-    """Send organizer a link to review and approve tasks + email draft.
+def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str, intelligence: dict = None):
+    """Send organizer a rich notification with meeting intelligence summary.
     Supports multiple channels: email, slack, teams (comma-separated in NOTIFY_VIA)."""
     review_url = f"{APP_BASE_URL}/review/{approval_id}"
     channels = [c.strip().lower() for c in NOTIFY_VIA.split(",")]
+
+    # ── Extract display data from intelligence ──
+    intel = intelligence or {}
+    summary = intel.get("meeting_summary", "Meeting processed — review details below.")
+    meeting_type = intel.get("meeting_type", "Meeting")
+    action_items = intel.get("action_items", [])
+    contacts = intel.get("contacts", [])
+    email_draft = intel.get("follow_up_email", {})
+    key_insights = intel.get("key_insights", [])
+
+    # Clean meeting title: use Claude's extraction or trim raw Fireflies filename
+    clean_title = meeting_title
+    if len(meeting_title) > 80 or "organisations_" in meeting_title or "meetingAssistant" in meeting_title:
+        participant_names = [c.get("name", "") for c in contacts if c.get("name")]
+        if participant_names:
+            clean_title = f"{meeting_type} with {', '.join(participant_names[:2])}"
+        else:
+            clean_title = meeting_type or "Meeting"
+
+    # Counts
+    n_tasks = len(action_items)
+    n_contacts = len(contacts)
+    has_email = bool(email_draft.get("body"))
+
+    # Build action items HTML
+    tasks_html = ""
+    for item in action_items[:5]:
+        owner = item.get("owner", "Unassigned")
+        task = item.get("task", "")
+        priority = item.get("priority", "medium")
+        priority_badge = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(priority, "⚪")
+        tasks_html += (
+            f'<tr>'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #eee;">{priority_badge} {task}</td>'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #eee;color:#666;white-space:nowrap;">{owner}</td>'
+            f'</tr>'
+        )
+
+    # Build insights HTML (top 3)
+    insights_html = ""
+    for insight in key_insights[:3]:
+        insights_html += f'<li style="margin-bottom:6px;color:#444;">{insight}</li>'
 
     # ── Slack ──
     if "slack" in channels and SLACK_WEBHOOK_URL:
         try:
             requests.post(SLACK_WEBHOOK_URL, json={
                 "text": (
-                    f"📞 *Meeting processed: {meeting_title}*\n"
-                    f"Review tasks & follow-up email before they're created:\n"
+                    f"📞 *Meeting processed: {clean_title}*\n"
+                    f"_{summary[:200]}_\n"
+                    f"📋 {n_tasks} action items | 👤 {n_contacts} contacts | {'📧 Draft ready' if has_email else ''}\n"
                     f"👉 <{review_url}|Review & Approve>"
                 )
             }, timeout=10)
-            logger.info(f"Slack notification sent for {meeting_title}")
+            logger.info(f"Slack notification sent for {clean_title}")
         except Exception as e:
             logger.warning(f"Slack notification failed: {e}")
 
-    # ── Teams (Incoming Webhook — posts to a channel) ──
+    # ── Teams Webhook ──
+    TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")
     if "teams" in channels and TEAMS_WEBHOOK_URL:
         try:
             card_payload = {
@@ -507,29 +551,18 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
                 "attachments": [
                     {
                         "contentType": "application/vnd.microsoft.card.adaptive",
-                        "contentUrl": None,
                         "content": {
                             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                             "type": "AdaptiveCard",
                             "version": "1.4",
                             "body": [
-                                {
-                                    "type": "TextBlock",
-                                    "size": "medium",
-                                    "weight": "bolder",
-                                    "text": f"📞 Meeting Processed: {meeting_title}",
-                                    "wrap": True,
-                                },
-                                {
-                                    "type": "TextBlock",
-                                    "text": "Claude extracted action items and a follow-up email draft. Review, edit, or delete before they're created in HubSpot, Asana, and Outlook.",
-                                    "wrap": True,
-                                    "spacing": "small",
-                                },
+                                {"type": "TextBlock", "text": f"📞 {clean_title}", "weight": "Bolder", "size": "Medium"},
+                                {"type": "TextBlock", "text": summary[:200], "wrap": True},
                                 {
                                     "type": "FactSet",
                                     "facts": [
                                         {"title": "Organizer", "value": organizer_email},
+                                        {"title": "Action Items", "value": str(n_tasks)},
                                         {"title": "Status", "value": "⏳ Awaiting your review"},
                                     ],
                                 },
@@ -548,7 +581,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
             }
             resp = requests.post(TEAMS_WEBHOOK_URL, json=card_payload, timeout=15)
             resp.raise_for_status()
-            logger.info(f"Teams webhook notification sent for {meeting_title}")
+            logger.info(f"Teams webhook notification sent for {clean_title}")
         except Exception as e:
             logger.warning(f"Teams webhook notification failed: {e}")
 
@@ -557,24 +590,68 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
         try:
             token = get_ms_graph_token()
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+            # Build tasks table
+            tasks_table = ""
+            if tasks_html:
+                tasks_table = (
+                    '<div style="padding:20px 28px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
+                    '<div style="font-size:12px;text-transform:uppercase;color:#64748b;font-weight:600;letter-spacing:0.5px;margin-bottom:12px;">Action Items</div>'
+                    '<table style="width:100%;border-collapse:collapse;font-size:14px;">'
+                    '<tr style="background:#f1f5f9;"><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Task</th><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Owner</th></tr>'
+                    f'{tasks_html}'
+                    '</table></div>'
+                )
+
+            # Build insights section
+            insights_section = ""
+            if insights_html:
+                insights_section = (
+                    '<div style="padding:20px 28px;background:#fffbeb;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
+                    '<div style="font-size:12px;text-transform:uppercase;color:#92400e;font-weight:600;letter-spacing:0.5px;margin-bottom:8px;">💡 Key Insights</div>'
+                    f'<ul style="margin:0;padding-left:20px;font-size:14px;line-height:1.6;">{insights_html}</ul></div>'
+                )
+
+            email_html = (
+                '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;max-width:640px;margin:0 auto;color:#1a1a1a;">'
+                # Header
+                '<div style="background:linear-gradient(135deg,#1e3a5f,#2563eb);padding:24px 28px;border-radius:12px 12px 0 0;">'
+                '<div style="color:white;font-size:13px;text-transform:uppercase;letter-spacing:1px;opacity:0.85;">Meeting Intelligence Report</div>'
+                f'<div style="color:white;font-size:22px;font-weight:600;margin-top:8px;">{clean_title}</div>'
+                f'<div style="color:rgba(255,255,255,0.75);font-size:13px;margin-top:4px;">{meeting_type} &bull; {n_tasks} action items &bull; {n_contacts} contacts{"  &bull; Draft email ready" if has_email else ""}</div>'
+                '</div>'
+                # Summary
+                '<div style="background:#f8fafc;padding:20px 28px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
+                '<div style="font-size:12px;text-transform:uppercase;color:#64748b;font-weight:600;letter-spacing:0.5px;margin-bottom:8px;">Summary</div>'
+                f'<div style="font-size:14px;line-height:1.6;color:#334155;">{summary}</div>'
+                '</div>'
+                # Action Items
+                f'{tasks_table}'
+                # Key Insights
+                f'{insights_section}'
+                # CTA Button
+                '<div style="padding:28px;text-align:center;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
+                f'<a href="{review_url}" style="display:inline-block;background:#2563eb;color:white;padding:14px 36px;text-decoration:none;border-radius:8px;font-weight:600;font-size:15px;">Review &amp; Approve Tasks</a>'
+                '<div style="margin-top:12px;font-size:12px;color:#94a3b8;">Review, edit, or delete items before they are created in HubSpot, Asana, and Outlook</div>'
+                '</div>'
+                # Footer
+                '<div style="background:#f1f5f9;padding:16px 28px;border-radius:0 0 12px 12px;border:1px solid #e2e8f0;border-top:none;">'
+                '<div style="font-size:12px;color:#64748b;">'
+                f'&mdash; {BOT_SENDER_NAME}<br>'
+                '<span style="color:#94a3b8;">Automated meeting intelligence by Negev Labs</span>'
+                '</div></div></div>'
+            )
+
             send_payload = {
                 "message": {
-                    "subject": f"✅ Review: Post-meeting tasks — {meeting_title}",
+                    "subject": f"✅ {clean_title} — {n_tasks} action items ready for review",
                     "body": {
                         "contentType": "HTML",
-                        "content": (
-                            f"<h3>📞 Meeting processed: {meeting_title}</h3>"
-                            f"<p>Hi! I've extracted action items and drafted a follow-up email from your meeting.</p>"
-                            f"<p><strong>Review, edit, or delete before they're created in HubSpot, Asana, and Outlook:</strong></p>"
-                            f'<p><a href="{review_url}" style="background:#2563eb;color:white;padding:12px 24px;'
-                            f'text-decoration:none;border-radius:6px;font-weight:bold;">Review & Approve Tasks</a></p>'
-                            f"<p style='color:#666;font-size:12px;'>— {BOT_SENDER_NAME}</p>"
-                        ),
+                        "content": email_html,
                     },
                     "toRecipients": [{"emailAddress": {"address": organizer_email}}],
                 },
             }
-            # Send from Sara's shared mailbox if configured
             if BOT_SENDER_EMAIL:
                 send_payload["message"]["from"] = {
                     "emailAddress": {"name": BOT_SENDER_NAME, "address": BOT_SENDER_EMAIL}
@@ -588,7 +665,9 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
         except Exception as e:
             logger.warning(f"Email notification failed: {e}")
 
-    logger.info(f"Review URL for '{meeting_title}': {review_url}")
+    logger.info(f"Review URL for '{clean_title}': {review_url}")
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -629,7 +708,7 @@ def process_transcript_phase1(transcript: dict) -> str:
     save_pending(pending)
 
     # Notify organizer
-    notify_organizer(organizer_email, approval_id, title)
+    notify_organizer(organizer_email, approval_id, title, intelligence)
 
     logger.info(f"Phase 1 complete. Approval ID: {approval_id} — awaiting organizer review.")
     return approval_id
