@@ -42,11 +42,15 @@ MS_GRAPH_CLIENT_ID = os.environ.get("MS_GRAPH_CLIENT_ID", "")
 MS_GRAPH_CLIENT_SECRET = os.environ.get("MS_GRAPH_CLIENT_SECRET", "")
 MS_GRAPH_TENANT_ID = os.environ.get("MS_GRAPH_TENANT_ID", "")
 MS_GRAPH_REFRESH_TOKEN = os.environ.get("MS_GRAPH_REFRESH_TOKEN", "")  # For delegated flow
+# Auth mode: "delegated" (uses refresh_token, /me/ endpoints — single user only)
+#            "app" (uses client_credentials, /users/{email} endpoints — team-wide)
+# Auto-detected: if refresh_token set → delegated, else → app
+MS_GRAPH_AUTH_MODE = os.environ.get("MS_GRAPH_AUTH_MODE", "auto")
 
 # Configuration
 ASANA_WORKSPACE_GID = os.environ.get("ASANA_WORKSPACE_GID", "")
 ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "")
-HUBSPOT_OWNER_ID = os.environ.get("HUBSPOT_OWNER_ID", "")
+HUBSPOT_OWNER_ID = os.environ.get("HUBSPOT_OWNER_ID", "")  # Fallback default owner
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8080")  # Your deployed URL
 NOTIFY_VIA = os.environ.get("NOTIFY_VIA", "email")  # "email" (per-organizer), "teams" (shared ops channel), or "email,teams" for both
@@ -54,12 +58,23 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared ops channel for admin visibility
 BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@negevlabs.com (shared mailbox)
 BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
+# HubSpot owner map: JSON string mapping email → owner ID, e.g. {"bk@negevlabs.com":"241153249","sr@negevlabs.com":"241153250"}
+HUBSPOT_OWNER_MAP_RAW = os.environ.get("HUBSPOT_OWNER_MAP", "{}")
+try:
+    HUBSPOT_OWNER_MAP = json.loads(HUBSPOT_OWNER_MAP_RAW)
+except (json.JSONDecodeError, TypeError):
+    HUBSPOT_OWNER_MAP = {}
 
 # Track processed transcripts and pending approvals
 PROCESSED_FILE = "processed_transcripts.json"
 PENDING_FILE = "pending_approvals.json"
 
 app = Flask(__name__)
+
+# Startup config summary
+_app_only = MS_GRAPH_AUTH_MODE == "app" or (MS_GRAPH_AUTH_MODE == "auto" and not MS_GRAPH_REFRESH_TOKEN)
+logger.info(f"Graph auth mode: {'app-only (team-wide)' if _app_only else 'delegated (single-user)'}")
+logger.info(f"HubSpot owner map: {len(HUBSPOT_OWNER_MAP)} entries | fallback: {HUBSPOT_OWNER_ID or 'none'}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -280,14 +295,24 @@ MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 _ms_token_cache = {"token": None, "expires_at": 0}
 
 
+def is_app_only_mode() -> bool:
+    """Determine if we're using app-only (team-wide) or delegated (single-user) auth."""
+    if MS_GRAPH_AUTH_MODE == "app":
+        return True
+    if MS_GRAPH_AUTH_MODE == "delegated":
+        return False
+    # Auto-detect: delegated if refresh token exists, else app-only
+    return not bool(MS_GRAPH_REFRESH_TOKEN)
+
+
 def get_ms_graph_token() -> str:
     """Get Microsoft Graph access token (supports both delegated and app-only)."""
     now = time.time()
     if _ms_token_cache["token"] and _ms_token_cache["expires_at"] > now + 60:
         return _ms_token_cache["token"]
 
-    if MS_GRAPH_REFRESH_TOKEN:
-        # Delegated flow (send as specific user)
+    if not is_app_only_mode():
+        # Delegated flow (send as specific user — single user only)
         data = {
             "client_id": MS_GRAPH_CLIENT_ID,
             "client_secret": MS_GRAPH_CLIENT_SECRET,
@@ -295,14 +320,16 @@ def get_ms_graph_token() -> str:
             "grant_type": "refresh_token",
             "scope": "https://graph.microsoft.com/Mail.ReadWrite",
         }
+        logger.info("Using delegated auth (single-user mode)")
     else:
-        # App-only flow (requires Mail.ReadWrite application permission)
+        # App-only flow (team-wide — requires Mail.ReadWrite application permission)
         data = {
             "client_id": MS_GRAPH_CLIENT_ID,
             "client_secret": MS_GRAPH_CLIENT_SECRET,
             "grant_type": "client_credentials",
             "scope": "https://graph.microsoft.com/.default",
         }
+        logger.info("Using app-only auth (team-wide mode)")
 
     resp = requests.post(MS_GRAPH_TOKEN_URL, data=data, timeout=15)
     resp.raise_for_status()
@@ -357,12 +384,12 @@ def create_outlook_draft(
     }
 
     # Create draft in sender's mailbox
-    # App-only: /users/{email}/messages
-    # Delegated: /me/messages (if refresh token belongs to sender)
-    if MS_GRAPH_REFRESH_TOKEN:
-        url = f"{MS_GRAPH_BASE}/me/messages"
-    else:
+    # App-only: /users/{email}/messages  (team-wide — any user's mailbox)
+    # Delegated: /me/messages            (single-user — only authenticated user)
+    if is_app_only_mode():
         url = f"{MS_GRAPH_BASE}/users/{sender_email}/messages"
+    else:
+        url = f"{MS_GRAPH_BASE}/me/messages"
 
     resp = requests.post(url, json=message_payload, headers=headers, timeout=30)
     resp.raise_for_status()
@@ -379,13 +406,13 @@ def create_outlook_draft(
 HUBSPOT_BASE = "https://api.hubapi.com"
 
 
-def hubspot_request(method: str, endpoint: str, data: dict = None) -> dict:
+def hubspot_request(method: str, endpoint: str, data: dict = None, params: dict = None) -> dict:
     headers = {
         "Authorization": f"Bearer {HUBSPOT_API_KEY}",
         "Content-Type": "application/json",
     }
     url = f"{HUBSPOT_BASE}{endpoint}"
-    resp = requests.request(method, url, json=data, headers=headers, timeout=30)
+    resp = requests.request(method, url, json=data, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json() if resp.content else {}
 
@@ -400,7 +427,43 @@ def find_hubspot_contact(email: str) -> Optional[dict]:
     return results[0] if results else None
 
 
-def create_hubspot_contact(contact_info: dict) -> dict:
+# ── Dynamic HubSpot Owner Resolution ──
+
+_hubspot_owner_cache = {}  # email → owner_id cache
+
+
+def resolve_hubspot_owner(organizer_email: str) -> str:
+    """Resolve organizer email to HubSpot owner ID.
+    Priority: HUBSPOT_OWNER_MAP → HubSpot API lookup → HUBSPOT_OWNER_ID fallback."""
+    if not organizer_email:
+        return HUBSPOT_OWNER_ID
+
+    # Check static map first (fast, no API call)
+    if organizer_email in HUBSPOT_OWNER_MAP:
+        return HUBSPOT_OWNER_MAP[organizer_email]
+
+    # Check cache
+    if organizer_email in _hubspot_owner_cache:
+        return _hubspot_owner_cache[organizer_email]
+
+    # Try HubSpot owners API lookup by email
+    try:
+        result = hubspot_request("GET", "/crm/v3/owners", params={"email": organizer_email, "limit": 1})
+        owners = result.get("results", [])
+        if owners:
+            owner_id = str(owners[0].get("id", ""))
+            _hubspot_owner_cache[organizer_email] = owner_id
+            logger.info(f"Resolved HubSpot owner: {organizer_email} → {owner_id}")
+            return owner_id
+    except Exception as e:
+        logger.warning(f"HubSpot owner lookup failed for {organizer_email}: {e}")
+
+    # Fallback to default
+    _hubspot_owner_cache[organizer_email] = HUBSPOT_OWNER_ID
+    return HUBSPOT_OWNER_ID
+
+
+def create_hubspot_contact(contact_info: dict, organizer_email: str = "") -> dict:
     properties = {
         "firstname": contact_info.get("name", "").split()[0] if contact_info.get("name") else "",
         "lastname": " ".join(contact_info.get("name", "").split()[1:]) if contact_info.get("name") else "",
@@ -408,11 +471,12 @@ def create_hubspot_contact(contact_info: dict) -> dict:
         "company": contact_info.get("company", ""),
         "jobtitle": contact_info.get("role", ""),
     }
-    if HUBSPOT_OWNER_ID:
-        properties["hubspot_owner_id"] = HUBSPOT_OWNER_ID
+    owner_id = resolve_hubspot_owner(organizer_email)
+    if owner_id:
+        properties["hubspot_owner_id"] = owner_id
     properties = {k: v for k, v in properties.items() if v}
     result = hubspot_request("POST", "/crm/v3/objects/contacts", {"properties": properties})
-    logger.info(f"Created HubSpot contact: {contact_info.get('name')} ({result.get('id')})")
+    logger.info(f"Created HubSpot contact: {contact_info.get('name')} ({result.get('id')}) — owner: {owner_id or 'none'}")
     return result
 
 
@@ -424,7 +488,7 @@ def log_hubspot_note(contact_id: str, note_body: str, meeting_date: str) -> dict
     return hubspot_request("POST", "/crm/v3/objects/notes", data)
 
 
-def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str) -> dict:
+def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str, organizer_email: str = "") -> dict:
     data = {
         "properties": {
             "hs_task_subject": subject, "hs_task_body": body,
@@ -433,8 +497,9 @@ def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str)
         },
         "associations": [{"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 204}]}],
     }
-    if HUBSPOT_OWNER_ID:
-        data["properties"]["hubspot_owner_id"] = HUBSPOT_OWNER_ID
+    owner_id = resolve_hubspot_owner(organizer_email)
+    if owner_id:
+        data["properties"]["hubspot_owner_id"] = owner_id
     return hubspot_request("POST", "/crm/v3/objects/tasks", data)
 
 
@@ -483,6 +548,9 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
     """Send organizer a rich notification with meeting intelligence summary.
     Supports multiple channels: email, slack, teams (comma-separated in NOTIFY_VIA)."""
     review_url = f"{APP_BASE_URL}/review/{approval_id}"
+    # Ensure URL has protocol for mobile auto-linking
+    if not review_url.startswith("http"):
+        review_url = f"https://{review_url}"
     channels = [c.strip().lower() for c in NOTIFY_VIA.split(",")]
 
     # ── Extract display data from intelligence ──
@@ -629,11 +697,11 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
                 f'{tasks_table}'
                 # Key Insights
                 f'{insights_section}'
-                # CTA Button
+                # CTA - raw URL (mobile Outlook strips <a> tags, raw https:// URLs auto-link)
                 '<div style="padding:28px;text-align:center;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
-                f'<p style="margin:0 0 16px 0;"><a href="{review_url}">✅ Review &amp; Approve Tasks</a></p>'
-                f'<p style="margin:0;font-size:13px;color:#64748b;">{review_url}</p>'
-                '<p style="margin:8px 0 0 0;font-size:12px;color:#94a3b8;">Review, edit, or delete items before they are created in HubSpot, Asana, and Outlook</p>'
+                '<p style="margin:0 0 8px 0;font-weight:600;font-size:15px;">✅ Review &amp; Approve Tasks</p>'
+                f'<p style="margin:0;font-size:14px;">{review_url}</p>'
+                '<p style="margin:12px 0 0 0;font-size:12px;color:#94a3b8;">Review, edit, or delete items before they are created in HubSpot, Asana, and Outlook</p>'
                 '</div>'
                 # Footer
                 '<div style="background:#f1f5f9;padding:16px 28px;border-radius:0 0 12px 12px;border:1px solid #e2e8f0;border-top:none;">'
@@ -657,10 +725,12 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
                 send_payload["message"]["from"] = {
                     "emailAddress": {"name": BOT_SENDER_NAME, "address": BOT_SENDER_EMAIL}
                 }
-            if MS_GRAPH_REFRESH_TOKEN:
-                url = f"{MS_GRAPH_BASE}/me/sendMail"
-            else:
+            if is_app_only_mode():
+                # App-only: send from Sara's mailbox (or organizer's)
                 url = f"{MS_GRAPH_BASE}/users/{BOT_SENDER_EMAIL or organizer_email}/sendMail"
+            else:
+                # Delegated: send as authenticated user
+                url = f"{MS_GRAPH_BASE}/me/sendMail"
             requests.post(url, json=send_payload, headers=headers, timeout=15)
             logger.info(f"Email notification sent to {organizer_email} from {BOT_SENDER_EMAIL or 'self'}")
         except Exception as e:
@@ -744,7 +814,7 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
                 contact_ids[email] = existing["id"]
                 results["actions"].append(f"✅ Found HubSpot contact: {contact['name']}")
             else:
-                new_contact = create_hubspot_contact(contact)
+                new_contact = create_hubspot_contact(contact, organizer_email)
                 contact_ids[email] = new_contact["id"]
                 results["actions"].append(f"✅ Created HubSpot contact: {contact['name']}")
         except Exception as e:
@@ -768,7 +838,7 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
         # HubSpot task
         for email, cid in contact_ids.items():
             try:
-                create_hubspot_task(cid, item["task"], item.get("task", ""), due)
+                create_hubspot_task(cid, item["task"], item.get("task", ""), due, organizer_email)
                 results["actions"].append(f"✅ HubSpot task: {item['task'][:60]}")
             except Exception as e:
                 results["actions"].append(f"❌ HubSpot task failed: {e}")
@@ -1034,6 +1104,21 @@ RESULT_TEMPLATE = """
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
+
+
+@app.route("/config", methods=["GET"])
+def config_check():
+    """Diagnostic: verify team-wide config (no secrets exposed)."""
+    return jsonify({
+        "graph_auth_mode": "app-only (team-wide)" if is_app_only_mode() else "delegated (single-user)",
+        "graph_client_id_set": bool(MS_GRAPH_CLIENT_ID),
+        "graph_tenant_id_set": bool(MS_GRAPH_TENANT_ID),
+        "bot_sender": BOT_SENDER_EMAIL or "(not set)",
+        "hubspot_owner_map_entries": len(HUBSPOT_OWNER_MAP),
+        "hubspot_owner_map_emails": list(HUBSPOT_OWNER_MAP.keys()),
+        "hubspot_fallback_owner": HUBSPOT_OWNER_ID or "(not set)",
+        "notify_via": NOTIFY_VIA,
+    })
 
 
 @app.route("/webhook/fireflies", methods=["POST"])
