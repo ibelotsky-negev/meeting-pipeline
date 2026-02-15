@@ -200,6 +200,7 @@ Return a JSON object with exactly this structure:
     "action_items": [
         {{
             "owner": "Person Name",
+            "owner_email": "person@email.com or empty string if unknown",
             "task": "Task description",
             "priority": "high/medium/low",
             "due_context": "ASAP / next week / specific date if mentioned",
@@ -219,7 +220,6 @@ Return a JSON object with exactly this structure:
     }}
 }}
 
-
 RULES:
 - The follow-up email is FROM the organizer TO the other meeting participants (NOT to the organizer themselves)
 - to_recipients must NEVER include the organizer ({transcript.get('organizer_email', '')}). The email is sent BY the organizer, not TO them.
@@ -231,7 +231,9 @@ RULES:
 - Identify ALL external contacts (non-organizer attendees) from speaker names in the transcript
 - Rate interest level based on language, engagement, and commitments made
 - Action items should be specific and assignable
-- Return ONLY valid JSON, no markdown"""
+- For each action item, set owner_email to the person's email if known from participants or organizer info. If the owner is the organizer, use their email. If unknown, leave as empty string.
+- Return ONLY valid JSON, no markdown
+"""
 
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -438,7 +440,9 @@ def create_asana_task(name: str, notes: str, due_on: str = None, assignee_gid: s
         task_data["projects"] = [ASANA_PROJECT_GID]
     return asana_request("POST", "/tasks", task_data)
 
-def find_asana_user_by_email(email):
+
+def find_asana_user_by_email(email: str) -> Optional[str]:
+    """Look up Asana user GID by email. Returns GID or None."""
     if not email or "placeholder" in email or "unknown" in email:
         return None
     try:
@@ -447,32 +451,6 @@ def find_asana_user_by_email(email):
     except Exception:
         return None
 
-
-# ═══
-```
-
-**Change 2** — In the action_items JSON structure, find:
-```
-            "owner": "Person Name",
-            "task":
-```
-Replace with:
-```
-            "owner": "Person Name",
-            "owner_email": "person@email.com or empty string if unknown",
-            "task":
-```
-
-**Change 3** — In RULES section, find:
-```
-- Action items should be specific and assignable
-- Return ONLY valid JSON
-```
-Replace with:
-```
-- Action items should be specific and assignable
-- For each action item, set owner_email to the person's email if known from participants or organizer info. If the owner is the organizer, use their email. If unknown, leave as empty string.
-- Return ONLY valid JSON
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  NOTIFICATION — Alert organizer to review
@@ -748,6 +726,7 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
         # Asana task
         try:
             notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {item.get('due_context', 'TBD')}"
+            # Look up Asana user by owner email
             assignee_gid = None
             owner_email = item.get("owner_email", "")
             if owner_email:
