@@ -809,7 +809,7 @@ REVIEW_TEMPLATE = """
 
         <div class="card">
             <h1>📞 {{ data.title }}</h1>
-            <p class="subtitle">{{ data.meeting_date[:10] }} · Organizer: {{ data.organizer_email }}</p>
+            <p class="subtitle">{{ (data.meeting_date|string)[:10] }} · Organizer: {{ data.organizer_email }}</p>
 
             {% set signals = data.intelligence.get('signals', {}) %}
             <div style="margin-top: 12px;">
