@@ -438,6 +438,41 @@ def create_asana_task(name: str, notes: str, due_on: str = None, assignee_gid: s
         task_data["projects"] = [ASANA_PROJECT_GID]
     return asana_request("POST", "/tasks", task_data)
 
+def find_asana_user_by_email(email):
+    if not email or "placeholder" in email or "unknown" in email:
+        return None
+    try:
+        result = asana_request("GET", f"/users/{email}")
+        return result.get("gid")
+    except Exception:
+        return None
+
+
+# ═══
+```
+
+**Change 2** — In the action_items JSON structure, find:
+```
+            "owner": "Person Name",
+            "task":
+```
+Replace with:
+```
+            "owner": "Person Name",
+            "owner_email": "person@email.com or empty string if unknown",
+            "task":
+```
+
+**Change 3** — In RULES section, find:
+```
+- Action items should be specific and assignable
+- Return ONLY valid JSON
+```
+Replace with:
+```
+- Action items should be specific and assignable
+- For each action item, set owner_email to the person's email if known from participants or organizer info. If the owner is the organizer, use their email. If unknown, leave as empty string.
+- Return ONLY valid JSON
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  NOTIFICATION — Alert organizer to review
@@ -713,7 +748,11 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
         # Asana task
         try:
             notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {item.get('due_context', 'TBD')}"
-            create_asana_task(item["task"], notes, due_date)
+            assignee_gid = None
+            owner_email = item.get("owner_email", "")
+            if owner_email:
+                assignee_gid = find_asana_user_by_email(owner_email)
+            create_asana_task(item["task"], notes, due_date, assignee_gid)
             results["actions"].append(f"✅ Asana task: {item['task'][:60]}")
         except Exception as e:
             results["actions"].append(f"❌ Asana task failed: {e}")
