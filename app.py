@@ -219,15 +219,19 @@ Return a JSON object with exactly this structure:
     }}
 }}
 
+
 RULES:
-- to_recipients should include ALL external (non-organizer) meeting participants
+- The follow-up email is FROM the organizer TO the other meeting participants (NOT to the organizer themselves)
+- to_recipients must NEVER include the organizer ({transcript.get('organizer_email', '')}). The email is sent BY the organizer, not TO them.
+- to_recipients should include the key external participants identified from the transcript speakers and discussion
+- If participant emails are not known, use "unknown@placeholder.com" and include their name so the organizer can fix it in the review UI
+- The email greeting should address the recipient(s) by name (e.g., "Hi Sam"), NOT the organizer
 - from_email must be the meeting organizer's email
 - body_html should use simple HTML (<p>, <br>, <strong>) for Outlook rendering
-- Identify ALL external contacts (non-organizer attendees)
+- Identify ALL external contacts (non-organizer attendees) from speaker names in the transcript
 - Rate interest level based on language, engagement, and commitments made
 - Action items should be specific and assignable
-- Return ONLY valid JSON, no markdown
-"""
+- Return ONLY valid JSON, no markdown"""
 
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -668,7 +672,7 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
         if contact.get("is_internal"):
             continue
         email = contact.get("email", "")
-        if not email:
+        if not email or "placeholder" in email or "unknown" in email or "@" not in email:
             continue
         try:
             existing = find_hubspot_contact(email)
