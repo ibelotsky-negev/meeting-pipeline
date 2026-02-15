@@ -49,11 +49,10 @@ ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "")
 HUBSPOT_OWNER_ID = os.environ.get("HUBSPOT_OWNER_ID", "")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8080")  # Your deployed URL
-NOTIFY_VIA = os.environ.get("NOTIFY_VIA", "email")  # "email" (per-organizer), "teams" (shared ops channel), or "email,teams" for both
+NOTIFY_VIA = os.environ.get("NOTIFY_VIA", "email")  # "email", "slack", "teams", or comma-separated: "email,teams"
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared ops channel for admin visibility
-BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@negevlabs.com (shared mailbox)
-BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
+TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Teams Incoming Webhook (channel-level)
+TEAMS_NOTIFY_VIA_GRAPH = os.environ.get("TEAMS_NOTIFY_VIA_GRAPH", "false").lower() == "true"  # Use Graph API for 1:1 chat
 
 # Track processed transcripts and pending approvals
 PROCESSED_FILE = "processed_transcripts.json"
@@ -158,27 +157,10 @@ def extract_meeting_intelligence(transcript: dict) -> dict:
     summary = transcript.get("summary", {})
     sentences = transcript.get("sentences", [])
     transcript_text = "\n".join(
-        [f"{s.get('speaker_name', 'Unknown')}: {s.get('text', '')}" for s in sentences]
+        [f"{s.get('speaker_name', 'Unknown')}: {s.get('text', '')}" for s in sentences[:200]]
     )
 
-    # Business context — loaded from file if available, else env var, else default
-    business_context = ""
-    context_file = os.environ.get("BUSINESS_CONTEXT_FILE", "business_context.md")
-    if os.path.exists(context_file):
-        with open(context_file, "r") as f:
-            business_context = f.read()
-        logger.info(f"Loaded business context from {context_file} ({len(business_context)} chars)")
-    elif os.environ.get("BUSINESS_CONTEXT"):
-        business_context = os.environ["BUSINESS_CONTEXT"]
-    else:
-        business_context = "No specific business context provided. Extract general meeting intelligence."
-
-    prompt = f"""You are an expert biotech venture capital analyst and chief of staff.
-
-BUSINESS CONTEXT:
-{business_context}
-
-Analyze this meeting transcript and extract structured intelligence.
+    prompt = f"""Analyze this meeting transcript and extract structured intelligence.
 
 MEETING INFO:
 - Title: {transcript.get('title', 'Unknown')}
@@ -191,7 +173,7 @@ SUMMARY: {summary.get('short_summary', 'No summary available')}
 ACTION ITEMS (from Fireflies): {summary.get('action_items', 'None extracted')}
 KEY TOPICS: {summary.get('overview', '')}
 
-FULL TRANSCRIPT:
+TRANSCRIPT (first ~200 sentences):
 {transcript_text}
 
 ---
@@ -239,11 +221,6 @@ Return a JSON object with exactly this structure:
 }}
 
 RULES:
-- Use the BUSINESS CONTEXT above to understand what matters in this meeting and extract high-value action items
-- Distinguish internal team members (@negevlabs.com, @ariadnebio.com, etc.) from external contacts
-- For investor/BD meetings: capture interest signals, objections, and next steps that matter for deal flow
-- For portfolio company meetings: capture strategic decisions, blockers, and deliverables
-- Action items should be specific, actionable, and reflect what was actually committed to in the conversation — not generic tasks
 - The follow-up email is FROM the organizer TO the other meeting participants (NOT to the organizer themselves)
 - to_recipients must NEVER include the organizer ({transcript.get('organizer_email', '')}). The email is sent BY the organizer, not TO them.
 - to_recipients should include the key external participants identified from the transcript speakers and discussion
@@ -260,7 +237,7 @@ RULES:
 
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=8000,
+        max_tokens=4000,
         messages=[{"role": "user", "content": prompt}],
     )
     response_text = message.content[0].text.strip()
@@ -502,6 +479,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
     # ── Teams (Incoming Webhook — posts to a channel) ──
     if "teams" in channels and TEAMS_WEBHOOK_URL:
         try:
+            # Adaptive Card format for Teams incoming webhook
             card_payload = {
                 "type": "message",
                 "attachments": [
@@ -522,7 +500,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
                                 },
                                 {
                                     "type": "TextBlock",
-                                    "text": "Claude extracted action items and a follow-up email draft. Review, edit, or delete before they're created in HubSpot, Asana, and Outlook.",
+                                    "text": f"Claude extracted action items and a follow-up email draft. Review, edit, or delete before they're created in HubSpot, Asana, and Outlook.",
                                     "wrap": True,
                                     "spacing": "small",
                                 },
@@ -552,6 +530,62 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
         except Exception as e:
             logger.warning(f"Teams webhook notification failed: {e}")
 
+    # ── Teams (Graph API — 1:1 chat message to organizer) ──
+    if "teams" in channels and TEAMS_NOTIFY_VIA_GRAPH and MS_GRAPH_CLIENT_ID:
+        try:
+            token = get_ms_graph_token()
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+            # Step 1: Create or get 1:1 chat with organizer
+            chat_payload = {
+                "chatType": "oneOnOne",
+                "members": [
+                    {
+                        "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                        "roles": ["owner"],
+                        "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{organizer_email}')",
+                    }
+                ],
+            }
+
+            # For app-only: use /chats endpoint; for delegated: need current user too
+            if MS_GRAPH_REFRESH_TOKEN:
+                # Delegated flow — include the app user as second member
+                # The /me reference auto-resolves to the authenticated user
+                me_resp = requests.get(f"{MS_GRAPH_BASE}/me", headers=headers, timeout=10)
+                me_data = me_resp.json()
+                my_id = me_data.get("id", "")
+                chat_payload["members"].insert(0, {
+                    "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                    "roles": ["owner"],
+                    "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{my_id}')",
+                })
+
+            chat_resp = requests.post(f"{MS_GRAPH_BASE}/chats", json=chat_payload,
+                                      headers=headers, timeout=15)
+            chat_resp.raise_for_status()
+            chat_id = chat_resp.json().get("id")
+
+            # Step 2: Send message to the chat
+            message_payload = {
+                "body": {
+                    "contentType": "html",
+                    "content": (
+                        f"<h3>📞 Meeting Processed: {meeting_title}</h3>"
+                        f"<p>Claude extracted action items and a follow-up email draft from your meeting.</p>"
+                        f"<p><b>Review, edit, or delete tasks before they're created:</b></p>"
+                        f'<p><a href="{review_url}">👉 Review & Approve Tasks</a></p>'
+                        f"<p><i>This link expires in 48 hours.</i></p>"
+                    ),
+                }
+            }
+            msg_resp = requests.post(f"{MS_GRAPH_BASE}/chats/{chat_id}/messages",
+                                     json=message_payload, headers=headers, timeout=15)
+            msg_resp.raise_for_status()
+            logger.info(f"Teams 1:1 chat message sent to {organizer_email}")
+        except Exception as e:
+            logger.warning(f"Teams Graph chat notification failed: {e}")
+
     # ── Email (via Outlook / Graph API) ──
     if "email" in channels and MS_GRAPH_CLIENT_ID:
         try:
@@ -563,28 +597,23 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str)
                     "body": {
                         "contentType": "HTML",
                         "content": (
-                            f"<h3>📞 Meeting processed: {meeting_title}</h3>"
-                            f"<p>Hi! I've extracted action items and drafted a follow-up email from your meeting.</p>"
-                            f"<p><strong>Review, edit, or delete before they're created in HubSpot, Asana, and Outlook:</strong></p>"
+                            f"<h3>Meeting processed: {meeting_title}</h3>"
+                            f"<p>Claude extracted action items and drafted a follow-up email from your meeting.</p>"
+                            f"<p><strong>Review, edit, or delete before they're created:</strong></p>"
                             f'<p><a href="{review_url}" style="background:#2563eb;color:white;padding:12px 24px;'
                             f'text-decoration:none;border-radius:6px;font-weight:bold;">Review & Approve Tasks</a></p>'
-                            f"<p style='color:#666;font-size:12px;'>— {BOT_SENDER_NAME}</p>"
+                            f"<p style='color:#666;font-size:12px;'>This link expires in 48 hours.</p>"
                         ),
                     },
                     "toRecipients": [{"emailAddress": {"address": organizer_email}}],
                 },
             }
-            # Send from Sara's shared mailbox if configured
-            if BOT_SENDER_EMAIL:
-                send_payload["message"]["from"] = {
-                    "emailAddress": {"name": BOT_SENDER_NAME, "address": BOT_SENDER_EMAIL}
-                }
             if MS_GRAPH_REFRESH_TOKEN:
                 url = f"{MS_GRAPH_BASE}/me/sendMail"
             else:
-                url = f"{MS_GRAPH_BASE}/users/{BOT_SENDER_EMAIL or organizer_email}/sendMail"
+                url = f"{MS_GRAPH_BASE}/users/{organizer_email}/sendMail"
             requests.post(url, json=send_payload, headers=headers, timeout=15)
-            logger.info(f"Email notification sent to {organizer_email} from {BOT_SENDER_EMAIL or 'self'}")
+            logger.info(f"Email notification sent to {organizer_email}")
         except Exception as e:
             logger.warning(f"Email notification failed: {e}")
 
@@ -697,13 +726,11 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
         # Asana task
         try:
             notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {item.get('due_context', 'TBD')}"
-            # Look up Asana user by owner email, fallback to organizer
+            # Look up Asana user by owner email
             assignee_gid = None
             owner_email = item.get("owner_email", "")
             if owner_email:
                 assignee_gid = find_asana_user_by_email(owner_email)
-            if not assignee_gid and organizer_email:
-                assignee_gid = find_asana_user_by_email(organizer_email)
             create_asana_task(item["task"], notes, due_date, assignee_gid)
             results["actions"].append(f"✅ Asana task: {item['task'][:60]}")
         except Exception as e:
@@ -959,7 +986,6 @@ def health():
 @app.route("/webhook/fireflies", methods=["POST"])
 def fireflies_webhook():
     """Fireflies webhook — triggers Phase 1 (extract + queue for approval)."""
-    import threading
     payload = request.get_json(force=True)
     logger.info(f"Webhook received: {json.dumps(payload)[:200]}")
 
@@ -971,23 +997,21 @@ def fireflies_webhook():
     if transcript_id in processed:
         return jsonify({"status": "already_processed"})
 
-    def _do_webhook_process():
-        try:
-            transcript = get_transcript_by_id(transcript_id)
-            if not transcript:
-                logger.error(f"Transcript not found: {transcript_id}")
-                return
-            approval_id = process_transcript_phase1(transcript)
-            proc = load_processed()
-            proc.add(transcript_id)
-            save_processed(proc)
-            logger.info(f"Webhook Phase 1 complete: approval_id={approval_id}")
-        except Exception as e:
-            logger.error(f"Webhook background error: {e}", exc_info=True)
+    try:
+        transcript = get_transcript_by_id(transcript_id)
+        if not transcript:
+            return jsonify({"error": "Transcript not found"}), 404
 
-    thread = threading.Thread(target=_do_webhook_process)
-    thread.start()
-    return jsonify({"status": "processing", "message": "Phase 1 started in background."})
+        approval_id = process_transcript_phase1(transcript)
+
+        processed.add(transcript_id)
+        save_processed(processed)
+
+        return jsonify({"status": "pending_approval", "approval_id": approval_id,
+                        "review_url": f"{APP_BASE_URL}/review/{approval_id}"})
+    except Exception as e:
+        logger.error(f"Webhook error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/review/<approval_id>", methods=["GET"])
@@ -1088,23 +1112,16 @@ def cancel_actions(approval_id: str):
 
 @app.route("/process/<transcript_id>", methods=["POST"])
 def manual_process(transcript_id: str):
-    """Manually trigger Phase 1 for a specific transcript (async)."""
-    import threading
-
-    def _do_process():
-        try:
-            transcript = get_transcript_by_id(transcript_id)
-            if not transcript:
-                logger.error(f"Transcript not found: {transcript_id}")
-                return
-            approval_id = process_transcript_phase1(transcript)
-            logger.info(f"Phase 1 complete: approval_id={approval_id}")
-        except Exception as e:
-            logger.error(f"Background processing failed for {transcript_id}: {e}", exc_info=True)
-
-    thread = threading.Thread(target=_do_process)
-    thread.start()
-    return jsonify({"status": "processing", "message": "Phase 1 started in background. Check your email for the approval link."})
+    """Manually trigger Phase 1 for a specific transcript."""
+    try:
+        transcript = get_transcript_by_id(transcript_id)
+        if not transcript:
+            return jsonify({"error": "Transcript not found"}), 404
+        approval_id = process_transcript_phase1(transcript)
+        return jsonify({"status": "pending_approval", "approval_id": approval_id,
+                        "review_url": f"{APP_BASE_URL}/review/{approval_id}"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ─── Polling (Fallback) ─────────────────────────────────────────────────────
