@@ -986,6 +986,7 @@ def health():
 @app.route("/webhook/fireflies", methods=["POST"])
 def fireflies_webhook():
     """Fireflies webhook — triggers Phase 1 (extract + queue for approval)."""
+    import threading
     payload = request.get_json(force=True)
     logger.info(f"Webhook received: {json.dumps(payload)[:200]}")
 
@@ -997,21 +998,23 @@ def fireflies_webhook():
     if transcript_id in processed:
         return jsonify({"status": "already_processed"})
 
-    try:
-        transcript = get_transcript_by_id(transcript_id)
-        if not transcript:
-            return jsonify({"error": "Transcript not found"}), 404
+    def _do_webhook_process():
+        try:
+            transcript = get_transcript_by_id(transcript_id)
+            if not transcript:
+                logger.error(f"Transcript not found: {transcript_id}")
+                return
+            approval_id = process_transcript_phase1(transcript)
+            proc = load_processed()
+            proc.add(transcript_id)
+            save_processed(proc)
+            logger.info(f"Webhook Phase 1 complete: approval_id={approval_id}")
+        except Exception as e:
+            logger.error(f"Webhook background error: {e}", exc_info=True)
 
-        approval_id = process_transcript_phase1(transcript)
-
-        processed.add(transcript_id)
-        save_processed(processed)
-
-        return jsonify({"status": "pending_approval", "approval_id": approval_id,
-                        "review_url": f"{APP_BASE_URL}/review/{approval_id}"})
-    except Exception as e:
-        logger.error(f"Webhook error: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+    thread = threading.Thread(target=_do_webhook_process)
+    thread.start()
+    return jsonify({"status": "processing", "message": "Phase 1 started in background."})
 
 
 @app.route("/review/<approval_id>", methods=["GET"])
@@ -1112,16 +1115,23 @@ def cancel_actions(approval_id: str):
 
 @app.route("/process/<transcript_id>", methods=["POST"])
 def manual_process(transcript_id: str):
-    """Manually trigger Phase 1 for a specific transcript."""
-    try:
-        transcript = get_transcript_by_id(transcript_id)
-        if not transcript:
-            return jsonify({"error": "Transcript not found"}), 404
-        approval_id = process_transcript_phase1(transcript)
-        return jsonify({"status": "pending_approval", "approval_id": approval_id,
-                        "review_url": f"{APP_BASE_URL}/review/{approval_id}"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    """Manually trigger Phase 1 for a specific transcript (async)."""
+    import threading
+
+    def _do_process():
+        try:
+            transcript = get_transcript_by_id(transcript_id)
+            if not transcript:
+                logger.error(f"Transcript not found: {transcript_id}")
+                return
+            approval_id = process_transcript_phase1(transcript)
+            logger.info(f"Phase 1 complete: approval_id={approval_id}")
+        except Exception as e:
+            logger.error(f"Background processing failed for {transcript_id}: {e}", exc_info=True)
+
+    thread = threading.Thread(target=_do_process)
+    thread.start()
+    return jsonify({"status": "processing", "message": "Phase 1 started in background. Check your email for the approval link."})
 
 
 # ─── Polling (Fallback) ─────────────────────────────────────────────────────
