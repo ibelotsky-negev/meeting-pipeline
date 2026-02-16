@@ -77,8 +77,11 @@ if HUBSPOT_OWNER_MAP_RAW:
     logger.info(f"Parsed HUBSPOT_OWNER_MAP: {HUBSPOT_OWNER_MAP}")
 
 # Track processed transcripts and pending approvals
-PROCESSED_FILE = "processed_transcripts.json"
-PENDING_FILE = "pending_approvals.json"
+# Railway volume mount: attach a volume at /data for persistence across deploys
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+PROCESSED_FILE = os.path.join(DATA_DIR, "processed_transcripts.json")
+PENDING_FILE = os.path.join(DATA_DIR, "pending_approvals.json")
 
 app = Flask(__name__)
 
@@ -247,7 +250,8 @@ Return a JSON object with exactly this structure:
             "owner_email": "person@email.com or empty string if unknown",
             "task": "Task description",
             "priority": "high/medium/low",
-            "due_context": "ASAP / next week / specific date if mentioned",
+            "due_context": "ASAP / tomorrow / this week / next week / end of month / specific date if mentioned",
+            "due_days": 7,
             "create_in": "both"
         }}
     ],
@@ -281,6 +285,7 @@ RULES:
 - Rate interest level based on language, engagement, and commitments made
 - Action items should be specific and assignable
 - For each action item, set owner_email to the person's email if known from participants or organizer info. If the owner is the organizer, use their email. If unknown, leave as empty string.
+- For due_days: convert relative time references from the conversation into integer days from the meeting date. Use: "ASAP"/"urgent"/"today" → 1, "tomorrow" → 1, "this week"/"few days" → 3, "next week" → 7, "couple weeks" → 14, "end of month" → 21, "next month" → 30. If a specific date is mentioned, calculate the days difference from the meeting date. Default to 7 if unclear.
 - Return ONLY valid JSON, no markdown
 """
 
@@ -491,6 +496,44 @@ def create_hubspot_contact(contact_info: dict, organizer_email: str = "") -> dic
     return result
 
 
+def resolve_due_date(item: dict, meeting_date_str: str) -> tuple:
+    """Convert due_days/due_context into actual dates for HubSpot and Asana.
+    Returns (hubspot_due: str ISO datetime, asana_due: str YYYY-MM-DD, display: str)"""
+    try:
+        meeting_dt = datetime.fromisoformat(meeting_date_str.replace("Z", "+00:00"))
+    except Exception:
+        meeting_dt = datetime.now(timezone.utc)
+
+    # Get due_days from Claude extraction, fallback to parsing due_context
+    due_days = item.get("due_days")
+    if due_days is None or not isinstance(due_days, (int, float)):
+        # Fallback: parse due_context string
+        ctx = (item.get("due_context") or "").lower()
+        if any(w in ctx for w in ["asap", "urgent", "today", "immediate"]):
+            due_days = 1
+        elif "tomorrow" in ctx:
+            due_days = 1
+        elif any(w in ctx for w in ["this week", "few days", "couple days"]):
+            due_days = 3
+        elif "next week" in ctx:
+            due_days = 7
+        elif any(w in ctx for w in ["two week", "couple week", "2 week"]):
+            due_days = 14
+        elif any(w in ctx for w in ["end of month", "month end"]):
+            due_days = 21
+        elif "next month" in ctx:
+            due_days = 30
+        else:
+            due_days = 7  # default
+
+    due_days = max(1, int(due_days))
+    due_dt = meeting_dt + timedelta(days=due_days)
+    hubspot_due = due_dt.strftime("%Y-%m-%dT17:00:00Z")
+    asana_due = due_dt.strftime("%Y-%m-%d")
+    display = due_dt.strftime("%b %d, %Y")
+    return hubspot_due, asana_due, display
+
+
 def log_hubspot_note(contact_id: str, note_body: str, meeting_date: str) -> dict:
     data = {
         "properties": {"hs_timestamp": meeting_date, "hs_note_body": note_body},
@@ -555,7 +598,7 @@ def find_asana_user_by_email(email: str) -> Optional[str]:
 #  NOTIFICATION — Alert organizer to review
 # ═══════════════════════════════════════════════════════════════════════════
 
-def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str, intelligence: dict = None):
+def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str, intelligence: dict = None, meeting_date_str: str = ""):
     """Send organizer a rich notification with meeting intelligence summary.
     Supports multiple channels: email, slack, teams (comma-separated in NOTIFY_VIA)."""
     review_url = f"{APP_BASE_URL}/review/{approval_id}"
@@ -594,10 +637,13 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
         task = item.get("task", "")
         priority = item.get("priority", "medium")
         priority_badge = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(priority, "⚪")
+        # Resolve due date for display
+        _, _, due_display = resolve_due_date(item, meeting_date_str)
         tasks_html += (
             f'<tr>'
             f'<td style="padding:8px 12px;border-bottom:1px solid #eee;">{priority_badge} {task}</td>'
             f'<td style="padding:8px 12px;border-bottom:1px solid #eee;color:#666;white-space:nowrap;">{owner}</td>'
+            f'<td style="padding:8px 12px;border-bottom:1px solid #eee;color:#888;white-space:nowrap;font-size:12px;">{due_display}</td>'
             f'</tr>'
         )
 
@@ -677,7 +723,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
                     '<div style="padding:20px 28px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
                     '<div style="font-size:12px;text-transform:uppercase;color:#64748b;font-weight:600;letter-spacing:0.5px;margin-bottom:12px;">Action Items</div>'
                     '<table style="width:100%;border-collapse:collapse;font-size:14px;">'
-                    '<tr style="background:#f1f5f9;"><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Task</th><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Owner</th></tr>'
+                    '<tr style="background:#f1f5f9;"><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Task</th><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Owner</th><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Due</th></tr>'
                     f'{tasks_html}'
                     '</table></div>'
                 )
@@ -790,7 +836,7 @@ def process_transcript_phase1(transcript: dict) -> str:
     save_pending(pending)
 
     # Notify organizer
-    notify_organizer(organizer_email, approval_id, title, intelligence)
+    notify_organizer(organizer_email, approval_id, title, intelligence, meeting_date)
 
     logger.info(f"Phase 1 complete. Approval ID: {approval_id} — awaiting organizer review.")
     return approval_id
@@ -843,21 +889,20 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
     # ── Tasks (HubSpot + Asana) ──
     action_items = intelligence.get("action_items", [])
     for item in action_items:
-        due = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%dT17:00:00Z")
-        due_date = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d")
+        hubspot_due, asana_due, due_display = resolve_due_date(item, meeting_date)
 
         # HubSpot task
         for email, cid in contact_ids.items():
             try:
-                create_hubspot_task(cid, item["task"], item.get("task", ""), due, organizer_email)
-                results["actions"].append(f"✅ HubSpot task: {item['task'][:60]}")
+                create_hubspot_task(cid, item["task"], item.get("task", ""), hubspot_due, organizer_email)
+                results["actions"].append(f"✅ HubSpot task: {item['task'][:60]} (due {due_display})")
             except Exception as e:
                 results["actions"].append(f"❌ HubSpot task failed: {e}")
             break
 
         # Asana task
         try:
-            notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {item.get('due_context', 'TBD')}"
+            notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {due_display} ({item.get('due_context', 'TBD')})"
             # Look up Asana user by owner email, fallback to organizer
             assignee_gid = None
             owner_email = item.get("owner_email", "")
@@ -865,8 +910,8 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
                 assignee_gid = find_asana_user_by_email(owner_email)
             if not assignee_gid and organizer_email:
                 assignee_gid = find_asana_user_by_email(organizer_email)
-            create_asana_task(item["task"], notes, due_date, assignee_gid)
-            results["actions"].append(f"✅ Asana task: {item['task'][:60]}")
+            create_asana_task(item["task"], notes, asana_due, assignee_gid)
+            results["actions"].append(f"✅ Asana task: {item['task'][:60]} (due {due_display})")
         except Exception as e:
             results["actions"].append(f"❌ Asana task failed: {e}")
 
@@ -1016,6 +1061,12 @@ REVIEW_TEMPLATE = """
                                         <option value="medium" {{ 'selected' if item.get('priority', 'medium') == 'medium' }}>Medium</option>
                                         <option value="low" {{ 'selected' if item.get('priority') == 'low' }}>Low</option>
                                     </select>
+                                </div>
+                                <div style="flex:0.5;">
+                                    <label>DUE (days)</label>
+                                    <input type="number" name="task_due_days_{{ loop.index0 }}" value="{{ item.get('due_days', 7) }}" min="1" max="90"
+                                           style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;">
+                                    <span style="font-size:11px;color:#94a3b8;">{{ item.get('due_context', '') }}</span>
                                 </div>
                             </div>
                         </div>
@@ -1200,7 +1251,9 @@ def approve_actions(approval_id: str):
         approved_tasks.append({
             "task": task_text,
             "owner": request.form.get(f"task_owner_{i}", ""),
+            "owner_email": data["intelligence"].get("action_items", [{}])[i].get("owner_email", "") if i < len(data["intelligence"].get("action_items", [])) else "",
             "priority": request.form.get(f"task_priority_{i}", "medium"),
+            "due_days": int(request.form.get(f"task_due_days_{i}", 7)),
             "due_context": data["intelligence"].get("action_items", [{}])[i].get("due_context", "1 week") if i < len(data["intelligence"].get("action_items", [])) else "1 week",
         })
     data["intelligence"]["action_items"] = approved_tasks
