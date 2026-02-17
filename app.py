@@ -42,53 +42,23 @@ MS_GRAPH_CLIENT_ID = os.environ.get("MS_GRAPH_CLIENT_ID", "")
 MS_GRAPH_CLIENT_SECRET = os.environ.get("MS_GRAPH_CLIENT_SECRET", "")
 MS_GRAPH_TENANT_ID = os.environ.get("MS_GRAPH_TENANT_ID", "")
 MS_GRAPH_REFRESH_TOKEN = os.environ.get("MS_GRAPH_REFRESH_TOKEN", "")  # For delegated flow
-# Auth mode: "delegated" (uses refresh_token, /me/ endpoints — single user only)
-#            "app" (uses client_credentials, /users/{email} endpoints — team-wide)
-# Auto-detected: if refresh_token set → delegated, else → app
-MS_GRAPH_AUTH_MODE = os.environ.get("MS_GRAPH_AUTH_MODE", "auto")
 
 # Configuration
 ASANA_WORKSPACE_GID = os.environ.get("ASANA_WORKSPACE_GID", "")
 ASANA_PROJECT_GID = os.environ.get("ASANA_PROJECT_GID", "")
-HUBSPOT_OWNER_ID = os.environ.get("HUBSPOT_OWNER_ID", "")  # Fallback default owner
+HUBSPOT_OWNER_ID = os.environ.get("HUBSPOT_OWNER_ID", "")
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "5"))
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8080")  # Your deployed URL
-NOTIFY_VIA = os.environ.get("NOTIFY_VIA", "email")  # "email" (per-organizer), "teams" (shared ops channel), or "email,teams" for both
+NOTIFY_VIA = os.environ.get("NOTIFY_VIA", "email")  # "email", "slack", "teams", or comma-separated: "email,teams"
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared ops channel for admin visibility
-BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@negevlabs.com (shared mailbox)
-BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
-# HubSpot owner map: maps organizer email → HubSpot owner ID
-# Supports two formats:
-#   JSON:   {"bk@negevlabs.com":"241153249","shlomi@negevlabs.com":"241153250"}
-#   Simple: bk@negevlabs.com:241153249,shlomi@negevlabs.com:241153250,dan@negevlabs.com:31299775
-HUBSPOT_OWNER_MAP_RAW = os.environ.get("HUBSPOT_OWNER_MAP", "")
-HUBSPOT_OWNER_MAP = {}
-if HUBSPOT_OWNER_MAP_RAW:
-    try:
-        HUBSPOT_OWNER_MAP = json.loads(HUBSPOT_OWNER_MAP_RAW)
-    except (json.JSONDecodeError, TypeError):
-        # Parse simple format: email:id,email:id
-        for pair in HUBSPOT_OWNER_MAP_RAW.split(","):
-            pair = pair.strip()
-            if ":" in pair:
-                email, owner_id = pair.rsplit(":", 1)
-                HUBSPOT_OWNER_MAP[email.strip()] = owner_id.strip()
-    logger.info(f"Parsed HUBSPOT_OWNER_MAP: {HUBSPOT_OWNER_MAP}")
+TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Teams Incoming Webhook (channel-level)
+TEAMS_NOTIFY_VIA_GRAPH = os.environ.get("TEAMS_NOTIFY_VIA_GRAPH", "false").lower() == "true"  # Use Graph API for 1:1 chat
 
 # Track processed transcripts and pending approvals
-# Railway volume mount: attach a volume at /data for persistence across deploys
-DATA_DIR = os.environ.get("DATA_DIR", "/data")
-os.makedirs(DATA_DIR, exist_ok=True)
-PROCESSED_FILE = os.path.join(DATA_DIR, "processed_transcripts.json")
-PENDING_FILE = os.path.join(DATA_DIR, "pending_approvals.json")
+PROCESSED_FILE = "processed_transcripts.json"
+PENDING_FILE = "pending_approvals.json"
 
 app = Flask(__name__)
-
-# Startup config summary
-_app_only = MS_GRAPH_AUTH_MODE == "app" or (MS_GRAPH_AUTH_MODE == "auto" and not MS_GRAPH_REFRESH_TOKEN)
-logger.info(f"Graph auth mode: {'app-only (team-wide)' if _app_only else 'delegated (single-user)'}")
-logger.info(f"HubSpot owner map: {len(HUBSPOT_OWNER_MAP)} entries | fallback: {HUBSPOT_OWNER_ID or 'none'}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -187,27 +157,10 @@ def extract_meeting_intelligence(transcript: dict) -> dict:
     summary = transcript.get("summary", {})
     sentences = transcript.get("sentences", [])
     transcript_text = "\n".join(
-        [f"{s.get('speaker_name', 'Unknown')}: {s.get('text', '')}" for s in sentences]
+        [f"{s.get('speaker_name', 'Unknown')}: {s.get('text', '')}" for s in sentences[:200]]
     )
 
-    # Business context — loaded from file if available, else env var, else default
-    business_context = ""
-    context_file = os.environ.get("BUSINESS_CONTEXT_FILE", "business_context.md")
-    if os.path.exists(context_file):
-        with open(context_file, "r") as f:
-            business_context = f.read()
-        logger.info(f"Loaded business context from {context_file} ({len(business_context)} chars)")
-    elif os.environ.get("BUSINESS_CONTEXT"):
-        business_context = os.environ["BUSINESS_CONTEXT"]
-    else:
-        business_context = "No specific business context provided. Extract general meeting intelligence."
-
-    prompt = f"""You are an expert biotech venture capital analyst and chief of staff.
-
-BUSINESS CONTEXT:
-{business_context}
-
-Analyze this meeting transcript and extract structured intelligence.
+    prompt = f"""Analyze this meeting transcript and extract structured intelligence.
 
 MEETING INFO:
 - Title: {transcript.get('title', 'Unknown')}
@@ -220,7 +173,7 @@ SUMMARY: {summary.get('short_summary', 'No summary available')}
 ACTION ITEMS (from Fireflies): {summary.get('action_items', 'None extracted')}
 KEY TOPICS: {summary.get('overview', '')}
 
-FULL TRANSCRIPT:
+TRANSCRIPT (first ~200 sentences):
 {transcript_text}
 
 ---
@@ -250,8 +203,7 @@ Return a JSON object with exactly this structure:
             "owner_email": "person@email.com or empty string if unknown",
             "task": "Task description",
             "priority": "high/medium/low",
-            "due_context": "ASAP / tomorrow / this week / next week / end of month / specific date if mentioned",
-            "due_days": 7,
+            "due_context": "ASAP / next week / specific date if mentioned",
             "create_in": "both"
         }}
     ],
@@ -269,11 +221,6 @@ Return a JSON object with exactly this structure:
 }}
 
 RULES:
-- Use the BUSINESS CONTEXT above to understand what matters in this meeting and extract high-value action items
-- Distinguish internal team members (@negevlabs.com, @ariadnebio.com, etc.) from external contacts
-- For investor/BD meetings: capture interest signals, objections, and next steps that matter for deal flow
-- For portfolio company meetings: capture strategic decisions, blockers, and deliverables
-- Action items should be specific, actionable, and reflect what was actually committed to in the conversation — not generic tasks
 - The follow-up email is FROM the organizer TO the other meeting participants (NOT to the organizer themselves)
 - to_recipients must NEVER include the organizer ({transcript.get('organizer_email', '')}). The email is sent BY the organizer, not TO them.
 - to_recipients should include the key external participants identified from the transcript speakers and discussion
@@ -285,13 +232,12 @@ RULES:
 - Rate interest level based on language, engagement, and commitments made
 - Action items should be specific and assignable
 - For each action item, set owner_email to the person's email if known from participants or organizer info. If the owner is the organizer, use their email. If unknown, leave as empty string.
-- For due_days: convert relative time references from the conversation into integer days from the meeting date. Use: "ASAP"/"urgent"/"today" → 1, "tomorrow" → 1, "this week"/"few days" → 3, "next week" → 7, "couple weeks" → 14, "end of month" → 21, "next month" → 30. If a specific date is mentioned, calculate the days difference from the meeting date. Default to 7 if unclear.
 - Return ONLY valid JSON, no markdown
 """
 
     message = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=8000,
+        max_tokens=4000,
         messages=[{"role": "user", "content": prompt}],
     )
     response_text = message.content[0].text.strip()
@@ -311,24 +257,14 @@ MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 _ms_token_cache = {"token": None, "expires_at": 0}
 
 
-def is_app_only_mode() -> bool:
-    """Determine if we're using app-only (team-wide) or delegated (single-user) auth."""
-    if MS_GRAPH_AUTH_MODE == "app":
-        return True
-    if MS_GRAPH_AUTH_MODE == "delegated":
-        return False
-    # Auto-detect: delegated if refresh token exists, else app-only
-    return not bool(MS_GRAPH_REFRESH_TOKEN)
-
-
 def get_ms_graph_token() -> str:
     """Get Microsoft Graph access token (supports both delegated and app-only)."""
     now = time.time()
     if _ms_token_cache["token"] and _ms_token_cache["expires_at"] > now + 60:
         return _ms_token_cache["token"]
 
-    if not is_app_only_mode():
-        # Delegated flow (send as specific user — single user only)
+    if MS_GRAPH_REFRESH_TOKEN:
+        # Delegated flow (send as specific user)
         data = {
             "client_id": MS_GRAPH_CLIENT_ID,
             "client_secret": MS_GRAPH_CLIENT_SECRET,
@@ -336,16 +272,14 @@ def get_ms_graph_token() -> str:
             "grant_type": "refresh_token",
             "scope": "https://graph.microsoft.com/Mail.ReadWrite",
         }
-        logger.info("Using delegated auth (single-user mode)")
     else:
-        # App-only flow (team-wide — requires Mail.ReadWrite application permission)
+        # App-only flow (requires Mail.ReadWrite application permission)
         data = {
             "client_id": MS_GRAPH_CLIENT_ID,
             "client_secret": MS_GRAPH_CLIENT_SECRET,
             "grant_type": "client_credentials",
             "scope": "https://graph.microsoft.com/.default",
         }
-        logger.info("Using app-only auth (team-wide mode)")
 
     resp = requests.post(MS_GRAPH_TOKEN_URL, data=data, timeout=15)
     resp.raise_for_status()
@@ -400,12 +334,12 @@ def create_outlook_draft(
     }
 
     # Create draft in sender's mailbox
-    # App-only: /users/{email}/messages  (team-wide — any user's mailbox)
-    # Delegated: /me/messages            (single-user — only authenticated user)
-    if is_app_only_mode():
-        url = f"{MS_GRAPH_BASE}/users/{sender_email}/messages"
-    else:
+    # App-only: /users/{email}/messages
+    # Delegated: /me/messages (if refresh token belongs to sender)
+    if MS_GRAPH_REFRESH_TOKEN:
         url = f"{MS_GRAPH_BASE}/me/messages"
+    else:
+        url = f"{MS_GRAPH_BASE}/users/{sender_email}/messages"
 
     resp = requests.post(url, json=message_payload, headers=headers, timeout=30)
     resp.raise_for_status()
@@ -422,13 +356,13 @@ def create_outlook_draft(
 HUBSPOT_BASE = "https://api.hubapi.com"
 
 
-def hubspot_request(method: str, endpoint: str, data: dict = None, params: dict = None) -> dict:
+def hubspot_request(method: str, endpoint: str, data: dict = None) -> dict:
     headers = {
         "Authorization": f"Bearer {HUBSPOT_API_KEY}",
         "Content-Type": "application/json",
     }
     url = f"{HUBSPOT_BASE}{endpoint}"
-    resp = requests.request(method, url, json=data, params=params, headers=headers, timeout=30)
+    resp = requests.request(method, url, json=data, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json() if resp.content else {}
 
@@ -443,43 +377,7 @@ def find_hubspot_contact(email: str) -> Optional[dict]:
     return results[0] if results else None
 
 
-# ── Dynamic HubSpot Owner Resolution ──
-
-_hubspot_owner_cache = {}  # email → owner_id cache
-
-
-def resolve_hubspot_owner(organizer_email: str) -> str:
-    """Resolve organizer email to HubSpot owner ID.
-    Priority: HUBSPOT_OWNER_MAP → HubSpot API lookup → HUBSPOT_OWNER_ID fallback."""
-    if not organizer_email:
-        return HUBSPOT_OWNER_ID
-
-    # Check static map first (fast, no API call)
-    if organizer_email in HUBSPOT_OWNER_MAP:
-        return HUBSPOT_OWNER_MAP[organizer_email]
-
-    # Check cache
-    if organizer_email in _hubspot_owner_cache:
-        return _hubspot_owner_cache[organizer_email]
-
-    # Try HubSpot owners API lookup by email
-    try:
-        result = hubspot_request("GET", "/crm/v3/owners", params={"email": organizer_email, "limit": 1})
-        owners = result.get("results", [])
-        if owners:
-            owner_id = str(owners[0].get("id", ""))
-            _hubspot_owner_cache[organizer_email] = owner_id
-            logger.info(f"Resolved HubSpot owner: {organizer_email} → {owner_id}")
-            return owner_id
-    except Exception as e:
-        logger.warning(f"HubSpot owner lookup failed for {organizer_email}: {e}")
-
-    # Fallback to default
-    _hubspot_owner_cache[organizer_email] = HUBSPOT_OWNER_ID
-    return HUBSPOT_OWNER_ID
-
-
-def create_hubspot_contact(contact_info: dict, organizer_email: str = "") -> dict:
+def create_hubspot_contact(contact_info: dict) -> dict:
     properties = {
         "firstname": contact_info.get("name", "").split()[0] if contact_info.get("name") else "",
         "lastname": " ".join(contact_info.get("name", "").split()[1:]) if contact_info.get("name") else "",
@@ -487,51 +385,12 @@ def create_hubspot_contact(contact_info: dict, organizer_email: str = "") -> dic
         "company": contact_info.get("company", ""),
         "jobtitle": contact_info.get("role", ""),
     }
-    owner_id = resolve_hubspot_owner(organizer_email)
-    if owner_id:
-        properties["hubspot_owner_id"] = owner_id
+    if HUBSPOT_OWNER_ID:
+        properties["hubspot_owner_id"] = HUBSPOT_OWNER_ID
     properties = {k: v for k, v in properties.items() if v}
     result = hubspot_request("POST", "/crm/v3/objects/contacts", {"properties": properties})
-    logger.info(f"Created HubSpot contact: {contact_info.get('name')} ({result.get('id')}) — owner: {owner_id or 'none'}")
+    logger.info(f"Created HubSpot contact: {contact_info.get('name')} ({result.get('id')})")
     return result
-
-
-def resolve_due_date(item: dict, meeting_date_str: str) -> tuple:
-    """Convert due_days/due_context into actual dates for HubSpot and Asana.
-    Returns (hubspot_due: str ISO datetime, asana_due: str YYYY-MM-DD, display: str)"""
-    try:
-        meeting_dt = datetime.fromisoformat(meeting_date_str.replace("Z", "+00:00"))
-    except Exception:
-        meeting_dt = datetime.now(timezone.utc)
-
-    # Get due_days from Claude extraction, fallback to parsing due_context
-    due_days = item.get("due_days")
-    if due_days is None or not isinstance(due_days, (int, float)):
-        # Fallback: parse due_context string
-        ctx = (item.get("due_context") or "").lower()
-        if any(w in ctx for w in ["asap", "urgent", "today", "immediate"]):
-            due_days = 1
-        elif "tomorrow" in ctx:
-            due_days = 1
-        elif any(w in ctx for w in ["this week", "few days", "couple days"]):
-            due_days = 3
-        elif "next week" in ctx:
-            due_days = 7
-        elif any(w in ctx for w in ["two week", "couple week", "2 week"]):
-            due_days = 14
-        elif any(w in ctx for w in ["end of month", "month end"]):
-            due_days = 21
-        elif "next month" in ctx:
-            due_days = 30
-        else:
-            due_days = 7  # default
-
-    due_days = max(1, int(due_days))
-    due_dt = meeting_dt + timedelta(days=due_days)
-    hubspot_due = due_dt.strftime("%Y-%m-%dT17:00:00Z")
-    asana_due = due_dt.strftime("%Y-%m-%d")
-    display = due_dt.strftime("%b %d, %Y")
-    return hubspot_due, asana_due, display
 
 
 def log_hubspot_note(contact_id: str, note_body: str, meeting_date: str) -> dict:
@@ -542,7 +401,7 @@ def log_hubspot_note(contact_id: str, note_body: str, meeting_date: str) -> dict
     return hubspot_request("POST", "/crm/v3/objects/notes", data)
 
 
-def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str, organizer_email: str = "") -> dict:
+def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str) -> dict:
     data = {
         "properties": {
             "hs_task_subject": subject, "hs_task_body": body,
@@ -551,9 +410,8 @@ def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str,
         },
         "associations": [{"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 204}]}],
     }
-    owner_id = resolve_hubspot_owner(organizer_email)
-    if owner_id:
-        data["properties"]["hubspot_owner_id"] = owner_id
+    if HUBSPOT_OWNER_ID:
+        data["properties"]["hubspot_owner_id"] = HUBSPOT_OWNER_ID
     return hubspot_request("POST", "/crm/v3/objects/tasks", data)
 
 
@@ -598,96 +456,58 @@ def find_asana_user_by_email(email: str) -> Optional[str]:
 #  NOTIFICATION — Alert organizer to review
 # ═══════════════════════════════════════════════════════════════════════════
 
-def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str, intelligence: dict = None, meeting_date_str: str = ""):
-    """Send organizer a rich notification with meeting intelligence summary.
+def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str):
+    """Send organizer a link to review and approve tasks + email draft.
     Supports multiple channels: email, slack, teams (comma-separated in NOTIFY_VIA)."""
     review_url = f"{APP_BASE_URL}/review/{approval_id}"
-    # Ensure URL has protocol for mobile auto-linking
-    if not review_url.startswith("http"):
-        review_url = f"https://{review_url}"
     channels = [c.strip().lower() for c in NOTIFY_VIA.split(",")]
-
-    # ── Extract display data from intelligence ──
-    intel = intelligence or {}
-    summary = intel.get("meeting_summary", "Meeting processed — review details below.")
-    meeting_type = intel.get("meeting_type", "Meeting")
-    action_items = intel.get("action_items", [])
-    contacts = intel.get("contacts", [])
-    email_draft = intel.get("follow_up_email", {})
-    key_insights = intel.get("key_insights", [])
-
-    # Clean meeting title: use Claude's extraction or trim raw Fireflies filename
-    clean_title = meeting_title
-    if len(meeting_title) > 80 or "organisations_" in meeting_title or "meetingAssistant" in meeting_title:
-        participant_names = [c.get("name", "") for c in contacts if c.get("name")]
-        if participant_names:
-            clean_title = f"{meeting_type} with {', '.join(participant_names[:2])}"
-        else:
-            clean_title = meeting_type or "Meeting"
-
-    # Counts
-    n_tasks = len(action_items)
-    n_contacts = len(contacts)
-    has_email = bool(email_draft.get("body"))
-
-    # Build action items HTML
-    tasks_html = ""
-    for item in action_items[:5]:
-        owner = item.get("owner", "Unassigned")
-        task = item.get("task", "")
-        priority = item.get("priority", "medium")
-        priority_badge = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(priority, "⚪")
-        # Resolve due date for display
-        _, _, due_display = resolve_due_date(item, meeting_date_str)
-        tasks_html += (
-            f'<tr>'
-            f'<td style="padding:8px 12px;border-bottom:1px solid #eee;">{priority_badge} {task}</td>'
-            f'<td style="padding:8px 12px;border-bottom:1px solid #eee;color:#666;white-space:nowrap;">{owner}</td>'
-            f'<td style="padding:8px 12px;border-bottom:1px solid #eee;color:#888;white-space:nowrap;font-size:12px;">{due_display}</td>'
-            f'</tr>'
-        )
-
-    # Build insights HTML (top 3)
-    insights_html = ""
-    for insight in key_insights[:3]:
-        insights_html += f'<li style="margin-bottom:6px;color:#444;">{insight}</li>'
 
     # ── Slack ──
     if "slack" in channels and SLACK_WEBHOOK_URL:
         try:
             requests.post(SLACK_WEBHOOK_URL, json={
                 "text": (
-                    f"📞 *Meeting processed: {clean_title}*\n"
-                    f"_{summary[:200]}_\n"
-                    f"📋 {n_tasks} action items | 👤 {n_contacts} contacts | {'📧 Draft ready' if has_email else ''}\n"
+                    f"📞 *Meeting processed: {meeting_title}*\n"
+                    f"Review tasks & follow-up email before they're created:\n"
                     f"👉 <{review_url}|Review & Approve>"
                 )
             }, timeout=10)
-            logger.info(f"Slack notification sent for {clean_title}")
+            logger.info(f"Slack notification sent for {meeting_title}")
         except Exception as e:
             logger.warning(f"Slack notification failed: {e}")
 
-    # ── Teams Webhook ──
-    TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")
+    # ── Teams (Incoming Webhook — posts to a channel) ──
     if "teams" in channels and TEAMS_WEBHOOK_URL:
         try:
+            # Adaptive Card format for Teams incoming webhook
             card_payload = {
                 "type": "message",
                 "attachments": [
                     {
                         "contentType": "application/vnd.microsoft.card.adaptive",
+                        "contentUrl": None,
                         "content": {
                             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                             "type": "AdaptiveCard",
                             "version": "1.4",
                             "body": [
-                                {"type": "TextBlock", "text": f"📞 {clean_title}", "weight": "Bolder", "size": "Medium"},
-                                {"type": "TextBlock", "text": summary[:200], "wrap": True},
+                                {
+                                    "type": "TextBlock",
+                                    "size": "medium",
+                                    "weight": "bolder",
+                                    "text": f"📞 Meeting Processed: {meeting_title}",
+                                    "wrap": True,
+                                },
+                                {
+                                    "type": "TextBlock",
+                                    "text": f"Claude extracted action items and a follow-up email draft. Review, edit, or delete before they're created in HubSpot, Asana, and Outlook.",
+                                    "wrap": True,
+                                    "spacing": "small",
+                                },
                                 {
                                     "type": "FactSet",
                                     "facts": [
                                         {"title": "Organizer", "value": organizer_email},
-                                        {"title": "Action Items", "value": str(n_tasks)},
                                         {"title": "Status", "value": "⏳ Awaiting your review"},
                                     ],
                                 },
@@ -706,96 +526,98 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
             }
             resp = requests.post(TEAMS_WEBHOOK_URL, json=card_payload, timeout=15)
             resp.raise_for_status()
-            logger.info(f"Teams webhook notification sent for {clean_title}")
+            logger.info(f"Teams webhook notification sent for {meeting_title}")
         except Exception as e:
             logger.warning(f"Teams webhook notification failed: {e}")
+
+    # ── Teams (Graph API — 1:1 chat message to organizer) ──
+    if "teams" in channels and TEAMS_NOTIFY_VIA_GRAPH and MS_GRAPH_CLIENT_ID:
+        try:
+            token = get_ms_graph_token()
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+            # Step 1: Create or get 1:1 chat with organizer
+            chat_payload = {
+                "chatType": "oneOnOne",
+                "members": [
+                    {
+                        "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                        "roles": ["owner"],
+                        "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{organizer_email}')",
+                    }
+                ],
+            }
+
+            # For app-only: use /chats endpoint; for delegated: need current user too
+            if MS_GRAPH_REFRESH_TOKEN:
+                # Delegated flow — include the app user as second member
+                # The /me reference auto-resolves to the authenticated user
+                me_resp = requests.get(f"{MS_GRAPH_BASE}/me", headers=headers, timeout=10)
+                me_data = me_resp.json()
+                my_id = me_data.get("id", "")
+                chat_payload["members"].insert(0, {
+                    "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                    "roles": ["owner"],
+                    "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{my_id}')",
+                })
+
+            chat_resp = requests.post(f"{MS_GRAPH_BASE}/chats", json=chat_payload,
+                                      headers=headers, timeout=15)
+            chat_resp.raise_for_status()
+            chat_id = chat_resp.json().get("id")
+
+            # Step 2: Send message to the chat
+            message_payload = {
+                "body": {
+                    "contentType": "html",
+                    "content": (
+                        f"<h3>📞 Meeting Processed: {meeting_title}</h3>"
+                        f"<p>Claude extracted action items and a follow-up email draft from your meeting.</p>"
+                        f"<p><b>Review, edit, or delete tasks before they're created:</b></p>"
+                        f'<p><a href="{review_url}">👉 Review & Approve Tasks</a></p>'
+                        f"<p><i>This link expires in 48 hours.</i></p>"
+                    ),
+                }
+            }
+            msg_resp = requests.post(f"{MS_GRAPH_BASE}/chats/{chat_id}/messages",
+                                     json=message_payload, headers=headers, timeout=15)
+            msg_resp.raise_for_status()
+            logger.info(f"Teams 1:1 chat message sent to {organizer_email}")
+        except Exception as e:
+            logger.warning(f"Teams Graph chat notification failed: {e}")
 
     # ── Email (via Outlook / Graph API) ──
     if "email" in channels and MS_GRAPH_CLIENT_ID:
         try:
             token = get_ms_graph_token()
             headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-            # Build tasks table
-            tasks_table = ""
-            if tasks_html:
-                tasks_table = (
-                    '<div style="padding:20px 28px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
-                    '<div style="font-size:12px;text-transform:uppercase;color:#64748b;font-weight:600;letter-spacing:0.5px;margin-bottom:12px;">Action Items</div>'
-                    '<table style="width:100%;border-collapse:collapse;font-size:14px;">'
-                    '<tr style="background:#f1f5f9;"><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Task</th><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Owner</th><th style="padding:8px 12px;text-align:left;font-weight:600;color:#475569;">Due</th></tr>'
-                    f'{tasks_html}'
-                    '</table></div>'
-                )
-
-            # Build insights section
-            insights_section = ""
-            if insights_html:
-                insights_section = (
-                    '<div style="padding:20px 28px;background:#fffbeb;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
-                    '<div style="font-size:12px;text-transform:uppercase;color:#92400e;font-weight:600;letter-spacing:0.5px;margin-bottom:8px;">💡 Key Insights</div>'
-                    f'<ul style="margin:0;padding-left:20px;font-size:14px;line-height:1.6;">{insights_html}</ul></div>'
-                )
-
-            email_html = (
-                '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;max-width:640px;margin:0 auto;color:#1a1a1a;">'
-                # Header
-                '<div style="background:linear-gradient(135deg,#1e3a5f,#2563eb);padding:24px 28px;border-radius:12px 12px 0 0;">'
-                '<div style="color:white;font-size:13px;text-transform:uppercase;letter-spacing:1px;opacity:0.85;">Meeting Intelligence Report</div>'
-                f'<div style="color:white;font-size:22px;font-weight:600;margin-top:8px;">{clean_title}</div>'
-                f'<div style="color:rgba(255,255,255,0.75);font-size:13px;margin-top:4px;">{meeting_type} &bull; {n_tasks} action items &bull; {n_contacts} contacts{"  &bull; Draft email ready" if has_email else ""}</div>'
-                '</div>'
-                # Summary
-                '<div style="background:#f8fafc;padding:20px 28px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
-                '<div style="font-size:12px;text-transform:uppercase;color:#64748b;font-weight:600;letter-spacing:0.5px;margin-bottom:8px;">Summary</div>'
-                f'<div style="font-size:14px;line-height:1.6;color:#334155;">{summary}</div>'
-                '</div>'
-                # Action Items
-                f'{tasks_table}'
-                # Key Insights
-                f'{insights_section}'
-                # CTA - raw URL (mobile Outlook strips <a> tags, raw https:// URLs auto-link)
-                '<div style="padding:28px;text-align:center;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
-                '<p style="margin:0 0 8px 0;font-weight:600;font-size:15px;">✅ Review &amp; Approve Tasks</p>'
-                f'<p style="margin:0;font-size:14px;">{review_url}</p>'
-                '<p style="margin:12px 0 0 0;font-size:12px;color:#94a3b8;">Review, edit, or delete items before they are created in HubSpot, Asana, and Outlook</p>'
-                '</div>'
-                # Footer
-                '<div style="background:#f1f5f9;padding:16px 28px;border-radius:0 0 12px 12px;border:1px solid #e2e8f0;border-top:none;">'
-                '<div style="font-size:12px;color:#64748b;">'
-                f'&mdash; {BOT_SENDER_NAME}<br>'
-                '<span style="color:#94a3b8;">Automated meeting intelligence by Negev Labs</span>'
-                '</div></div></div>'
-            )
-
             send_payload = {
                 "message": {
-                    "subject": f"✅ {clean_title} — {n_tasks} action items ready for review",
+                    "subject": f"✅ Review: Post-meeting tasks — {meeting_title}",
                     "body": {
                         "contentType": "HTML",
-                        "content": email_html,
+                        "content": (
+                            f"<h3>Meeting processed: {meeting_title}</h3>"
+                            f"<p>Claude extracted action items and drafted a follow-up email from your meeting.</p>"
+                            f"<p><strong>Review, edit, or delete before they're created:</strong></p>"
+                            f'<p><a href="{review_url}" style="background:#2563eb;color:white;padding:12px 24px;'
+                            f'text-decoration:none;border-radius:6px;font-weight:bold;">Review & Approve Tasks</a></p>'
+                            f"<p style='color:#666;font-size:12px;'>This link expires in 48 hours.</p>"
+                        ),
                     },
                     "toRecipients": [{"emailAddress": {"address": organizer_email}}],
                 },
             }
-            if BOT_SENDER_EMAIL:
-                send_payload["message"]["from"] = {
-                    "emailAddress": {"name": BOT_SENDER_NAME, "address": BOT_SENDER_EMAIL}
-                }
-            if is_app_only_mode():
-                # App-only: send from Sara's mailbox (or organizer's)
-                url = f"{MS_GRAPH_BASE}/users/{BOT_SENDER_EMAIL or organizer_email}/sendMail"
-            else:
-                # Delegated: send as authenticated user
+            if MS_GRAPH_REFRESH_TOKEN:
                 url = f"{MS_GRAPH_BASE}/me/sendMail"
+            else:
+                url = f"{MS_GRAPH_BASE}/users/{organizer_email}/sendMail"
             requests.post(url, json=send_payload, headers=headers, timeout=15)
-            logger.info(f"Email notification sent to {organizer_email} from {BOT_SENDER_EMAIL or 'self'}")
+            logger.info(f"Email notification sent to {organizer_email}")
         except Exception as e:
             logger.warning(f"Email notification failed: {e}")
 
-    logger.info(f"Review URL for '{clean_title}': {review_url}")
-
-
+    logger.info(f"Review URL for '{meeting_title}': {review_url}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -836,7 +658,7 @@ def process_transcript_phase1(transcript: dict) -> str:
     save_pending(pending)
 
     # Notify organizer
-    notify_organizer(organizer_email, approval_id, title, intelligence, meeting_date)
+    notify_organizer(organizer_email, approval_id, title)
 
     logger.info(f"Phase 1 complete. Approval ID: {approval_id} — awaiting organizer review.")
     return approval_id
@@ -871,7 +693,7 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
                 contact_ids[email] = existing["id"]
                 results["actions"].append(f"✅ Found HubSpot contact: {contact['name']}")
             else:
-                new_contact = create_hubspot_contact(contact, organizer_email)
+                new_contact = create_hubspot_contact(contact)
                 contact_ids[email] = new_contact["id"]
                 results["actions"].append(f"✅ Created HubSpot contact: {contact['name']}")
         except Exception as e:
@@ -889,29 +711,28 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
     # ── Tasks (HubSpot + Asana) ──
     action_items = intelligence.get("action_items", [])
     for item in action_items:
-        hubspot_due, asana_due, due_display = resolve_due_date(item, meeting_date)
+        due = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%dT17:00:00Z")
+        due_date = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d")
 
         # HubSpot task
         for email, cid in contact_ids.items():
             try:
-                create_hubspot_task(cid, item["task"], item.get("task", ""), hubspot_due, organizer_email)
-                results["actions"].append(f"✅ HubSpot task: {item['task'][:60]} (due {due_display})")
+                create_hubspot_task(cid, item["task"], item.get("task", ""), due)
+                results["actions"].append(f"✅ HubSpot task: {item['task'][:60]}")
             except Exception as e:
                 results["actions"].append(f"❌ HubSpot task failed: {e}")
             break
 
         # Asana task
         try:
-            notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {due_display} ({item.get('due_context', 'TBD')})"
-            # Look up Asana user by owner email, fallback to organizer
+            notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {item.get('due_context', 'TBD')}"
+            # Look up Asana user by owner email
             assignee_gid = None
             owner_email = item.get("owner_email", "")
             if owner_email:
                 assignee_gid = find_asana_user_by_email(owner_email)
-            if not assignee_gid and organizer_email:
-                assignee_gid = find_asana_user_by_email(organizer_email)
-            create_asana_task(item["task"], notes, asana_due, assignee_gid)
-            results["actions"].append(f"✅ Asana task: {item['task'][:60]} (due {due_display})")
+            create_asana_task(item["task"], notes, due_date, assignee_gid)
+            results["actions"].append(f"✅ Asana task: {item['task'][:60]}")
         except Exception as e:
             results["actions"].append(f"❌ Asana task failed: {e}")
 
@@ -1062,12 +883,6 @@ REVIEW_TEMPLATE = """
                                         <option value="low" {{ 'selected' if item.get('priority') == 'low' }}>Low</option>
                                     </select>
                                 </div>
-                                <div style="flex:0.5;">
-                                    <label>DUE (days)</label>
-                                    <input type="number" name="task_due_days_{{ loop.index0 }}" value="{{ item.get('due_days', 7) }}" min="1" max="90"
-                                           style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;">
-                                    <span style="font-size:11px;color:#94a3b8;">{{ item.get('due_context', '') }}</span>
-                                </div>
                             </div>
                         </div>
                         <div style="margin-left:12px; padding-top:20px;">
@@ -1168,26 +983,9 @@ def health():
     return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
 
 
-@app.route("/config", methods=["GET"])
-def config_check():
-    """Diagnostic: verify team-wide config (no secrets exposed)."""
-    return jsonify({
-        "graph_auth_mode": "app-only (team-wide)" if is_app_only_mode() else "delegated (single-user)",
-        "graph_client_id_set": bool(MS_GRAPH_CLIENT_ID),
-        "graph_tenant_id_set": bool(MS_GRAPH_TENANT_ID),
-        "bot_sender": BOT_SENDER_EMAIL or "(not set)",
-        "hubspot_owner_map_raw": HUBSPOT_OWNER_MAP_RAW[:200] if HUBSPOT_OWNER_MAP_RAW else "(empty)",
-        "hubspot_owner_map_entries": len(HUBSPOT_OWNER_MAP),
-        "hubspot_owner_map_emails": list(HUBSPOT_OWNER_MAP.keys()),
-        "hubspot_fallback_owner": HUBSPOT_OWNER_ID or "(not set)",
-        "notify_via": NOTIFY_VIA,
-    })
-
-
 @app.route("/webhook/fireflies", methods=["POST"])
 def fireflies_webhook():
     """Fireflies webhook — triggers Phase 1 (extract + queue for approval)."""
-    import threading
     payload = request.get_json(force=True)
     logger.info(f"Webhook received: {json.dumps(payload)[:200]}")
 
@@ -1199,23 +997,21 @@ def fireflies_webhook():
     if transcript_id in processed:
         return jsonify({"status": "already_processed"})
 
-    def _do_webhook_process():
-        try:
-            transcript = get_transcript_by_id(transcript_id)
-            if not transcript:
-                logger.error(f"Transcript not found: {transcript_id}")
-                return
-            approval_id = process_transcript_phase1(transcript)
-            proc = load_processed()
-            proc.add(transcript_id)
-            save_processed(proc)
-            logger.info(f"Webhook Phase 1 complete: approval_id={approval_id}")
-        except Exception as e:
-            logger.error(f"Webhook background error: {e}", exc_info=True)
+    try:
+        transcript = get_transcript_by_id(transcript_id)
+        if not transcript:
+            return jsonify({"error": "Transcript not found"}), 404
 
-    thread = threading.Thread(target=_do_webhook_process)
-    thread.start()
-    return jsonify({"status": "processing", "message": "Phase 1 started in background."})
+        approval_id = process_transcript_phase1(transcript)
+
+        processed.add(transcript_id)
+        save_processed(processed)
+
+        return jsonify({"status": "pending_approval", "approval_id": approval_id,
+                        "review_url": f"{APP_BASE_URL}/review/{approval_id}"})
+    except Exception as e:
+        logger.error(f"Webhook error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/review/<approval_id>", methods=["GET"])
@@ -1251,9 +1047,7 @@ def approve_actions(approval_id: str):
         approved_tasks.append({
             "task": task_text,
             "owner": request.form.get(f"task_owner_{i}", ""),
-            "owner_email": data["intelligence"].get("action_items", [{}])[i].get("owner_email", "") if i < len(data["intelligence"].get("action_items", [])) else "",
             "priority": request.form.get(f"task_priority_{i}", "medium"),
-            "due_days": int(request.form.get(f"task_due_days_{i}", 7)),
             "due_context": data["intelligence"].get("action_items", [{}])[i].get("due_context", "1 week") if i < len(data["intelligence"].get("action_items", [])) else "1 week",
         })
     data["intelligence"]["action_items"] = approved_tasks
@@ -1316,25 +1110,18 @@ def cancel_actions(approval_id: str):
                                   status_emoji="🚫", actions=[])
 
 
-@app.route("/process/<transcript_id>", methods=["GET", "POST"])
+@app.route("/process/<transcript_id>", methods=["POST"])
 def manual_process(transcript_id: str):
-    """Manually trigger Phase 1 for a specific transcript (async)."""
-    import threading
-
-    def _do_process():
-        try:
-            transcript = get_transcript_by_id(transcript_id)
-            if not transcript:
-                logger.error(f"Transcript not found: {transcript_id}")
-                return
-            approval_id = process_transcript_phase1(transcript)
-            logger.info(f"Phase 1 complete: approval_id={approval_id}")
-        except Exception as e:
-            logger.error(f"Background processing failed for {transcript_id}: {e}", exc_info=True)
-
-    thread = threading.Thread(target=_do_process)
-    thread.start()
-    return jsonify({"status": "processing", "message": "Phase 1 started in background. Check your email for the approval link."})
+    """Manually trigger Phase 1 for a specific transcript."""
+    try:
+        transcript = get_transcript_by_id(transcript_id)
+        if not transcript:
+            return jsonify({"error": "Transcript not found"}), 404
+        approval_id = process_transcript_phase1(transcript)
+        return jsonify({"status": "pending_approval", "approval_id": approval_id,
+                        "review_url": f"{APP_BASE_URL}/review/{approval_id}"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ─── Polling (Fallback) ─────────────────────────────────────────────────────
