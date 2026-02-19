@@ -184,8 +184,8 @@ def get_transcript_by_id(transcript_id: str) -> dict:
 
 def extract_meeting_intelligence(transcript: dict) -> dict:
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-    summary = transcript.get("summary", {})
-    sentences = transcript.get("sentences", [])
+    summary = transcript.get("summary") or {}
+    sentences = transcript.get("sentences") or []
     transcript_text = "\n".join(
         [f"{s.get('speaker_name', 'Unknown')}: {s.get('text', '')}" for s in sentences]
     )
@@ -213,7 +213,7 @@ MEETING INFO:
 - Title: {transcript.get('title', 'Unknown')}
 - Date: {transcript.get('dateString', 'Unknown')}
 - Duration: {transcript.get('duration', 'Unknown')} minutes
-- Participants: {', '.join(transcript.get('participants', []))}
+- Participants: {', '.join(transcript.get('participants') or [])}
 - Organizer: {transcript.get('organizer_email', 'Unknown')}
 
 SUMMARY: {summary.get('short_summary', 'No summary available')}
@@ -825,7 +825,7 @@ def process_transcript_phase1(transcript: dict) -> str:
         "title": title,
         "meeting_date": meeting_date,
         "organizer_email": organizer_email,
-        "participants": transcript.get("participants", []),
+        "participants": transcript.get("participants") or [],
         "intelligence": intelligence,
         "status": "pending",  # pending → approved → executed
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1170,7 +1170,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.1.0-meetingId-fix", "deployed": "2026-02-17"})
+    return jsonify({"version": "2.2.0-null-safe-retry", "deployed": "2026-02-19"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1218,9 +1218,22 @@ def fireflies_webhook():
     def _do_webhook_process():
         try:
             logger.info(f"Webhook thread: fetching transcript {transcript_id}")
-            transcript = get_transcript_by_id(transcript_id)
+            transcript = None
+            # Retry up to 3 times with increasing delay — webhook may fire before transcript is ready
+            for attempt in range(1, 4):
+                try:
+                    transcript = get_transcript_by_id(transcript_id)
+                except Exception as fetch_err:
+                    logger.warning(f"Webhook thread: fetch attempt {attempt}/3 failed: {fetch_err}")
+                    transcript = None
+                if transcript:
+                    break
+                wait_seconds = attempt * 15  # 15s, 30s, 45s
+                logger.info(f"Webhook thread: transcript not available, retry {attempt}/3 in {wait_seconds}s...")
+                import time
+                time.sleep(wait_seconds)
             if not transcript:
-                logger.error(f"Webhook thread: transcript not found: {transcript_id}")
+                logger.error(f"Webhook thread: transcript not found after 3 attempts: {transcript_id}")
                 return
             logger.info(f"Webhook thread: got transcript '{transcript.get('title', '?')}', starting Phase 1")
             approval_id = process_transcript_phase1(transcript)
