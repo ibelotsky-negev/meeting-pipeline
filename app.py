@@ -1,12 +1,12 @@
 """
 Post-Meeting Intelligence Pipeline v2
-Fireflies → Claude AI → Approval UI → HubSpot + Asana + Outlook Draft
+Fireflies â†’ Claude AI â†’ Approval UI â†’ HubSpot + Asana + Outlook Draft
 
 Flow:
 1. Fireflies triggers (webhook or poll) when transcript is ready
 2. Claude extracts intelligence (signals, action items, contacts, email draft)
 3. Organizer receives approval link (email or Slack)
-4. Organizer reviews tasks & email draft in a web UI — can edit, delete, or approve
+4. Organizer reviews tasks & email draft in a web UI â€” can edit, delete, or approve
 5. On approval: HubSpot updated, Asana tasks created, Outlook draft saved
 
 Author: Negev Labs
@@ -26,7 +26,7 @@ import requests
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ─── Configuration ───────────────────────────────────────────────────────────
+# â”€â”€â”€ Configuration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -37,14 +37,14 @@ CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
 HUBSPOT_API_KEY = os.environ["HUBSPOT_API_KEY"]
 ASANA_API_KEY = os.environ["ASANA_API_KEY"]
 
-# Microsoft Graph (Outlook) — OAuth2 client credentials or delegated
+# Microsoft Graph (Outlook) â€” OAuth2 client credentials or delegated
 MS_GRAPH_CLIENT_ID = os.environ.get("MS_GRAPH_CLIENT_ID", "")
 MS_GRAPH_CLIENT_SECRET = os.environ.get("MS_GRAPH_CLIENT_SECRET", "")
 MS_GRAPH_TENANT_ID = os.environ.get("MS_GRAPH_TENANT_ID", "")
 MS_GRAPH_REFRESH_TOKEN = os.environ.get("MS_GRAPH_REFRESH_TOKEN", "")  # For delegated flow
-# Auth mode: "delegated" (uses refresh_token, /me/ endpoints — single user only)
-#            "app" (uses client_credentials, /users/{email} endpoints — team-wide)
-# Auto-detected: if refresh_token set → delegated, else → app
+# Auth mode: "delegated" (uses refresh_token, /me/ endpoints â€” single user only)
+#            "app" (uses client_credentials, /users/{email} endpoints â€” team-wide)
+# Auto-detected: if refresh_token set â†’ delegated, else â†’ app
 MS_GRAPH_AUTH_MODE = os.environ.get("MS_GRAPH_AUTH_MODE", "auto")
 
 # Configuration
@@ -58,7 +58,7 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared ops channel for admin visibility
 BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@negevlabs.com (shared mailbox)
 BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
-# HubSpot owner map: maps organizer email → HubSpot owner ID
+# HubSpot owner map: maps organizer email â†’ HubSpot owner ID
 # Supports two formats:
 #   JSON:   {"bk@negevlabs.com":"241153249","shlomi@negevlabs.com":"241153250"}
 #   Simple: bk@negevlabs.com:241153249,shlomi@negevlabs.com:241153250,dan@negevlabs.com:31299775
@@ -91,9 +91,9 @@ logger.info(f"Graph auth mode: {'app-only (team-wide)' if _app_only else 'delega
 logger.info(f"HubSpot owner map: {len(HUBSPOT_OWNER_MAP)} entries | fallback: {HUBSPOT_OWNER_ID or 'none'}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  PENDING APPROVALS STORE
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def load_pending() -> dict:
     try:
@@ -121,9 +121,9 @@ def save_processed(processed: set):
         json.dump(list(processed), f)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  FIREFLIES API
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
 
@@ -178,9 +178,9 @@ def get_transcript_by_id(transcript_id: str) -> dict:
     return data.get("transcript")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CLAUDE AI — INTELLIGENCE EXTRACTION
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  CLAUDE AI â€” INTELLIGENCE EXTRACTION
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def extract_meeting_intelligence(transcript: dict) -> dict:
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
@@ -190,7 +190,7 @@ def extract_meeting_intelligence(transcript: dict) -> dict:
         [f"{s.get('speaker_name', 'Unknown')}: {s.get('text', '')}" for s in sentences]
     )
 
-    # Business context — loaded from file if available, else env var, else default
+    # Business context â€” loaded from file if available, else env var, else default
     business_context = ""
     context_file = os.environ.get("BUSINESS_CONTEXT_FILE", "business_context.md")
     if os.path.exists(context_file):
@@ -273,7 +273,7 @@ RULES:
 - Distinguish internal team members (@negevlabs.com, @ariadnebio.com, etc.) from external contacts
 - For investor/BD meetings: capture interest signals, objections, and next steps that matter for deal flow
 - For portfolio company meetings: capture strategic decisions, blockers, and deliverables
-- Action items should be specific, actionable, and reflect what was actually committed to in the conversation — not generic tasks
+- Action items should be specific, actionable, and reflect what was actually committed to in the conversation â€” not generic tasks
 - The follow-up email is FROM the organizer TO the other meeting participants (NOT to the organizer themselves)
 - to_recipients must NEVER include the organizer ({transcript.get('organizer_email', '')}). The email is sent BY the organizer, not TO them.
 - to_recipients should include the key external participants identified from the transcript speakers and discussion
@@ -285,7 +285,7 @@ RULES:
 - Rate interest level based on language, engagement, and commitments made
 - Action items should be specific and assignable
 - For each action item, set owner_email to the person's email if known from participants or organizer info. If the owner is the organizer, use their email. If unknown, leave as empty string.
-- For due_days: convert relative time references from the conversation into integer days from the meeting date. Use: "ASAP"/"urgent"/"today" → 1, "tomorrow" → 1, "this week"/"few days" → 3, "next week" → 7, "couple weeks" → 14, "end of month" → 21, "next month" → 30. If a specific date is mentioned, calculate the days difference from the meeting date. Default to 7 if unclear.
+- For due_days: convert relative time references from the conversation into integer days from the meeting date. Use: "ASAP"/"urgent"/"today" â†’ 1, "tomorrow" â†’ 1, "this week"/"few days" â†’ 3, "next week" â†’ 7, "couple weeks" â†’ 14, "end of month" â†’ 21, "next month" â†’ 30. If a specific date is mentioned, calculate the days difference from the meeting date. Default to 7 if unclear.
 - Return ONLY valid JSON, no markdown
 """
 
@@ -301,9 +301,9 @@ RULES:
     return json.loads(response_text)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  MICROSOFT GRAPH — OUTLOOK DRAFT CREATION
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  MICROSOFT GRAPH â€” OUTLOOK DRAFT CREATION
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 MS_GRAPH_TOKEN_URL = f"https://login.microsoftonline.com/{MS_GRAPH_TENANT_ID}/oauth2/v2.0/token"
 MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -328,7 +328,7 @@ def get_ms_graph_token() -> str:
         return _ms_token_cache["token"]
 
     if not is_app_only_mode():
-        # Delegated flow (send as specific user — single user only)
+        # Delegated flow (send as specific user â€” single user only)
         data = {
             "client_id": MS_GRAPH_CLIENT_ID,
             "client_secret": MS_GRAPH_CLIENT_SECRET,
@@ -338,7 +338,7 @@ def get_ms_graph_token() -> str:
         }
         logger.info("Using delegated auth (single-user mode)")
     else:
-        # App-only flow (team-wide — requires Mail.ReadWrite application permission)
+        # App-only flow (team-wide â€” requires Mail.ReadWrite application permission)
         data = {
             "client_id": MS_GRAPH_CLIENT_ID,
             "client_secret": MS_GRAPH_CLIENT_SECRET,
@@ -400,8 +400,8 @@ def create_outlook_draft(
     }
 
     # Create draft in sender's mailbox
-    # App-only: /users/{email}/messages  (team-wide — any user's mailbox)
-    # Delegated: /me/messages            (single-user — only authenticated user)
+    # App-only: /users/{email}/messages  (team-wide â€” any user's mailbox)
+    # Delegated: /me/messages            (single-user â€” only authenticated user)
     if is_app_only_mode():
         url = f"{MS_GRAPH_BASE}/users/{sender_email}/messages"
     else:
@@ -415,9 +415,9 @@ def create_outlook_draft(
     return draft
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  HUBSPOT API
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 HUBSPOT_BASE = "https://api.hubapi.com"
 
@@ -443,14 +443,14 @@ def find_hubspot_contact(email: str) -> Optional[dict]:
     return results[0] if results else None
 
 
-# ── Dynamic HubSpot Owner Resolution ──
+# â”€â”€ Dynamic HubSpot Owner Resolution â”€â”€
 
-_hubspot_owner_cache = {}  # email → owner_id cache
+_hubspot_owner_cache = {}  # email â†’ owner_id cache
 
 
 def resolve_hubspot_owner(organizer_email: str) -> str:
     """Resolve organizer email to HubSpot owner ID.
-    Priority: HUBSPOT_OWNER_MAP → HubSpot API lookup → HUBSPOT_OWNER_ID fallback."""
+    Priority: HUBSPOT_OWNER_MAP â†’ HubSpot API lookup â†’ HUBSPOT_OWNER_ID fallback."""
     if not organizer_email:
         return HUBSPOT_OWNER_ID
 
@@ -469,7 +469,7 @@ def resolve_hubspot_owner(organizer_email: str) -> str:
         if owners:
             owner_id = str(owners[0].get("id", ""))
             _hubspot_owner_cache[organizer_email] = owner_id
-            logger.info(f"Resolved HubSpot owner: {organizer_email} → {owner_id}")
+            logger.info(f"Resolved HubSpot owner: {organizer_email} â†’ {owner_id}")
             return owner_id
     except Exception as e:
         logger.warning(f"HubSpot owner lookup failed for {organizer_email}: {e}")
@@ -492,7 +492,7 @@ def create_hubspot_contact(contact_info: dict, organizer_email: str = "") -> dic
         properties["hubspot_owner_id"] = owner_id
     properties = {k: v for k, v in properties.items() if v}
     result = hubspot_request("POST", "/crm/v3/objects/contacts", {"properties": properties})
-    logger.info(f"Created HubSpot contact: {contact_info.get('name')} ({result.get('id')}) — owner: {owner_id or 'none'}")
+    logger.info(f"Created HubSpot contact: {contact_info.get('name')} ({result.get('id')}) â€” owner: {owner_id or 'none'}")
     return result
 
 
@@ -557,9 +557,9 @@ def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str,
     return hubspot_request("POST", "/crm/v3/objects/tasks", data)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  ASANA API
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 ASANA_BASE = "https://app.asana.com/api/1.0"
 
@@ -594,9 +594,9 @@ def find_asana_user_by_email(email: str) -> Optional[str]:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  NOTIFICATION — Alert organizer to review
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  NOTIFICATION â€” Alert organizer to review
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str, intelligence: dict = None, meeting_date_str: str = ""):
     """Send organizer a rich notification with meeting intelligence summary.
@@ -607,9 +607,9 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
         review_url = f"https://{review_url}"
     channels = [c.strip().lower() for c in NOTIFY_VIA.split(",")]
 
-    # ── Extract display data from intelligence ──
+    # â”€â”€ Extract display data from intelligence â”€â”€
     intel = intelligence or {}
-    summary = intel.get("meeting_summary", "Meeting processed — review details below.")
+    summary = intel.get("meeting_summary", "Meeting processed â€” review details below.")
     meeting_type = intel.get("meeting_type", "Meeting")
     action_items = intel.get("action_items", [])
     contacts = intel.get("contacts", [])
@@ -636,7 +636,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
         owner = item.get("owner", "Unassigned")
         task = item.get("task", "")
         priority = item.get("priority", "medium")
-        priority_badge = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(priority, "⚪")
+        priority_badge = {"high": "ðŸ”´", "medium": "ðŸŸ¡", "low": "ðŸŸ¢"}.get(priority, "âšª")
         # Resolve due date for display
         _, _, due_display = resolve_due_date(item, meeting_date_str)
         tasks_html += (
@@ -652,22 +652,22 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
     for insight in key_insights[:3]:
         insights_html += f'<li style="margin-bottom:6px;color:#444;">{insight}</li>'
 
-    # ── Slack ──
+    # â”€â”€ Slack â”€â”€
     if "slack" in channels and SLACK_WEBHOOK_URL:
         try:
             requests.post(SLACK_WEBHOOK_URL, json={
                 "text": (
-                    f"📞 *Meeting processed: {clean_title}*\n"
+                    f"ðŸ“ž *Meeting processed: {clean_title}*\n"
                     f"_{summary[:200]}_\n"
-                    f"📋 {n_tasks} action items | 👤 {n_contacts} contacts | {'📧 Draft ready' if has_email else ''}\n"
-                    f"👉 <{review_url}|Review & Approve>"
+                    f"ðŸ“‹ {n_tasks} action items | ðŸ‘¤ {n_contacts} contacts | {'ðŸ“§ Draft ready' if has_email else ''}\n"
+                    f"ðŸ‘‰ <{review_url}|Review & Approve>"
                 )
             }, timeout=10)
             logger.info(f"Slack notification sent for {clean_title}")
         except Exception as e:
             logger.warning(f"Slack notification failed: {e}")
 
-    # ── Teams Webhook ──
+    # â”€â”€ Teams Webhook â”€â”€
     TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")
     if "teams" in channels and TEAMS_WEBHOOK_URL:
         try:
@@ -681,21 +681,21 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
                             "type": "AdaptiveCard",
                             "version": "1.4",
                             "body": [
-                                {"type": "TextBlock", "text": f"📞 {clean_title}", "weight": "Bolder", "size": "Medium"},
+                                {"type": "TextBlock", "text": f"ðŸ“ž {clean_title}", "weight": "Bolder", "size": "Medium"},
                                 {"type": "TextBlock", "text": summary[:200], "wrap": True},
                                 {
                                     "type": "FactSet",
                                     "facts": [
                                         {"title": "Organizer", "value": organizer_email},
                                         {"title": "Action Items", "value": str(n_tasks)},
-                                        {"title": "Status", "value": "⏳ Awaiting your review"},
+                                        {"title": "Status", "value": "â³ Awaiting your review"},
                                     ],
                                 },
                             ],
                             "actions": [
                                 {
                                     "type": "Action.OpenUrl",
-                                    "title": "✅ Review & Approve Tasks",
+                                    "title": "âœ… Review & Approve Tasks",
                                     "url": review_url,
                                     "style": "positive",
                                 },
@@ -710,7 +710,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
         except Exception as e:
             logger.warning(f"Teams webhook notification failed: {e}")
 
-    # ── Email (via Outlook / Graph API) ──
+    # â”€â”€ Email (via Outlook / Graph API) â”€â”€
     if "email" in channels and MS_GRAPH_CLIENT_ID:
         try:
             token = get_ms_graph_token()
@@ -733,7 +733,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
             if insights_html:
                 insights_section = (
                     '<div style="padding:20px 28px;background:#fffbeb;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
-                    '<div style="font-size:12px;text-transform:uppercase;color:#92400e;font-weight:600;letter-spacing:0.5px;margin-bottom:8px;">💡 Key Insights</div>'
+                    '<div style="font-size:12px;text-transform:uppercase;color:#92400e;font-weight:600;letter-spacing:0.5px;margin-bottom:8px;">ðŸ’¡ Key Insights</div>'
                     f'<ul style="margin:0;padding-left:20px;font-size:14px;line-height:1.6;">{insights_html}</ul></div>'
                 )
 
@@ -756,7 +756,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
                 f'{insights_section}'
                 # CTA - raw URL (mobile Outlook strips <a> tags, raw https:// URLs auto-link)
                 '<div style="padding:28px;text-align:center;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
-                '<p style="margin:0 0 8px 0;font-weight:600;font-size:15px;">✅ Review &amp; Approve Tasks</p>'
+                '<p style="margin:0 0 8px 0;font-weight:600;font-size:15px;">âœ… Review &amp; Approve Tasks</p>'
                 f'<p style="margin:0;font-size:14px;">{review_url}</p>'
                 '<p style="margin:12px 0 0 0;font-size:12px;color:#94a3b8;">Review, edit, or delete items before they are created in HubSpot, Asana, and Outlook</p>'
                 '</div>'
@@ -770,7 +770,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
 
             send_payload = {
                 "message": {
-                    "subject": f"✅ {clean_title} — {n_tasks} action items ready for review",
+                    "subject": f"âœ… {clean_title} â€” {n_tasks} action items ready for review",
                     "body": {
                         "contentType": "HTML",
                         "content": email_html,
@@ -798,9 +798,9 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
 
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PIPELINE — Phase 1: Extract & Queue for Approval
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  PIPELINE â€” Phase 1: Extract & Queue for Approval
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def process_transcript_phase1(transcript: dict) -> str:
     """
@@ -812,7 +812,7 @@ def process_transcript_phase1(transcript: dict) -> str:
     meeting_date = transcript.get("dateString", datetime.now(timezone.utc).isoformat())
     organizer_email = transcript.get("organizer_email", "")
 
-    logger.info(f"═══ Phase 1: Extracting intelligence for '{title}' ═══")
+    logger.info(f"â•â•â• Phase 1: Extracting intelligence for '{title}' â•â•â•")
 
     # Extract intelligence via Claude
     intelligence = extract_meeting_intelligence(transcript)
@@ -827,7 +827,7 @@ def process_transcript_phase1(transcript: dict) -> str:
         "organizer_email": organizer_email,
         "participants": transcript.get("participants") or [],
         "intelligence": intelligence,
-        "status": "pending",  # pending → approved → executed
+        "status": "pending",  # pending â†’ approved â†’ executed
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -838,13 +838,13 @@ def process_transcript_phase1(transcript: dict) -> str:
     # Notify organizer
     notify_organizer(organizer_email, approval_id, title, intelligence, meeting_date)
 
-    logger.info(f"Phase 1 complete. Approval ID: {approval_id} — awaiting organizer review.")
+    logger.info(f"Phase 1 complete. Approval ID: {approval_id} â€” awaiting organizer review.")
     return approval_id
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PIPELINE — Phase 2: Execute Approved Actions
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  PIPELINE â€” Phase 2: Execute Approved Actions
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
     """
@@ -857,7 +857,7 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
     title = approved_data["title"]
     organizer_email = approved_data["organizer_email"]
 
-    # ── HubSpot: Contacts + Notes ──
+    # â”€â”€ HubSpot: Contacts + Notes â”€â”€
     contact_ids = {}
     for contact in intelligence.get("contacts", []):
         if contact.get("is_internal"):
@@ -869,24 +869,24 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
             existing = find_hubspot_contact(email)
             if existing:
                 contact_ids[email] = existing["id"]
-                results["actions"].append(f"✅ Found HubSpot contact: {contact['name']}")
+                results["actions"].append(f"âœ… Found HubSpot contact: {contact['name']}")
             else:
                 new_contact = create_hubspot_contact(contact, organizer_email)
                 contact_ids[email] = new_contact["id"]
-                results["actions"].append(f"✅ Created HubSpot contact: {contact['name']}")
+                results["actions"].append(f"âœ… Created HubSpot contact: {contact['name']}")
         except Exception as e:
-            results["actions"].append(f"❌ HubSpot contact failed ({email}): {e}")
+            results["actions"].append(f"âŒ HubSpot contact failed ({email}): {e}")
 
     # Log meeting notes
     note_body = intelligence.get("hubspot_note", "Meeting processed via pipeline.")
     for email, cid in contact_ids.items():
         try:
             log_hubspot_note(cid, note_body, meeting_date)
-            results["actions"].append(f"✅ Meeting note logged on {email}")
+            results["actions"].append(f"âœ… Meeting note logged on {email}")
         except Exception as e:
-            results["actions"].append(f"❌ Note failed for {email}: {e}")
+            results["actions"].append(f"âŒ Note failed for {email}: {e}")
 
-    # ── Tasks (HubSpot + Asana) ──
+    # â”€â”€ Tasks (HubSpot + Asana) â”€â”€
     action_items = intelligence.get("action_items", [])
     for item in action_items:
         hubspot_due, asana_due, due_display = resolve_due_date(item, meeting_date)
@@ -895,9 +895,9 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
         for email, cid in contact_ids.items():
             try:
                 create_hubspot_task(cid, item["task"], item.get("task", ""), hubspot_due, organizer_email)
-                results["actions"].append(f"✅ HubSpot task: {item['task'][:60]} (due {due_display})")
+                results["actions"].append(f"âœ… HubSpot task: {item['task'][:60]} (due {due_display})")
             except Exception as e:
-                results["actions"].append(f"❌ HubSpot task failed: {e}")
+                results["actions"].append(f"âŒ HubSpot task failed: {e}")
             break
 
         # Asana task
@@ -911,23 +911,23 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
             if not assignee_gid and organizer_email:
                 assignee_gid = find_asana_user_by_email(organizer_email)
             create_asana_task(item["task"], notes, asana_due, assignee_gid)
-            results["actions"].append(f"✅ Asana task: {item['task'][:60]} (due {due_display})")
+            results["actions"].append(f"âœ… Asana task: {item['task'][:60]} (due {due_display})")
         except Exception as e:
-            results["actions"].append(f"❌ Asana task failed: {e}")
+            results["actions"].append(f"âŒ Asana task failed: {e}")
 
-    # ── Outlook Draft ──
+    # â”€â”€ Outlook Draft â”€â”€
     follow_up = intelligence.get("follow_up_email", {})
     if follow_up and follow_up.get("to_recipients") and MS_GRAPH_CLIENT_ID:
         try:
             create_outlook_draft(
                 sender_email=follow_up.get("from_email", organizer_email),
                 to_recipients=follow_up["to_recipients"],
-                subject=follow_up.get("subject", f"Following up — {title}"),
+                subject=follow_up.get("subject", f"Following up â€” {title}"),
                 body_html=follow_up.get("body_html", follow_up.get("body_text", "")),
             )
-            results["actions"].append(f"✅ Outlook draft created in {organizer_email}'s Drafts")
+            results["actions"].append(f"âœ… Outlook draft created in {organizer_email}'s Drafts")
         except Exception as e:
-            results["actions"].append(f"❌ Outlook draft failed: {e}")
+            results["actions"].append(f"âŒ Outlook draft failed: {e}")
 
     # Mark as executed
     pending = load_pending()
@@ -940,9 +940,9 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  REVIEW & APPROVAL WEB UI
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 REVIEW_TEMPLATE = """
 <!DOCTYPE html>
@@ -994,7 +994,7 @@ REVIEW_TEMPLATE = """
         .meta-label { font-weight: 600; color: #64748b; min-width: 70px; }
         .signals-list { list-style: none; padding: 0; }
         .signals-list li { padding: 6px 0; font-size: 14px; }
-        .signals-list li::before { content: "→ "; color: #3b82f6; font-weight: bold; }
+        .signals-list li::before { content: "â†’ "; color: #3b82f6; font-weight: bold; }
         .status-banner { padding: 16px; border-radius: 8px; text-align: center; font-weight: 600; }
         .status-executed { background: #dcfce7; color: #166534; }
         .status-pending { background: #dbeafe; color: #1e40af; }
@@ -1004,13 +1004,13 @@ REVIEW_TEMPLATE = """
     <div class="container">
         {% if data.status == 'executed' %}
         <div class="card status-banner status-executed">
-            ✅ Actions already executed for this meeting.
+            âœ… Actions already executed for this meeting.
         </div>
         {% endif %}
 
         <div class="card">
-            <h1>📞 {{ data.title }}</h1>
-            <p class="subtitle">{{ (data.meeting_date|string)[:10] }} · Organizer: {{ data.organizer_email }}</p>
+            <h1>ðŸ“ž {{ data.title }}</h1>
+            <p class="subtitle">{{ (data.meeting_date|string)[:10] }} Â· Organizer: {{ data.organizer_email }}</p>
 
             {% set signals = data.intelligence.get('signals', {}) %}
             <div style="margin-top: 12px;">
@@ -1037,7 +1037,7 @@ REVIEW_TEMPLATE = """
         <form method="POST" action="/review/{{ data.id }}/approve">
             <!-- ACTION ITEMS -->
             <div class="card">
-                <h2>📋 Action Items</h2>
+                <h2>ðŸ“‹ Action Items</h2>
                 <p style="color:#64748b; font-size:13px; margin-bottom:16px;">
                     Edit task text, change owners, or delete tasks you don't need. Only approved tasks will be created.
                 </p>
@@ -1086,7 +1086,7 @@ REVIEW_TEMPLATE = """
 
             <!-- FOLLOW-UP EMAIL -->
             <div class="card">
-                <h2>✉️ Follow-Up Email Draft</h2>
+                <h2>âœ‰ï¸ Follow-Up Email Draft</h2>
                 <p style="color:#64748b; font-size:13px; margin-bottom:16px;">
                     This will be saved as a draft in Outlook ({{ data.organizer_email }}). Edit before approving.
                 </p>
@@ -1103,7 +1103,7 @@ REVIEW_TEMPLATE = """
 
                 <label style="display:flex; align-items:center; gap:6px; margin-top:12px; cursor:pointer;">
                     <input type="checkbox" name="skip_email" value="1">
-                    <span style="font-size:13px; color:#64748b;">Skip email draft — don't create in Outlook</span>
+                    <span style="font-size:13px; color:#64748b;">Skip email draft â€” don't create in Outlook</span>
                 </label>
             </div>
 
@@ -1111,8 +1111,8 @@ REVIEW_TEMPLATE = """
             {% if data.status == 'pending' %}
             <div class="card">
                 <div class="actions-bar" style="border-top:none; margin-top:0; padding-top:0;">
-                    <a href="/review/{{ data.id }}/cancel" class="btn btn-ghost">Cancel — Don't Create Anything</a>
-                    <button type="submit" class="btn btn-primary">✅ Approve & Create Tasks + Draft</button>
+                    <a href="/review/{{ data.id }}/cancel" class="btn btn-ghost">Cancel â€” Don't Create Anything</a>
+                    <button type="submit" class="btn btn-primary">âœ… Approve & Create Tasks + Draft</button>
                 </div>
             </div>
             {% endif %}
@@ -1159,9 +1159,9 @@ RESULT_TEMPLATE = """
 """
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  FLASK ROUTES
-# ═══════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -1189,9 +1189,72 @@ def config_check():
     })
 
 
+
+@app.route("/test", methods=["GET"])
+def test_pipeline():
+    """Dry-run test: fetch a recent transcript and run intelligence extraction without sending emails."""
+    import time as _time
+    results = {"version": "2.2.0-null-safe-retry", "steps": {}}
+
+    # Step 1: Fetch a recent transcript from Fireflies
+    try:
+        start = _time.time()
+        recent = get_recent_transcripts(since_minutes=10080)
+        if not recent:
+            return jsonify({"status": "skip", "reason": "No transcripts in last 7 days to test with"}), 200
+        transcript = recent[0]
+        results["steps"]["fetch_transcript"] = {
+            "status": "ok",
+            "title": transcript.get("title", "?"),
+            "id": transcript.get("id", "?"),
+            "duration_ms": int((_time.time() - start) * 1000),
+        }
+    except Exception as e:
+        results["steps"]["fetch_transcript"] = {"status": "error", "error": str(e)}
+        results["status"] = "fail"
+        return jsonify(results), 500
+
+    # Step 2: Test null-safe summary handling
+    try:
+        summary = transcript.get("summary") or {}
+        participants = transcript.get("participants") or []
+        sentences = transcript.get("sentences") or []
+        test_val = summary.get("short_summary", "No summary available")
+        results["steps"]["null_safety"] = {
+            "status": "ok",
+            "summary_type": type(transcript.get("summary")).__name__,
+            "summary_is_none": transcript.get("summary") is None,
+            "participants_count": len(participants),
+            "sentences_count": len(sentences),
+        }
+    except Exception as e:
+        results["steps"]["null_safety"] = {"status": "error", "error": str(e)}
+        results["status"] = "fail"
+        return jsonify(results), 500
+
+    # Step 3: Run Claude intelligence extraction
+    try:
+        start = _time.time()
+        intelligence = extract_meeting_intelligence(transcript)
+        task_count = len(intelligence.get("tasks", []))
+        contact_count = len(intelligence.get("contacts", []))
+        results["steps"]["claude_extraction"] = {
+            "status": "ok",
+            "tasks_found": task_count,
+            "contacts_found": contact_count,
+            "duration_ms": int((_time.time() - start) * 1000),
+        }
+    except Exception as e:
+        results["steps"]["claude_extraction"] = {"status": "error", "error": str(e)}
+        results["status"] = "fail"
+        return jsonify(results), 500
+
+    results["status"] = "pass"
+    return jsonify(results), 200
+
 @app.route("/webhook/fireflies", methods=["POST"])
 def fireflies_webhook():
-    """Fireflies webhook — triggers Phase 1 (extract + queue for approval)."""
+    """Fireflies webhook â€” triggers Phase 1 (extract + queue for approval)."""
     import threading
     payload = request.get_json(force=True)
     logger.info(f"Webhook received: {json.dumps(payload)[:500]}")
@@ -1219,7 +1282,7 @@ def fireflies_webhook():
         try:
             logger.info(f"Webhook thread: fetching transcript {transcript_id}")
             transcript = None
-            # Retry up to 3 times with increasing delay — webhook may fire before transcript is ready
+            # Retry up to 3 times with increasing delay â€” webhook may fire before transcript is ready
             for attempt in range(1, 4):
                 try:
                     transcript = get_transcript_by_id(transcript_id)
@@ -1252,7 +1315,7 @@ def fireflies_webhook():
 
 @app.route("/review/<approval_id>", methods=["GET"])
 def review_page(approval_id: str):
-    """Approval review page — organizer sees tasks + email draft and can edit/delete."""
+    """Approval review page â€” organizer sees tasks + email draft and can edit/delete."""
     pending = load_pending()
     data = pending.get(approval_id)
     if not data:
@@ -1269,9 +1332,9 @@ def approve_actions(approval_id: str):
         return "Approval not found.", 404
     if data["status"] != "pending":
         return render_template_string(RESULT_TEMPLATE, data=data,
-                                      status_title="Already Processed", status_emoji="ℹ️", actions=[])
+                                      status_title="Already Processed", status_emoji="â„¹ï¸", actions=[])
 
-    # ── Parse edited tasks from form ──
+    # â”€â”€ Parse edited tasks from form â”€â”€
     task_count = int(request.form.get("task_count", 0))
     approved_tasks = []
     for i in range(task_count):
@@ -1290,7 +1353,7 @@ def approve_actions(approval_id: str):
         })
     data["intelligence"]["action_items"] = approved_tasks
 
-    # ── Parse edited email from form ──
+    # â”€â”€ Parse edited email from form â”€â”€
     skip_email = request.form.get("skip_email")
     if skip_email:
         data["intelligence"]["follow_up_email"] = {}
@@ -1322,30 +1385,30 @@ def approve_actions(approval_id: str):
             "body_text": email_body,
         }
 
-    # ── Execute ──
+    # â”€â”€ Execute â”€â”€
     try:
         results = execute_approved_actions(approval_id, data)
         return render_template_string(RESULT_TEMPLATE, data=data,
                                       status_title="Actions Created Successfully",
-                                      status_emoji="✅", actions=results.get("actions", []))
+                                      status_emoji="âœ…", actions=results.get("actions", []))
     except Exception as e:
         logger.error(f"Execution error: {e}", exc_info=True)
         return render_template_string(RESULT_TEMPLATE, data=data,
                                       status_title="Error During Execution",
-                                      status_emoji="❌", actions=[str(e)])
+                                      status_emoji="âŒ", actions=[str(e)])
 
 
 @app.route("/review/<approval_id>/cancel", methods=["GET"])
 def cancel_actions(approval_id: str):
-    """Cancel — don't create anything."""
+    """Cancel â€” don't create anything."""
     pending = load_pending()
     if approval_id in pending:
         pending[approval_id]["status"] = "cancelled"
         save_pending(pending)
     return render_template_string(RESULT_TEMPLATE,
                                   data=pending.get(approval_id, {"title": "Unknown"}),
-                                  status_title="Cancelled — No Actions Created",
-                                  status_emoji="🚫", actions=[])
+                                  status_title="Cancelled â€” No Actions Created",
+                                  status_emoji="ðŸš«", actions=[])
 
 
 @app.route("/process/<transcript_id>", methods=["GET", "POST"])
@@ -1369,7 +1432,7 @@ def manual_process(transcript_id: str):
     return jsonify({"status": "processing", "message": "Phase 1 started in background. Check your email for the approval link."})
 
 
-# ─── Polling (Fallback) ─────────────────────────────────────────────────────
+# â”€â”€â”€ Polling (Fallback) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def poll_and_process():
     logger.info("Polling Fireflies for new transcripts...")
@@ -1397,7 +1460,7 @@ def start_scheduler():
     logger.info(f"Scheduler started: polling every {POLL_INTERVAL_MINUTES} minutes")
 
 
-# ─── Startup ────────────────────────────────────────────────────────────────
+# â”€â”€â”€ Startup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 if __name__ == "__main__":
     start_scheduler()
