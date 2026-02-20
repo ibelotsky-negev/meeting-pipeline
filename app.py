@@ -279,7 +279,7 @@ Return a JSON object with exactly this structure:
             "priority": "high/medium/low",
             "due_context": "ASAP / tomorrow / this week / next week / end of month / specific date if mentioned",
             "due_days": 7,
-            "create_in": "both"
+            "create_in": "hubspot or asana"
         }}
     ],
     "hubspot_note": "Comprehensive meeting note for HubSpot CRM",
@@ -313,6 +313,7 @@ RULES:
 - Action items should be specific and assignable
 - For each action item, set owner_email to the person's email if known from participants or organizer info. If the owner is the organizer, use their email. If unknown, leave as empty string.
 - For due_days: convert relative time references from the conversation into integer days from the meeting date. Use: "ASAP"/"urgent"/"today"   1, "tomorrow"   1, "this week"/"few days"   3, "next week"   7, "couple weeks"   14, "end of month"   21, "next month"   30. If a specific date is mentioned, calculate the days difference from the meeting date. Default to 7 if unclear.
+- For create_in: Route each task to the RIGHT system. Use "hubspot" for external/investor-facing tasks (follow-up emails, calls, scheduling meetings, sending materials to external contacts). Use "asana" for internal operational tasks (preparing documents, data rooms, reports, internal reviews, research). Most tasks should go to ONE system, not both.
 - Return ONLY valid JSON, no markdown
 """
 
@@ -561,12 +562,67 @@ def resolve_due_date(item: dict, meeting_date_str: str) -> tuple:
     return hubspot_due, asana_due, display
 
 
-def log_hubspot_note(contact_id: str, note_body: str, meeting_date: str) -> dict:
-    data = {
-        "properties": {"hs_timestamp": meeting_date, "hs_note_body": note_body},
-        "associations": [{"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}],
+def get_contact_associations(contact_id: str) -> dict:
+    """Look up a contact's associated companies and deals."""
+    assoc = {"companies": [], "deals": []}
+    for obj_type in ("companies", "deals"):
+        try:
+            result = hubspot_request("GET", f"/crm/v4/objects/contacts/{contact_id}/associations/{obj_type}")
+            for item in (result.get("results") or []):
+                to_id = item.get("toObjectId")
+                if to_id:
+                    assoc[obj_type].append(str(to_id))
+        except Exception as e:
+            logger.warning(f"Association lookup {obj_type} for contact {contact_id}: {e}")
+    return assoc
+
+
+def log_hubspot_meeting(contact_id: str, meeting_body: str, meeting_date: str,
+                        title: str = "", transcript_id: str = "", duration_min: int = 30) -> dict:
+    """Create a Meeting engagement in HubSpot, associated with Contact + Company + Deal."""
+    # Build Fireflies link
+    fireflies_url = f"https://app.fireflies.ai/view/{transcript_id}" if transcript_id else ""
+    body_with_link = meeting_body
+    if fireflies_url:
+        body_with_link += f"\n\n---\nRecording: {fireflies_url}"
+
+    # Calculate meeting times
+    try:
+        from dateutil import parser as dtparser
+        start_dt = dtparser.parse(meeting_date)
+    except Exception:
+        start_dt = datetime.now(timezone.utc)
+    end_dt = start_dt + timedelta(minutes=duration_min)
+
+    properties = {
+        "hs_timestamp": start_dt.isoformat(),
+        "hs_meeting_title": title or "Meeting",
+        "hs_meeting_body": body_with_link,
+        "hs_meeting_start_time": start_dt.isoformat(),
+        "hs_meeting_end_time": end_dt.isoformat(),
+        "hs_meeting_outcome": "COMPLETED",
     }
-    return hubspot_request("POST", "/crm/v3/objects/notes", data)
+
+    # Build associations: contact + company + deal
+    # Association type IDs: meeting->contact=200, meeting->company=188, meeting->deal=206
+    associations = [
+        {"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 200}]}
+    ]
+
+    # Look up related companies and deals
+    related = get_contact_associations(contact_id)
+    for company_id in related["companies"]:
+        associations.append(
+            {"to": {"id": company_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 188}]}
+        )
+    for deal_id in related["deals"]:
+        associations.append(
+            {"to": {"id": deal_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 206}]}
+        )
+
+    logger.info(f"Creating HubSpot meeting: contact={contact_id}, companies={related['companies']}, deals={related['deals']}")
+    data = {"properties": properties, "associations": associations}
+    return hubspot_request("POST", "/crm/v3/objects/meetings", data)
 
 
 def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str, organizer_email: str = "") -> dict:
@@ -625,9 +681,14 @@ def find_asana_user_by_email(email: str) -> Optional[str]:
 # NOTIFICATION -> Alert organizer to review
 # ======================================================================
 
-def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str, intelligence: dict = None, meeting_date_str: str = ""):
-    """Send organizer a rich notification with meeting intelligence summary.
+def notify_organizer(recipients, approval_id: str, meeting_title: str, intelligence: dict = None, meeting_date_str: str = ""):
+    """Send all internal participants a rich notification with meeting intelligence summary.
+    recipients: list of email addresses or single email string.
     Supports multiple channels: email, slack, teams (comma-separated in NOTIFY_VIA)."""
+    # Normalize to list
+    if isinstance(recipients, str):
+        recipients = [recipients]
+    organizer_email = recipients[0] if recipients else ""
     review_url = f"{APP_BASE_URL}/review/{approval_id}"
     # Ensure URL has protocol for mobile auto-linking
     if not review_url.startswith("http"):
@@ -802,7 +863,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
                         "contentType": "HTML",
                         "content": email_html,
                     },
-                    "toRecipients": [{"emailAddress": {"address": organizer_email}}],
+                    "toRecipients": [{"emailAddress": {"address": r}} for r in recipients],
                 },
             }
             if BOT_SENDER_EMAIL:
@@ -816,7 +877,7 @@ def notify_organizer(organizer_email: str, approval_id: str, meeting_title: str,
                 # Delegated: send as authenticated user
                 url = f"{MS_GRAPH_BASE}/me/sendMail"
             requests.post(url, json=send_payload, headers=headers, timeout=15)
-            logger.info(f"Email notification sent to {organizer_email} from {BOT_SENDER_EMAIL or 'self'}")
+            logger.info(f"Email notification sent to {recipients} from {BOT_SENDER_EMAIL or 'self'}")
         except Exception as e:
             logger.warning(f"Email notification failed: {e}")
 
@@ -862,8 +923,20 @@ def process_transcript_phase1(transcript: dict) -> str:
     pending[approval_id] = approval
     save_pending(pending)
 
-    # Notify organizer
-    notify_organizer(organizer_email, approval_id, title, intelligence, meeting_date)
+    # Collect all internal recipient emails (organizer + internal contacts from transcript)
+    internal_emails = set()
+    if organizer_email:
+        internal_emails.add(organizer_email.lower())
+    for c in intelligence.get("contacts", []):
+        if c.get("is_internal") and c.get("email"):
+            email = c["email"].lower()
+            if email and "@" in email and "placeholder" not in email:
+                internal_emails.add(email)
+    notify_recipients = list(internal_emails) or [organizer_email]
+    logger.info(f"Notifying internal team: {notify_recipients}")
+
+    # Notify all internal participants
+    notify_organizer(notify_recipients, approval_id, title, intelligence, meeting_date)
 
     logger.info(f"Phase 1 complete. Approval ID: {approval_id}  --  awaiting organizer review.")
     return approval_id
@@ -904,43 +977,47 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
         except Exception as e:
             results["actions"].append(f"[ERR] HubSpot contact failed ({email}): {e}")
 
-    # Log meeting notes
+    # Log meeting in HubSpot (Meeting engagement, not Note)
     note_body = intelligence.get("hubspot_note", "Meeting processed via pipeline.")
+    transcript_id = approved_data.get("transcript_id", "")
     for email, cid in contact_ids.items():
         try:
-            log_hubspot_note(cid, note_body, meeting_date)
-            results["actions"].append(f"[OK] Meeting note logged on {email}")
+            log_hubspot_meeting(cid, note_body, meeting_date, title=title, transcript_id=transcript_id)
+            results["actions"].append(f"[OK] Meeting logged on {email}")
         except Exception as e:
-            results["actions"].append(f"[ERR] Note failed for {email}: {e}")
+            results["actions"].append(f"[ERR] Meeting log failed for {email}: {e}")
 
 # ======================================================================
     action_items = intelligence.get("action_items", [])
     for item in action_items:
         hubspot_due, asana_due, due_display = resolve_due_date(item, meeting_date)
+        create_in = item.get("create_in", "both").lower()
+        owner_email = item.get("owner_email", "") or organizer_email
 
-        # HubSpot task
-        for email, cid in contact_ids.items():
+        # HubSpot task (for external/investor-facing tasks)
+        if create_in in ("hubspot", "both"):
+            for email, cid in contact_ids.items():
+                try:
+                    create_hubspot_task(cid, item["task"], item.get("task", ""), hubspot_due, owner_email)
+                    results["actions"].append(f"[OK] HubSpot task: {item['task'][:60]} (due {due_display})")
+                except Exception as e:
+                    results["actions"].append(f"[ERR] HubSpot task failed: {e}")
+                break
+
+        # Asana task (for internal operational tasks)
+        if create_in in ("asana", "both"):
             try:
-                create_hubspot_task(cid, item["task"], item.get("task", ""), hubspot_due, organizer_email)
-                results["actions"].append(f"[OK] HubSpot task: {item['task'][:60]} (due {due_display})")
+                notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {due_display} ({item.get('due_context', 'TBD')})"
+                # Look up Asana user by owner email, fallback to organizer
+                assignee_gid = None
+                if owner_email:
+                    assignee_gid = find_asana_user_by_email(owner_email)
+                if not assignee_gid and organizer_email:
+                    assignee_gid = find_asana_user_by_email(organizer_email)
+                create_asana_task(item["task"], notes, asana_due, assignee_gid)
+                results["actions"].append(f"[OK] Asana task: {item['task'][:60]} (due {due_display})")
             except Exception as e:
-                results["actions"].append(f"[ERR] HubSpot task failed: {e}")
-            break
-
-        # Asana task
-        try:
-            notes = f"From meeting: {title}\nOwner: {item.get('owner', 'TBD')}\nPriority: {item.get('priority', 'medium')}\nDue: {due_display} ({item.get('due_context', 'TBD')})"
-            # Look up Asana user by owner email, fallback to organizer
-            assignee_gid = None
-            owner_email = item.get("owner_email", "")
-            if owner_email:
-                assignee_gid = find_asana_user_by_email(owner_email)
-            if not assignee_gid and organizer_email:
-                assignee_gid = find_asana_user_by_email(organizer_email)
-            create_asana_task(item["task"], notes, asana_due, assignee_gid)
-            results["actions"].append(f"[OK] Asana task: {item['task'][:60]} (due {due_display})")
-        except Exception as e:
-            results["actions"].append(f"[ERR] Asana task failed: {e}")
+                results["actions"].append(f"[ERR] Asana task failed: {e}")
 
 # ======================================================================
     follow_up = intelligence.get("follow_up_email", {})
@@ -1080,6 +1157,15 @@ REVIEW_TEMPLATE = """
                                 <div style="flex:1;">
                                     <label>OWNER</label>
                                     <input type="text" name="task_owner_{{ loop.index0 }}" value="{{ item.get('owner', '') }}">
+                                    <input type="hidden" name="task_owner_email_{{ loop.index0 }}" value="{{ item.get('owner_email', '') }}">
+                                </div>
+                                <div style="flex:0.5;">
+                                    <label>CREATE IN</label>
+                                    <select name="task_create_in_{{ loop.index0 }}" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;">
+                                        <option value="hubspot" {{ 'selected' if item.get('create_in') == 'hubspot' }}>HubSpot (external)</option>
+                                        <option value="asana" {{ 'selected' if item.get('create_in', 'asana') == 'asana' }}>Asana (internal)</option>
+                                        <option value="both" {{ 'selected' if item.get('create_in') == 'both' }}>Both</option>
+                                    </select>
                                 </div>
                                 <div style="flex:0.5;">
                                     <label>PRIORITY</label>
@@ -1197,7 +1283,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.3.0-emoji-encoding-fix", "deployed": "2026-02-19"})
+    return jsonify({"version": "2.4.0-task-routing-fix", "deployed": "2026-02-20"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1346,10 +1432,11 @@ def approve_actions(approval_id: str):
         approved_tasks.append({
             "task": task_text,
             "owner": request.form.get(f"task_owner_{i}", ""),
-            "owner_email": data["intelligence"].get("action_items", [{}])[i].get("owner_email", "") if i < len(data["intelligence"].get("action_items", [])) else "",
+            "owner_email": request.form.get(f"task_owner_email_{i}", ""),
             "priority": request.form.get(f"task_priority_{i}", "medium"),
             "due_days": int(request.form.get(f"task_due_days_{i}", 7)),
             "due_context": data["intelligence"].get("action_items", [{}])[i].get("due_context", "1 week") if i < len(data["intelligence"].get("action_items", [])) else "1 week",
+            "create_in": request.form.get(f"task_create_in_{i}", "both"),
         })
     data["intelligence"]["action_items"] = approved_tasks
 
