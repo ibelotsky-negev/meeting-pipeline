@@ -42,6 +42,13 @@ MS_GRAPH_CLIENT_ID = os.environ.get("MS_GRAPH_CLIENT_ID", "")
 MS_GRAPH_CLIENT_SECRET = os.environ.get("MS_GRAPH_CLIENT_SECRET", "")
 MS_GRAPH_TENANT_ID = os.environ.get("MS_GRAPH_TENANT_ID", "")
 MS_GRAPH_REFRESH_TOKEN = os.environ.get("MS_GRAPH_REFRESH_TOKEN", "")  # For delegated flow
+# Load refresh token from persistent storage if env var not set or to get latest rotated token
+try:
+    if os.path.exists("/data/refresh_token.txt"):
+        with open("/data/refresh_token.txt") as f: _file_token = f.read().strip()
+        if _file_token: MS_GRAPH_REFRESH_TOKEN = _file_token; import sys; print("[startup] Loaded refresh token from /data/refresh_token.txt", file=sys.stderr)
+except Exception as _e:
+    import sys; print(f"[startup] Could not load refresh token from file: {_e}", file=sys.stderr)
 # Auth mode: "delegated" (uses refresh_token, /me/ endpoints -> single user only)
 # "app" (uses client_credentials, /users/{email} endpoints -> team-wide)
 # Auto-detected: if refresh_token set -- delegated, else -- app
@@ -413,6 +420,12 @@ def get_delegated_graph_token() -> str:
     if token_data.get("refresh_token"):
         MS_GRAPH_REFRESH_TOKEN = token_data["refresh_token"]
         logger.info("[todo-sync] Refresh token rotated, updated in memory")
+        try:
+            os.makedirs("/data", exist_ok=True)
+            with open("/data/refresh_token.txt", "w") as f: f.write(MS_GRAPH_REFRESH_TOKEN)
+            logger.info("[todo-sync] Refresh token persisted to /data/refresh_token.txt")
+        except Exception as e:
+            logger.warning(f"[todo-sync] Could not persist refresh token: {e}")
     return _ms_delegated_token_cache["token"]
 
 
