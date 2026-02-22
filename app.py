@@ -93,6 +93,7 @@ SYNC_MAP_FILE = os.path.join(DATA_DIR, "asana_todo_map.json")
 
 # To-Do sync config
 TODO_LIST_NAME = os.environ.get("TODO_LIST_NAME", "Asana Tasks")
+TODO_SYNC_USER_EMAIL = os.environ.get("TODO_SYNC_USER_EMAIL", "bk@negevlabs.com")  # only sync tasks assigned to this user
 TODO_POLL_INTERVAL = int(os.environ.get("TODO_POLL_INTERVAL", "300"))
 RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL", "https://meeting-pipeline-production.up.railway.app")
 
@@ -1563,7 +1564,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.6.3-public-client-fix", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.6.4-filter-my-tasks", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1623,7 +1624,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.6.3-public-client-fix", "steps": {}}
+    results = {"version": "2.6.4-filter-my-tasks", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1803,7 +1804,7 @@ def sync_setup():
         tasks_synced = 0
         if ASANA_PROJECT_GID:
             try:
-                project_tasks = asana_request("GET", f"/projects/{ASANA_PROJECT_GID}/tasks?opt_fields=gid,name,notes,due_on,completed")
+                project_tasks = asana_request("GET", f"/projects/{ASANA_PROJECT_GID}/tasks?opt_fields=gid,name,notes,due_on,completed,assignee.email")
                 task_list = project_tasks if isinstance(project_tasks, list) else []
                 sync_map = load_sync_map()
                 for task in task_list:
@@ -1865,7 +1866,7 @@ def sync_full():
             sync_map["todo_list_id"] = list_id
             save_sync_map(sync_map)
 
-        project_tasks = asana_request("GET", f"/projects/{ASANA_PROJECT_GID}/tasks?opt_fields=gid,name,notes,due_on,completed")
+        project_tasks = asana_request("GET", f"/projects/{ASANA_PROJECT_GID}/tasks?opt_fields=gid,name,notes,due_on,completed,assignee.email")
         task_list = project_tasks if isinstance(project_tasks, list) else []
         for task in task_list:
             if task.get("completed"):
@@ -1873,6 +1874,12 @@ def sync_full():
                 continue
             gid = task.get("gid")
             if not gid:
+                continue
+            # Only sync tasks assigned to the To-Do user (delegated auth is single-user)
+            assignee = task.get('assignee') or {}
+            assignee_email = (assignee.get('email') or '').lower()
+            if assignee_email != TODO_SYNC_USER_EMAIL.lower():
+                tasks_skipped += 1
                 continue
             sync_map = load_sync_map()
             if gid in sync_map["mappings"]:
@@ -1895,6 +1902,33 @@ def sync_full():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
+
+@app.route("/sync/reset", methods=["POST"])
+def sync_reset():
+    """Clear sync map and delete all tasks from the To-Do list. Use to start fresh."""
+    try:
+        sync_map = load_sync_map()
+        list_id = sync_map.get("todo_list_id")
+        deleted = 0
+        if list_id:
+            # Delete all tasks from the To-Do list
+            url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks"
+            data = _graph_request_with_retry("GET", url, force_delegated=True)
+            for task in (data.get("value") or []):
+                try:
+                    _graph_request_with_retry("DELETE",
+                        f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{task['id']}",
+                        force_delegated=True)
+                    deleted += 1
+                except Exception as e:
+                    logger.warning(f"[sync-reset] Could not delete task {task['id']}: {e}")
+        # Reset sync map but keep list_id
+        new_map = {"todo_list_id": list_id, "mappings": {}}
+        save_sync_map(new_map)
+        return jsonify({"status": "ok", "tasks_deleted": deleted, "mappings_cleared": len(sync_map.get("mappings", {}))})
+    except Exception as e:
+        logger.error(f"[sync-reset] Error: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
 @app.route("/webhook/fireflies", methods=["POST"])
 def fireflies_webhook():
     """Fireflies webhook  --  triggers Phase 1 (extract + queue for approval)."""
