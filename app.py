@@ -1,4 +1,4 @@
-"""
+﻿"""
 Post-Meeting Intelligence Pipeline v2
 # Fireflies -> Claude AI -> Approval UI -> HubSpot/Asana/Outlook
 
@@ -768,7 +768,7 @@ def _graph_request_with_retry(method: str, url: str, json_body: dict = None, hea
         try:
             resp = requests.request(method, url, json=json_body, headers=hdrs, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-                logger.warning(f"[todo-sync] Graph {method} {url} → {resp.status_code}, retrying (attempt {attempt+1}/3)")
+                logger.warning(f"[todo-sync] Graph {method} {url} â†’ {resp.status_code}, retrying (attempt {attempt+1}/3)")
                 continue
             resp.raise_for_status()
             return resp.json() if resp.content else {}
@@ -895,6 +895,23 @@ def complete_todo_task(todo_task_id: str, asana_gid: str = None):
         sync_map["mappings"][asana_gid]["last_synced"] = datetime.now(timezone.utc).isoformat()
         save_sync_map(sync_map)
 
+
+def reopen_todo_task(todo_task_id: str, asana_gid: str = None):
+    """Mark To-Do task as not started (reopen) when re-opened in Asana."""
+    sync_map = load_sync_map()
+    mapping = sync_map.get("mappings", {}).get(asana_gid or "", {})
+    user_email = mapping.get("user_email", "")
+    list_id = mapping.get("todo_list_id", "")
+    if not user_email or not list_id:
+        logger.warning(f"[todo-sync] reopen_todo_task: no user_email/list_id for {asana_gid}")
+        return
+    url = f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks/{todo_task_id}"
+    logger.info(f"[todo-sync] Reopening To-Do task {todo_task_id} for {user_email} (from Asana {asana_gid})")
+    _graph_request_with_retry("PATCH", url, json_body={"status": "notStarted"})
+    if asana_gid and asana_gid in sync_map["mappings"]:
+        sync_map["mappings"][asana_gid].pop("completed_by", None)
+        sync_map["mappings"][asana_gid]["last_synced"] = datetime.now(timezone.utc).isoformat()
+        save_sync_map(sync_map)
 
 def complete_asana_task(asana_gid: str, todo_task_id: str = None):
     """Mark Asana task complete. Sets completed_by='todo' in mapping."""
@@ -1589,7 +1606,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.7.2-webhook-resilient", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.7.3-reopen-and-webhook-verify", "deployed": "2026-02-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1618,7 +1635,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.7.2-webhook-resilient", "steps": {}}
+    results = {"version": "2.7.3-reopen-and-webhook-verify", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1665,7 +1682,7 @@ def test_pipeline():
 
 @app.route("/webhook/asana", methods=["POST"])
 def asana_webhook():
-    """Asana webhook handler — handshake + event processing."""
+    """Asana webhook handler â€” handshake + event processing."""
     import threading
 
     # Handshake: echo X-Hook-Secret back
@@ -1694,7 +1711,7 @@ def asana_webhook():
                 mapping = sync_map["mappings"].get(task_gid)
 
                 if action == "added":
-                    # New task added to project — create in To-Do
+                    # New task added to project â€” create in To-Do
                     logger.info(f"[todo-sync] Asana webhook: task added {task_gid}")
                     try:
                         task_data = asana_request("GET", f"/tasks/{task_gid}?opt_fields=name,notes,due_on,assignee.email")
@@ -1715,13 +1732,22 @@ def asana_webhook():
                     new_val = change.get("new_value")
 
                     if field == "completed" and new_val is True:
-                        # Task completed in Asana → complete in To-Do
+                        # Task completed in Asana â†’ complete in To-Do
                         if mapping and not mapping.get("completed_by"):
                             logger.info(f"[todo-sync] Asana webhook: completing To-Do for {task_gid}")
                             try:
                                 complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
                             except Exception as e:
                                 logger.error(f"[todo-sync] complete_todo_task failed for {task_gid}: {e}", exc_info=True)
+                    elif field == "completed" and new_val is False:
+                        # Task re-opened in Asana -> reopen in To-Do
+                        if mapping:
+                            logger.info(f"[todo-sync] Asana webhook: reopening To-Do for {task_gid}")
+                            try:
+                                reopen_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
+                            except Exception as e:
+                                logger.error(f"[todo-sync] reopen_todo_task failed for {task_gid}: {e}", exc_info=True)
+
 
                     elif field in ("name", "due_on", "notes") and mapping:
                         # Name, due date, or notes changed -> update To-Do
@@ -1740,7 +1766,7 @@ def asana_webhook():
                         except Exception as e:
                             logger.error(f"[todo-sync] update_todo_task failed for {task_gid}: {e}", exc_info=True)
                 elif action in ("deleted", "removed") and mapping:
-                    # Task removed — mark To-Do complete (best effort)
+                    # Task removed â€” mark To-Do complete (best effort)
                     try:
                         complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
                     except Exception as e:
@@ -1751,6 +1777,61 @@ def asana_webhook():
 
     threading.Thread(target=_process_events, daemon=True).start()
     return jsonify({"status": "processing"}), 200
+
+
+@app.route("/sync/webhook-verify", methods=["GET", "POST"])
+def sync_webhook_verify():
+    """Check if Asana webhook is active. POST to force-recreate if dead."""
+    sync_map = load_sync_map()
+    wh_id = sync_map.get("asana_webhook_id")
+    result = {"webhook_id": wh_id, "status": "unknown"}
+
+    if not wh_id:
+        result["status"] = "not_registered"
+        result["fix"] = "Call /sync/setup to register"
+        return jsonify(result), 200
+
+    # Query Asana for webhook status
+    try:
+        wh_data = asana_request("GET", f"/webhooks/{wh_id}")
+        if wh_data:
+            result["active"] = wh_data.get("active", False)
+            result["target"] = wh_data.get("target")
+            result["last_failure_at"] = wh_data.get("last_failure_at")
+            result["last_failure_content"] = wh_data.get("last_failure_content")
+            result["status"] = "active" if wh_data.get("active") else "failed"
+        else:
+            result["status"] = "not_found"
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+
+    # If POST and webhook is dead, force recreate
+    if request.method == "POST" and result["status"] in ("failed", "not_found", "error"):
+        try:
+            # Delete old
+            try:
+                asana_request("DELETE", f"/webhooks/{wh_id}")
+            except Exception:
+                pass
+            # Create new
+            webhook_target = f"{RAILWAY_PUBLIC_URL}/webhook/asana"
+            wh = asana_request("POST", "/webhooks", {
+                "resource": ASANA_PROJECT_GID,
+                "target": webhook_target,
+            })
+            new_id = (wh or {}).get("gid", "pending_handshake")
+            sync_map = load_sync_map()
+            sync_map["asana_webhook_id"] = new_id
+            save_sync_map(sync_map)
+            result["action"] = "recreated"
+            result["new_webhook_id"] = new_id
+            result["status"] = "recreated"
+        except Exception as re_err:
+            result["action"] = "recreate_failed"
+            result["recreate_error"] = str(re_err)
+
+    return jsonify(result), 200
 
 
 @app.route("/todo/setup", methods=["GET", "POST"])
@@ -1772,6 +1853,7 @@ def todo_setup():
 def sync_setup():
     """One-time setup: create To-Do list, register Asana webhook, do initial full sync."""
     results = {}
+    force = request.args.get("force", "").lower() in ("true", "1", "yes")
     try:
         # Per-user lists created automatically during sync
         sync_map = load_sync_map()
@@ -1781,6 +1863,16 @@ def sync_setup():
             webhook_target = f"{RAILWAY_PUBLIC_URL}/webhook/asana"
             try:
                 existing_wh_id = sync_map.get("asana_webhook_id")
+                if existing_wh_id and force:
+                    logger.info(f"[todo-sync] Force mode: deleting webhook {existing_wh_id}")
+                    try:
+                        asana_request("DELETE", f"/webhooks/{existing_wh_id}")
+                    except Exception:
+                        pass
+                    sync_map["asana_webhook_id"] = None
+                    save_sync_map(sync_map)
+                    existing_wh_id = None
+                    results["webhook_note"] = "Old webhook deleted, creating new"
                 if existing_wh_id:
                     results["asana_webhook_id"] = existing_wh_id
                     results["webhook_note"] = "Already registered"
@@ -2171,10 +2263,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Post-Meeting Intelligence Pipeline v2 on port {port}")
     app.run(host="0.0.0.0", port=port)
-
-
-
-
 
 
 
