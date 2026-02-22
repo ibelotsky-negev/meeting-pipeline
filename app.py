@@ -1606,7 +1606,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.7.5-debug-reopen", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.7.6-fetch-completed", "deployed": "2026-02-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1635,7 +1635,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.7.5-debug-reopen", "steps": {}}
+    results = {"version": "2.7.6-fetch-completed", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1739,22 +1739,24 @@ def asana_webhook():
                     field = change.get("field")
                     new_val = change.get("new_value")
 
-                    if field == "completed" and new_val is True:
-                        # Task completed in Asana â†’ complete in To-Do
-                        if mapping and not mapping.get("completed_by"):
-                            logger.info(f"[todo-sync] Asana webhook: completing To-Do for {task_gid}")
-                            try:
-                                complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
-                            except Exception as e:
-                                logger.error(f"[todo-sync] complete_todo_task failed for {task_gid}: {e}", exc_info=True)
-                    elif field == "completed" and new_val == False and new_val is not None:
-                        # Task re-opened in Asana -> reopen in To-Do
-                        if mapping:
-                            logger.info(f"[todo-sync] Asana webhook: reopening To-Do for {task_gid}")
-                            try:
-                                reopen_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
-                            except Exception as e:
-                                logger.error(f"[todo-sync] reopen_todo_task failed for {task_gid}: {e}", exc_info=True)
+                    if field == "completed" and mapping:
+                        # Asana sends new_value=None for completed field - must fetch actual status
+                        td = asana_request("GET", f"/tasks/{task_gid}?opt_fields=completed")
+                        if td:
+                            is_completed = td.get("completed", False)
+                            logger.info(f"[todo-sync] Asana webhook: completed field changed for {task_gid}, actual completed={is_completed}")
+                            if is_completed and not mapping.get("completed_by"):
+                                logger.info(f"[todo-sync] Completing To-Do for {task_gid}")
+                                try:
+                                    complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
+                                except Exception as e:
+                                    logger.error(f"[todo-sync] complete_todo_task failed for {task_gid}: {e}", exc_info=True)
+                            elif not is_completed:
+                                logger.info(f"[todo-sync] Reopening To-Do for {task_gid}")
+                                try:
+                                    reopen_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
+                                except Exception as e:
+                                    logger.error(f"[todo-sync] reopen_todo_task failed for {task_gid}: {e}", exc_info=True)
 
 
                     elif field in ("name", "due_on", "notes") and mapping:
