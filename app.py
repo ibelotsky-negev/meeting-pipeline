@@ -400,7 +400,6 @@ def get_delegated_graph_token() -> str:
         raise RuntimeError("MS_GRAPH_REFRESH_TOKEN not set -- required for To-Do API (delegated auth)")
     data = {
         "client_id": MS_GRAPH_CLIENT_ID,
-        "client_secret": MS_GRAPH_CLIENT_SECRET,
         "refresh_token": MS_GRAPH_REFRESH_TOKEN,
         "grant_type": "refresh_token",
         "scope": "https://graph.microsoft.com/Tasks.ReadWrite Mail.ReadWrite",
@@ -1544,7 +1543,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.5.1-todo-delegated-auth", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.5.2-todo-public-client", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1572,7 +1571,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.5.1-todo-delegated-auth", "steps": {}}
+    results = {"version": "2.5.2-todo-public-client", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -2069,6 +2068,8 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Post-Meeting Intelligence Pipeline v2 on port {port}")
     app.run(host="0.0.0.0", port=port)
+
+
 
 
 
