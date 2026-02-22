@@ -82,6 +82,12 @@ DATA_DIR = os.environ.get("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 PROCESSED_FILE = os.path.join(DATA_DIR, "processed_transcripts.json")
 PENDING_FILE = os.path.join(DATA_DIR, "pending_approvals.json")
+SYNC_MAP_FILE = os.path.join(DATA_DIR, "asana_todo_map.json")
+
+# To-Do sync config
+TODO_LIST_NAME = os.environ.get("TODO_LIST_NAME", "Asana Tasks")
+TODO_POLL_INTERVAL = int(os.environ.get("TODO_POLL_INTERVAL", "300"))
+RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL", "https://meeting-pipeline-production.up.railway.app")
 
 
 def strip_emojis(text: str) -> str:
@@ -678,7 +684,222 @@ def find_asana_user_by_email(email: str) -> Optional[str]:
 
 
 # ======================================================================
-# NOTIFICATION -> Alert organizer to review
+#  ASANA <-> MICROSOFT TO-DO BIDIRECTIONAL SYNC
+# ======================================================================
+
+import threading as _threading
+
+_todo_poller_running = False
+_todo_last_poll_time = None
+
+
+def load_sync_map() -> dict:
+    """Load Asana<->To-Do mapping from /data/asana_todo_map.json."""
+    try:
+        with open(SYNC_MAP_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"todo_list_id": None, "mappings": {}, "asana_webhook_id": None}
+
+
+def save_sync_map(sync_map: dict):
+    """Persist mapping to /data/asana_todo_map.json."""
+    with open(SYNC_MAP_FILE, "w") as f:
+        json.dump(sync_map, f, indent=2, default=str)
+
+
+def _graph_request_with_retry(method: str, url: str, json_body: dict = None, headers: dict = None) -> dict:
+    """Microsoft Graph request with 3x retry on 429/5xx (5s/10s/15s backoff)."""
+    token = get_ms_graph_token()
+    hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    last_exc = None
+    for attempt, wait in enumerate([0, 5, 10, 15]):
+        if wait:
+            time.sleep(wait)
+        try:
+            resp = requests.request(method, url, json=json_body, headers=hdrs, timeout=30)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                logger.warning(f"[todo-sync] Graph {method} {url} → {resp.status_code}, retrying (attempt {attempt+1}/3)")
+                continue
+            resp.raise_for_status()
+            return resp.json() if resp.content else {}
+        except Exception as e:
+            last_exc = e
+            logger.warning(f"[todo-sync] Graph request attempt {attempt+1} failed: {e}")
+    raise last_exc
+
+
+def get_or_create_todo_list(list_name: str = None) -> str:
+    """Find or create a Microsoft To-Do list by name. Returns list_id."""
+    list_name = list_name or TODO_LIST_NAME
+    url = f"{MS_GRAPH_BASE}/me/todo/lists"
+    data = _graph_request_with_retry("GET", url)
+    for lst in (data.get("value") or []):
+        if lst.get("displayName", "").lower() == list_name.lower():
+            logger.info(f"[todo-sync] Found existing To-Do list '{list_name}': {lst['id']}")
+            return lst["id"]
+    # Create new list
+    created = _graph_request_with_retry("POST", url, json_body={"displayName": list_name})
+    list_id = created["id"]
+    logger.info(f"[todo-sync] Created To-Do list '{list_name}': {list_id}")
+    return list_id
+
+
+def create_todo_task(title: str, notes: str = None, due_date: str = None,
+                     asana_gid: str = None, asana_project_gid: str = None) -> str:
+    """Create a To-Do task and store mapping. Returns todo_task_id."""
+    sync_map = load_sync_map()
+    list_id = sync_map.get("todo_list_id")
+    if not list_id:
+        list_id = get_or_create_todo_list()
+        sync_map["todo_list_id"] = list_id
+        save_sync_map(sync_map)
+
+    body: dict = {"title": title}
+    if notes:
+        body["body"] = {"content": notes, "contentType": "text"}
+    if due_date:
+        body["dueDateTime"] = {"dateTime": f"{due_date}T00:00:00", "timeZone": "UTC"}
+    body["status"] = "notStarted"
+
+    url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks"
+    logger.info(f"[todo-sync] Creating To-Do task for Asana {asana_gid}: '{title}'")
+    task = _graph_request_with_retry("POST", url, json_body=body)
+    todo_task_id = task["id"]
+
+    # Add linked resource back to Asana
+    if asana_gid:
+        project_gid = asana_project_gid or ASANA_PROJECT_GID
+        linked_url = f"https://app.asana.com/0/{project_gid}/{asana_gid}" if project_gid else f"https://app.asana.com/0/0/{asana_gid}"
+        try:
+            _graph_request_with_retry("POST",
+                f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{todo_task_id}/linkedResources",
+                json_body={"webUrl": linked_url, "applicationName": "Asana", "displayName": "View in Asana"})
+        except Exception as e:
+            logger.warning(f"[todo-sync] Could not add linked resource: {e}")
+
+        # Store mapping
+        sync_map = load_sync_map()  # reload in case concurrent writes
+        sync_map["todo_list_id"] = list_id
+        sync_map["mappings"][asana_gid] = {
+            "todo_task_id": todo_task_id,
+            "last_synced": datetime.now(timezone.utc).isoformat(),
+            "completed_by": None,
+        }
+        save_sync_map(sync_map)
+
+    logger.info(f"[todo-sync] Created To-Do task {todo_task_id} for Asana {asana_gid}")
+    return todo_task_id
+
+
+def update_todo_task(todo_task_id: str, title: str = None, notes: str = None, due_date: str = None):
+    """Update an existing To-Do task."""
+    sync_map = load_sync_map()
+    list_id = sync_map.get("todo_list_id")
+    if not list_id:
+        logger.warning("[todo-sync] update_todo_task called but no list_id in sync map")
+        return
+    body = {}
+    if title:
+        body["title"] = title
+    if notes:
+        body["body"] = {"content": notes, "contentType": "text"}
+    if due_date:
+        body["dueDateTime"] = {"dateTime": f"{due_date}T00:00:00", "timeZone": "UTC"}
+    if not body:
+        return
+    url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{todo_task_id}"
+    logger.info(f"[todo-sync] Updating To-Do task {todo_task_id}")
+    _graph_request_with_retry("PATCH", url, json_body=body)
+
+
+def complete_todo_task(todo_task_id: str, asana_gid: str = None):
+    """Mark To-Do task complete. Sets completed_by='asana' in mapping."""
+    sync_map = load_sync_map()
+    list_id = sync_map.get("todo_list_id")
+    if not list_id:
+        logger.warning("[todo-sync] complete_todo_task: no list_id")
+        return
+    url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{todo_task_id}"
+    logger.info(f"[todo-sync] Completing To-Do task {todo_task_id} (triggered by Asana {asana_gid})")
+    _graph_request_with_retry("PATCH", url, json_body={"status": "completed"})
+    if asana_gid and asana_gid in sync_map["mappings"]:
+        sync_map["mappings"][asana_gid]["completed_by"] = "asana"
+        sync_map["mappings"][asana_gid]["last_synced"] = datetime.now(timezone.utc).isoformat()
+        save_sync_map(sync_map)
+
+
+def complete_asana_task(asana_gid: str, todo_task_id: str = None):
+    """Mark Asana task complete. Sets completed_by='todo' in mapping."""
+    logger.info(f"[todo-sync] Completing Asana task {asana_gid} (triggered by To-Do)")
+    try:
+        asana_request("PUT", f"/tasks/{asana_gid}", {"completed": True})
+    except Exception as e:
+        logger.error(f"[todo-sync] Failed to complete Asana task {asana_gid}: {e}", exc_info=True)
+        return
+    sync_map = load_sync_map()
+    if asana_gid in sync_map["mappings"]:
+        sync_map["mappings"][asana_gid]["completed_by"] = "todo"
+        sync_map["mappings"][asana_gid]["last_synced"] = datetime.now(timezone.utc).isoformat()
+        save_sync_map(sync_map)
+
+
+def poll_todo_completions():
+    """Check To-Do list for newly completed tasks and sync back to Asana."""
+    global _todo_last_poll_time
+    _todo_last_poll_time = datetime.now(timezone.utc).isoformat()
+    sync_map = load_sync_map()
+    list_id = sync_map.get("todo_list_id")
+    if not list_id:
+        logger.info("[todo-sync] Poller: no list_id configured, skipping")
+        return
+    try:
+        url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks?$filter=status eq 'completed'&$top=100"
+        data = _graph_request_with_retry("GET", url)
+        completed_tasks = data.get("value") or []
+        newly_synced = 0
+        # Build reverse mapping: todo_task_id -> asana_gid
+        reverse = {v["todo_task_id"]: k for k, v in sync_map["mappings"].items() if v.get("todo_task_id")}
+        for task in completed_tasks:
+            tid = task.get("id")
+            asana_gid = reverse.get(tid)
+            if not asana_gid:
+                continue
+            mapping = sync_map["mappings"][asana_gid]
+            if mapping.get("completed_by"):
+                # Already synced in either direction — skip to prevent infinite loop
+                continue
+            complete_asana_task(asana_gid, todo_task_id=tid)
+            newly_synced += 1
+        logger.info(f"[todo-sync] Poller: checked {len(completed_tasks)} completed tasks, {newly_synced} newly synced to Asana")
+    except Exception as e:
+        logger.error(f"[todo-sync] Poller error: {e}", exc_info=True)
+
+
+def start_todo_poller():
+    """Start background polling thread for To-Do -> Asana sync."""
+    global _todo_poller_running
+    if _todo_poller_running:
+        return
+    _todo_poller_running = True
+
+    def _run():
+        logger.info(f"[todo-sync] Poller started (interval: {TODO_POLL_INTERVAL}s)")
+        while _todo_poller_running:
+            try:
+                poll_todo_completions()
+            except Exception as e:
+                logger.error(f"[todo-sync] Poller loop error: {e}", exc_info=True)
+            time.sleep(TODO_POLL_INTERVAL)
+
+    t = _threading.Thread(target=_run, daemon=True, name="todo-poller")
+    t.start()
+    logger.info("[todo-sync] Poller thread launched")
+
+
+
 # ======================================================================
 
 def notify_organizer(recipients, approval_id: str, meeting_title: str, intelligence: dict = None, meeting_date_str: str = ""):
@@ -1014,8 +1235,22 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
                     assignee_gid = find_asana_user_by_email(owner_email)
                 if not assignee_gid and organizer_email:
                     assignee_gid = find_asana_user_by_email(organizer_email)
-                create_asana_task(item["task"], notes, asana_due, assignee_gid)
+                asana_task = create_asana_task(item["task"], notes, asana_due, assignee_gid)
                 results["actions"].append(f"[OK] Asana task: {item['task'][:60]} (due {due_display})")
+                # Sync new Asana task to Microsoft To-Do
+                if asana_task and asana_task.get("gid") and MS_GRAPH_CLIENT_ID:
+                    try:
+                        create_todo_task(
+                            title=item["task"],
+                            notes=notes,
+                            due_date=asana_due,
+                            asana_gid=asana_task["gid"],
+                            asana_project_gid=ASANA_PROJECT_GID,
+                        )
+                        results["actions"].append(f"[OK] To-Do task synced for: {item['task'][:60]}")
+                    except Exception as te:
+                        logger.warning(f"[todo-sync] Failed to create To-Do task for Asana {asana_task.get('gid')}: {te}")
+                        results["actions"].append(f"[WARN] To-Do sync failed: {te}")
             except Exception as e:
                 results["actions"].append(f"[ERR] Asana task failed: {e}")
 
@@ -1283,7 +1518,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.4.0-task-routing-fix", "deployed": "2026-02-20"})
+    return jsonify({"version": "2.5.0-todo-sync", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1299,16 +1534,19 @@ def config_check():
         "hubspot_owner_map_emails": list(HUBSPOT_OWNER_MAP.keys()),
         "hubspot_fallback_owner": HUBSPOT_OWNER_ID or "(not set)",
         "notify_via": NOTIFY_VIA,
+        "todo_list_name": TODO_LIST_NAME,
+        "todo_poll_interval": TODO_POLL_INTERVAL,
+        "todo_poller_running": _todo_poller_running,
     })
 
 
 
 @app.route("/test", methods=["GET"])
 def test_pipeline():
-    """Dry-run: fetch transcript, extract intelligence, report pass/fail with details."""
+    """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.2.0-null-safe-retry", "steps": {}}
+    results = {"version": "2.5.0-todo-sync", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1330,6 +1568,20 @@ def test_pipeline():
         intelligence = extract_meeting_intelligence(transcript)
         results["steps"]["claude"] = {"status": "ok", "tasks": len(intelligence.get("tasks",[])), "contacts": len(intelligence.get("contacts",[])), "ms": int((_time.time()-t0)*1000)}
 
+        # Step 4: Microsoft To-Do API connectivity
+        if MS_GRAPH_CLIENT_ID:
+            try:
+                t0 = _time.time()
+                token = get_ms_graph_token()
+                url = f"{MS_GRAPH_BASE}/me/todo/lists"
+                todo_resp = _graph_request_with_retry("GET", url)
+                lists = todo_resp.get("value") or []
+                results["steps"]["todo_api"] = {"status": "ok", "lists_count": len(lists), "ms": int((_time.time()-t0)*1000)}
+            except Exception as te:
+                results["steps"]["todo_api"] = {"status": "fail", "error": str(te)}
+        else:
+            results["steps"]["todo_api"] = {"status": "skip", "reason": "MS_GRAPH_CLIENT_ID not set"}
+
         results["status"] = "pass"
         return jsonify(results), 200
     except Exception as e:
@@ -1337,6 +1589,220 @@ def test_pipeline():
         results["error"] = str(e)
         results["traceback"] = _tb.format_exc()
         return jsonify(results), 500
+
+@app.route("/webhook/asana", methods=["POST"])
+def asana_webhook():
+    """Asana webhook handler — handshake + event processing."""
+    import threading
+
+    # Handshake: echo X-Hook-Secret back
+    hook_secret = request.headers.get("X-Hook-Secret")
+    if hook_secret:
+        logger.info(f"[todo-sync] Asana webhook handshake received, echoing X-Hook-Secret")
+        return jsonify({}), 200, {"X-Hook-Secret": hook_secret}
+
+    payload = request.get_json(force=True, silent=True) or {}
+    events = payload.get("events") or []
+    logger.info(f"[todo-sync] Asana webhook: {len(events)} events")
+
+    def _process_events():
+        try:
+            for event in events:
+                action = event.get("action")
+                resource = event.get("resource") or {}
+                change = event.get("change") or {}
+                if resource.get("resource_type") != "task":
+                    continue
+                task_gid = resource.get("gid")
+                if not task_gid:
+                    continue
+
+                sync_map = load_sync_map()
+                mapping = sync_map["mappings"].get(task_gid)
+
+                if action == "added":
+                    # New task added to project — create in To-Do
+                    logger.info(f"[todo-sync] Asana webhook: task added {task_gid}")
+                    try:
+                        task_data = asana_request("GET", f"/tasks/{task_gid}")
+                        if not task_data:
+                            continue
+                        name = task_data.get("name") or "Asana Task"
+                        notes = task_data.get("notes") or ""
+                        due_on = task_data.get("due_on")
+                        if not mapping:
+                            create_todo_task(name, notes, due_on, asana_gid=task_gid)
+                    except Exception as e:
+                        logger.error(f"[todo-sync] Failed to create To-Do for new Asana task {task_gid}: {e}", exc_info=True)
+
+                elif action == "changed":
+                    field = change.get("field")
+                    new_val = change.get("new_value")
+
+                    if field == "completed" and new_val is True:
+                        # Task completed in Asana → complete in To-Do
+                        if mapping and not mapping.get("completed_by"):
+                            logger.info(f"[todo-sync] Asana webhook: completing To-Do for {task_gid}")
+                            try:
+                                complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
+                            except Exception as e:
+                                logger.error(f"[todo-sync] complete_todo_task failed for {task_gid}: {e}", exc_info=True)
+
+                    elif field in ("name", "due_on") and mapping:
+                        # Name or due date changed → update To-Do
+                        logger.info(f"[todo-sync] Asana webhook: updating To-Do for {task_gid} field={field}")
+                        try:
+                            if field == "name":
+                                update_todo_task(mapping["todo_task_id"], title=new_val)
+                            else:
+                                update_todo_task(mapping["todo_task_id"], due_date=new_val)
+                        except Exception as e:
+                            logger.error(f"[todo-sync] update_todo_task failed for {task_gid}: {e}", exc_info=True)
+
+                elif action in ("deleted", "removed") and mapping:
+                    # Task removed — mark To-Do complete (best effort)
+                    try:
+                        complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
+                    except Exception as e:
+                        logger.warning(f"[todo-sync] Could not complete To-Do on Asana delete {task_gid}: {e}")
+
+        except Exception as e:
+            logger.error(f"[todo-sync] Asana webhook processing error: {e}", exc_info=True)
+
+    threading.Thread(target=_process_events, daemon=True).start()
+    return jsonify({"status": "processing"}), 200
+
+
+@app.route("/sync/setup", methods=["POST"])
+def sync_setup():
+    """One-time setup: create To-Do list, register Asana webhook, do initial full sync."""
+    results = {}
+    try:
+        # 1. Get/create To-Do list
+        list_id = get_or_create_todo_list()
+        sync_map = load_sync_map()
+        sync_map["todo_list_id"] = list_id
+        save_sync_map(sync_map)
+        results["todo_list_id"] = list_id
+
+        # 2. Register Asana webhook
+        if ASANA_PROJECT_GID:
+            webhook_target = f"{RAILWAY_PUBLIC_URL}/webhook/asana"
+            try:
+                existing_wh_id = sync_map.get("asana_webhook_id")
+                if existing_wh_id:
+                    results["asana_webhook_id"] = existing_wh_id
+                    results["webhook_note"] = "Already registered"
+                else:
+                    wh = asana_request("POST", "/webhooks", {
+                        "resource": ASANA_PROJECT_GID,
+                        "target": webhook_target,
+                    })
+                    wh_id = (wh or {}).get("gid", "pending_handshake")
+                    sync_map = load_sync_map()
+                    sync_map["asana_webhook_id"] = wh_id
+                    save_sync_map(sync_map)
+                    results["asana_webhook_id"] = wh_id
+                    results["webhook_target"] = webhook_target
+            except Exception as e:
+                results["webhook_error"] = str(e)
+                logger.warning(f"[todo-sync] Asana webhook registration failed: {e}")
+
+        # 3. Full sync of all incomplete Asana tasks
+        tasks_synced = 0
+        if ASANA_PROJECT_GID:
+            try:
+                project_tasks = asana_request("GET", f"/projects/{ASANA_PROJECT_GID}/tasks?opt_fields=gid,name,notes,due_on,completed")
+                task_list = project_tasks if isinstance(project_tasks, list) else []
+                sync_map = load_sync_map()
+                for task in task_list:
+                    if task.get("completed"):
+                        continue
+                    gid = task.get("gid")
+                    if not gid or gid in sync_map["mappings"]:
+                        continue
+                    try:
+                        create_todo_task(
+                            title=task.get("name") or "Asana Task",
+                            notes=task.get("notes") or "",
+                            due_date=task.get("due_on"),
+                            asana_gid=gid,
+                        )
+                        tasks_synced += 1
+                    except Exception as e:
+                        logger.warning(f"[todo-sync] Initial sync failed for {gid}: {e}")
+            except Exception as e:
+                results["initial_sync_error"] = str(e)
+                logger.error(f"[todo-sync] Initial sync error: {e}", exc_info=True)
+
+        results["tasks_synced"] = tasks_synced
+        results["status"] = "ok"
+        return jsonify(results), 200
+    except Exception as e:
+        logger.error(f"[todo-sync] Setup error: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/sync/status", methods=["GET"])
+def sync_status():
+    """Return current sync status and mapping stats."""
+    sync_map = load_sync_map()
+    return jsonify({
+        "todo_list_id": sync_map.get("todo_list_id"),
+        "asana_webhook_id": sync_map.get("asana_webhook_id"),
+        "total_mapped_tasks": len(sync_map.get("mappings", {})),
+        "poller_running": _todo_poller_running,
+        "last_poll_time": _todo_last_poll_time,
+        "poll_interval_seconds": TODO_POLL_INTERVAL,
+        "todo_list_name": TODO_LIST_NAME,
+    })
+
+
+@app.route("/sync/full", methods=["POST"])
+def sync_full():
+    """Manual full re-sync: create To-Do tasks for any unmapped Asana tasks."""
+    if not ASANA_PROJECT_GID:
+        return jsonify({"status": "error", "reason": "ASANA_PROJECT_GID not set"}), 400
+    tasks_synced = 0
+    tasks_skipped = 0
+    errors = []
+    try:
+        sync_map = load_sync_map()
+        list_id = sync_map.get("todo_list_id")
+        if not list_id:
+            list_id = get_or_create_todo_list()
+            sync_map["todo_list_id"] = list_id
+            save_sync_map(sync_map)
+
+        project_tasks = asana_request("GET", f"/projects/{ASANA_PROJECT_GID}/tasks?opt_fields=gid,name,notes,due_on,completed")
+        task_list = project_tasks if isinstance(project_tasks, list) else []
+        for task in task_list:
+            if task.get("completed"):
+                tasks_skipped += 1
+                continue
+            gid = task.get("gid")
+            if not gid:
+                continue
+            sync_map = load_sync_map()
+            if gid in sync_map["mappings"]:
+                tasks_skipped += 1
+                continue
+            try:
+                create_todo_task(
+                    title=task.get("name") or "Asana Task",
+                    notes=task.get("notes") or "",
+                    due_date=task.get("due_on"),
+                    asana_gid=gid,
+                )
+                tasks_synced += 1
+            except Exception as e:
+                errors.append(f"{gid}: {e}")
+                logger.warning(f"[todo-sync] Full sync failed for {gid}: {e}")
+        return jsonify({"status": "ok", "tasks_synced": tasks_synced, "tasks_skipped": tasks_skipped, "errors": errors})
+    except Exception as e:
+        logger.error(f"[todo-sync] Full sync error: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 
 @app.route("/webhook/fireflies", methods=["POST"])
 def fireflies_webhook():
@@ -1547,10 +2013,19 @@ def start_scheduler():
     logger.info(f"Scheduler started: polling every {POLL_INTERVAL_MINUTES} minutes")
 
 
+# Start background services for gunicorn (module-level, not just __main__)
+_start_lock = _threading.Lock()
+def _start_background_services():
+    with _start_lock:
+        start_scheduler()
+        if ASANA_PROJECT_GID and MS_GRAPH_CLIENT_ID:
+            start_todo_poller()
+
+_start_background_services()
+
 # ======================================================================
 
 if __name__ == "__main__":
-    start_scheduler()
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Post-Meeting Intelligence Pipeline v2 on port {port}")
     app.run(host="0.0.0.0", port=port)
