@@ -93,7 +93,7 @@ SYNC_MAP_FILE = os.path.join(DATA_DIR, "asana_todo_map.json")
 
 # To-Do sync config
 TODO_LIST_NAME = os.environ.get("TODO_LIST_NAME", "Asana Tasks")
-TODO_SYNC_USER_EMAIL = os.environ.get("TODO_SYNC_USER_EMAIL", "bk@negevlabs.com")  # only sync tasks assigned to this user
+# TODO_SYNC_USER_EMAIL removed - app-only mode syncs all @negevlabs.com users automatically
 TODO_POLL_INTERVAL = int(os.environ.get("TODO_POLL_INTERVAL", "300"))
 RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL", "https://meeting-pipeline-production.up.railway.app")
 
@@ -374,6 +374,7 @@ def get_ms_graph_token() -> str:
  # Delegated flow (send as specific user -> single user only)
         data = {
             "client_id": MS_GRAPH_CLIENT_ID,
+            "client_secret": MS_GRAPH_CLIENT_SECRET,
             "refresh_token": MS_GRAPH_REFRESH_TOKEN,
             "grant_type": "refresh_token",
             "scope": "https://graph.microsoft.com/Mail.ReadWrite",
@@ -400,7 +401,7 @@ def get_ms_graph_token() -> str:
 
 def get_delegated_graph_token() -> str:
     global MS_GRAPH_REFRESH_TOKEN
-    """Always use refresh token (delegated) -- required for /me/todo/* endpoints."""
+    """Get delegated token via refresh token (for Mail.ReadWrite delegated flow)."""
     now = time.time()
     if _ms_delegated_token_cache["token"] and _ms_delegated_token_cache["expires_at"] > now + 60:
         return _ms_delegated_token_cache["token"]
@@ -409,6 +410,7 @@ def get_delegated_graph_token() -> str:
         raise RuntimeError("MS_GRAPH_REFRESH_TOKEN not set -- required for To-Do API (delegated auth)")
     data = {
         "client_id": MS_GRAPH_CLIENT_ID,
+        "client_secret": MS_GRAPH_CLIENT_SECRET,
         "refresh_token": MS_GRAPH_REFRESH_TOKEN,
         "grant_type": "refresh_token",
         "scope": "https://graph.microsoft.com/Tasks.ReadWrite Mail.ReadWrite",
@@ -742,7 +744,7 @@ def load_sync_map() -> dict:
         with open(SYNC_MAP_FILE, "r") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"todo_list_id": None, "mappings": {}, "asana_webhook_id": None}
+        return {"user_lists": {}, "mappings": {}, "asana_webhook_id": None}
 
 
 def save_sync_map(sync_map: dict):
@@ -753,7 +755,7 @@ def save_sync_map(sync_map: dict):
 
 def _graph_request_with_retry(method: str, url: str, json_body: dict = None, headers: dict = None, force_delegated: bool = False) -> dict:
     """Microsoft Graph request with 3x retry on 429/5xx (5s/10s/15s backoff).
-    force_delegated=True: always use refresh token (required for /me/todo/* endpoints).
+    force_delegated=True: use refresh token instead of client_credentials.
     """
     token = get_delegated_graph_token() if force_delegated else get_ms_graph_token()
     hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -776,30 +778,32 @@ def _graph_request_with_retry(method: str, url: str, json_body: dict = None, hea
     raise last_exc
 
 
-def get_or_create_todo_list(list_name: str = None) -> str:
-    """Find or create a Microsoft To-Do list by name. Returns list_id."""
+def get_or_create_todo_list(user_email: str, list_name: str = None) -> str:
+    """Find or create a Microsoft To-Do list for a specific user. App-only auth."""
     list_name = list_name or TODO_LIST_NAME
-    url = f"{MS_GRAPH_BASE}/me/todo/lists"
-    data = _graph_request_with_retry("GET", url, force_delegated=True)
+    url = f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists"
+    data = _graph_request_with_retry("GET", url)  # app-only auth
     for lst in (data.get("value") or []):
         if lst.get("displayName", "").lower() == list_name.lower():
-            logger.info(f"[todo-sync] Found existing To-Do list '{list_name}': {lst['id']}")
+            logger.info(f"[todo-sync] Found To-Do list '{list_name}' for {user_email}: {lst['id']}")
             return lst["id"]
     # Create new list
-    created = _graph_request_with_retry("POST", url, json_body={"displayName": list_name}, force_delegated=True)
+    created = _graph_request_with_retry("POST", url, json_body={"displayName": list_name})
     list_id = created["id"]
-    logger.info(f"[todo-sync] Created To-Do list '{list_name}': {list_id}")
+    logger.info(f"[todo-sync] Created To-Do list '{list_name}' for {user_email}: {list_id}")
     return list_id
 
 
-def create_todo_task(title: str, notes: str = None, due_date: str = None,
+def create_todo_task(title: str, user_email: str, notes: str = None, due_date: str = None,
                      asana_gid: str = None, asana_project_gid: str = None) -> str:
-    """Create a To-Do task and store mapping. Returns todo_task_id."""
+    """Create a To-Do task for a specific user (app-only auth). Returns todo_task_id."""
     sync_map = load_sync_map()
-    list_id = sync_map.get("todo_list_id")
+    # Get or create per-user list
+    user_lists = sync_map.get("user_lists") or {}
+    list_id = user_lists.get(user_email)
     if not list_id:
-        list_id = get_or_create_todo_list()
-        sync_map["todo_list_id"] = list_id
+        list_id = get_or_create_todo_list(user_email)
+        sync_map.setdefault("user_lists", {})[user_email] = list_id
         save_sync_map(sync_map)
 
     body: dict = {"title": title}
@@ -809,9 +813,9 @@ def create_todo_task(title: str, notes: str = None, due_date: str = None,
         body["dueDateTime"] = {"dateTime": f"{due_date}T00:00:00", "timeZone": "UTC"}
     body["status"] = "notStarted"
 
-    url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks"
-    logger.info(f"[todo-sync] Creating To-Do task for Asana {asana_gid}: '{title}'")
-    task = _graph_request_with_retry("POST", url, json_body=body, force_delegated=True)
+    url = f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks"
+    logger.info(f"[todo-sync] Creating To-Do task for {user_email}, Asana {asana_gid}: '{title}'")
+    task = _graph_request_with_retry("POST", url, json_body=body)
     todo_task_id = task["id"]
 
     # Add linked resource back to Asana
@@ -820,32 +824,36 @@ def create_todo_task(title: str, notes: str = None, due_date: str = None,
         linked_url = f"https://app.asana.com/0/{project_gid}/{asana_gid}" if project_gid else f"https://app.asana.com/0/0/{asana_gid}"
         try:
             _graph_request_with_retry("POST",
-                f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{todo_task_id}/linkedResources",
-                force_delegated=True,
+                f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks/{todo_task_id}/linkedResources",
                 json_body={"webUrl": linked_url, "applicationName": "Asana", "displayName": "View in Asana"})
         except Exception as e:
             logger.warning(f"[todo-sync] Could not add linked resource: {e}")
 
         # Store mapping
-        sync_map = load_sync_map()  # reload in case concurrent writes
-        sync_map["todo_list_id"] = list_id
+        sync_map = load_sync_map()
+        sync_map.setdefault("user_lists", {})[user_email] = list_id
         sync_map["mappings"][asana_gid] = {
             "todo_task_id": todo_task_id,
+            "user_email": user_email,
+            "todo_list_id": list_id,
             "last_synced": datetime.now(timezone.utc).isoformat(),
             "completed_by": None,
         }
         save_sync_map(sync_map)
 
-    logger.info(f"[todo-sync] Created To-Do task {todo_task_id} for Asana {asana_gid}")
+    logger.info(f"[todo-sync] Created To-Do task {todo_task_id} for {user_email}, Asana {asana_gid}")
     return todo_task_id
 
 
-def update_todo_task(todo_task_id: str, title: str = None, notes: str = None, due_date: str = None):
-    """Update an existing To-Do task."""
+
+def update_todo_task(todo_task_id: str, asana_gid: str = None, title: str = None, notes: str = None, due_date: str = None):
+    """Update an existing To-Do task using per-user app-only auth."""
     sync_map = load_sync_map()
-    list_id = sync_map.get("todo_list_id")
-    if not list_id:
-        logger.warning("[todo-sync] update_todo_task called but no list_id in sync map")
+    mapping = sync_map.get("mappings", {}).get(asana_gid or "", {})
+    user_email = mapping.get("user_email", "")
+    list_id = mapping.get("todo_list_id", "")
+    if not user_email or not list_id:
+        logger.warning(f"[todo-sync] update_todo_task: no user_email/list_id for {asana_gid}")
         return
     body = {}
     if title:
@@ -856,21 +864,24 @@ def update_todo_task(todo_task_id: str, title: str = None, notes: str = None, du
         body["dueDateTime"] = {"dateTime": f"{due_date}T00:00:00", "timeZone": "UTC"}
     if not body:
         return
-    url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{todo_task_id}"
-    logger.info(f"[todo-sync] Updating To-Do task {todo_task_id}")
-    _graph_request_with_retry("PATCH", url, json_body=body, force_delegated=True)
+    url = f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks/{todo_task_id}"
+    logger.info(f"[todo-sync] Updating To-Do task {todo_task_id} for {user_email}")
+    _graph_request_with_retry("PATCH", url, json_body=body)
+
 
 
 def complete_todo_task(todo_task_id: str, asana_gid: str = None):
-    """Mark To-Do task complete. Sets completed_by='asana' in mapping."""
+    """Mark To-Do task complete using per-user app-only auth."""
     sync_map = load_sync_map()
-    list_id = sync_map.get("todo_list_id")
-    if not list_id:
-        logger.warning("[todo-sync] complete_todo_task: no list_id")
+    mapping = sync_map.get("mappings", {}).get(asana_gid or "", {})
+    user_email = mapping.get("user_email", "")
+    list_id = mapping.get("todo_list_id", "")
+    if not user_email or not list_id:
+        logger.warning(f"[todo-sync] complete_todo_task: no user_email/list_id for {asana_gid}")
         return
-    url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{todo_task_id}"
-    logger.info(f"[todo-sync] Completing To-Do task {todo_task_id} (triggered by Asana {asana_gid})")
-    _graph_request_with_retry("PATCH", url, json_body={"status": "completed"}, force_delegated=True)
+    url = f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks/{todo_task_id}"
+    logger.info(f"[todo-sync] Completing To-Do task {todo_task_id} for {user_email} (from Asana {asana_gid})")
+    _graph_request_with_retry("PATCH", url, json_body={"status": "completed"})
     if asana_gid and asana_gid in sync_map["mappings"]:
         sync_map["mappings"][asana_gid]["completed_by"] = "asana"
         sync_map["mappings"][asana_gid]["last_synced"] = datetime.now(timezone.utc).isoformat()
@@ -893,35 +904,38 @@ def complete_asana_task(asana_gid: str, todo_task_id: str = None):
 
 
 def poll_todo_completions():
-    """Check To-Do list for newly completed tasks and sync back to Asana."""
+    """Check all user To-Do lists for newly completed tasks and sync back to Asana."""
     global _todo_last_poll_time
     _todo_last_poll_time = datetime.now(timezone.utc).isoformat()
     sync_map = load_sync_map()
-    list_id = sync_map.get("todo_list_id")
-    if not list_id:
-        logger.info("[todo-sync] Poller: no list_id configured, skipping")
+    user_lists = sync_map.get("user_lists") or {}
+    if not user_lists:
+        logger.info("[todo-sync] Poller: no user_lists configured, skipping")
         return
-    try:
-        url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks?$filter=status eq 'completed'&$top=100"
-        data = _graph_request_with_retry("GET", url, force_delegated=True)
-        completed_tasks = data.get("value") or []
-        newly_synced = 0
-        # Build reverse mapping: todo_task_id -> asana_gid
-        reverse = {v["todo_task_id"]: k for k, v in sync_map["mappings"].items() if v.get("todo_task_id")}
-        for task in completed_tasks:
-            tid = task.get("id")
-            asana_gid = reverse.get(tid)
-            if not asana_gid:
-                continue
-            mapping = sync_map["mappings"][asana_gid]
-            if mapping.get("completed_by"):
-                # Already synced in either direction — skip to prevent infinite loop
-                continue
-            complete_asana_task(asana_gid, todo_task_id=tid)
-            newly_synced += 1
-        logger.info(f"[todo-sync] Poller: checked {len(completed_tasks)} completed tasks, {newly_synced} newly synced to Asana")
-    except Exception as e:
-        logger.error(f"[todo-sync] Poller error: {e}", exc_info=True)
+    # Build reverse mapping: todo_task_id -> asana_gid
+    reverse = {v["todo_task_id"]: k for k, v in sync_map.get("mappings", {}).items() if v.get("todo_task_id")}
+    total_checked = 0
+    newly_synced = 0
+    for user_email, list_id in user_lists.items():
+        try:
+            url = f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks?$filter=status eq 'completed'&$top=100"
+            data = _graph_request_with_retry("GET", url)
+            completed_tasks = data.get("value") or []
+            total_checked += len(completed_tasks)
+            for task in completed_tasks:
+                tid = task.get("id")
+                asana_gid = reverse.get(tid)
+                if not asana_gid:
+                    continue
+                mapping = sync_map["mappings"][asana_gid]
+                if mapping.get("completed_by"):
+                    continue
+                complete_asana_task(asana_gid, todo_task_id=tid)
+                newly_synced += 1
+        except Exception as e:
+            logger.error(f"[todo-sync] Poller error for {user_email}: {e}", exc_info=True)
+    logger.info(f"[todo-sync] Poller: {len(user_lists)} users, {total_checked} completed tasks, {newly_synced} newly synced to Asana")
+
 
 
 def start_todo_poller():
@@ -1286,13 +1300,16 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
                 # Sync new Asana task to Microsoft To-Do
                 if asana_task and asana_task.get("gid") and MS_GRAPH_CLIENT_ID:
                     try:
-                        create_todo_task(
-                            title=item["task"],
-                            notes=notes,
-                            due_date=asana_due,
-                            asana_gid=asana_task["gid"],
-                            asana_project_gid=ASANA_PROJECT_GID,
-                        )
+                        todo_user = (owner_email or organizer_email or '').lower()
+                        if todo_user and todo_user.endswith('@negevlabs.com'):
+                            create_todo_task(
+                                title=item['task'],
+                                user_email=todo_user,
+                                notes=notes,
+                                due_date=asana_due,
+                                asana_gid=asana_task['gid'],
+                                asana_project_gid=ASANA_PROJECT_GID,
+                            )
                         results["actions"].append(f"[OK] To-Do task synced for: {item['task'][:60]}")
                     except Exception as te:
                         logger.warning(f"[todo-sync] Failed to create To-Do task for Asana {asana_task.get('gid')}: {te}")
@@ -1564,7 +1581,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.6.4-filter-my-tasks", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.7.0-app-only-scalable", "deployed": "2026-02-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1588,43 +1605,12 @@ def config_check():
 
 
 
-@app.route("/debug-auth", methods=["GET"])
-def debug_auth():
-    """Test token exchange and show exact Microsoft response."""
-    import requests as req
-    data = {
-        "client_id": MS_GRAPH_CLIENT_ID,
-        "refresh_token": MS_GRAPH_REFRESH_TOKEN,
-        "grant_type": "refresh_token",
-        "scope": "https://graph.microsoft.com/Tasks.ReadWrite Mail.ReadWrite",
-    }
-    debug_info = {
-        "client_id_len": len(MS_GRAPH_CLIENT_ID or ""),
-        "client_secret_len": len(MS_GRAPH_CLIENT_SECRET or ""),
-        "client_secret_first3": (MS_GRAPH_CLIENT_SECRET or "")[:3],
-        "client_secret_last3": (MS_GRAPH_CLIENT_SECRET or "")[-3:],
-        "refresh_token_len": len(MS_GRAPH_REFRESH_TOKEN or ""),
-        "refresh_token_first5": (MS_GRAPH_REFRESH_TOKEN or "")[:5],
-        "token_url": MS_GRAPH_TOKEN_URL,
-    }
-    try:
-        resp = req.post(MS_GRAPH_TOKEN_URL, data=data, timeout=30)
-        debug_info["status_code"] = resp.status_code
-        debug_info["response_body"] = resp.text[:2000]
-        if resp.status_code == 200:
-            debug_info["result"] = "SUCCESS"
-        else:
-            debug_info["result"] = "FAILED"
-    except Exception as e:
-        debug_info["exception"] = str(e)
-    return jsonify(debug_info)
-
 @app.route("/test", methods=["GET"])
 def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.6.4-filter-my-tasks", "steps": {}}
+    results = {"version": "2.7.0-app-only-scalable", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1651,8 +1637,9 @@ def test_pipeline():
             try:
                 t0 = _time.time()
                 token = get_ms_graph_token()
-                url = f"{MS_GRAPH_BASE}/me/todo/lists"
-                todo_resp = _graph_request_with_retry("GET", url, force_delegated=True)
+                test_user = "bk@negevlabs.com"
+                url = f"{MS_GRAPH_BASE}/users/{test_user}/todo/lists"
+                todo_resp = _graph_request_with_retry("GET", url)
                 lists = todo_resp.get("value") or []
                 results["steps"]["todo_api"] = {"status": "ok", "lists_count": len(lists), "ms": int((_time.time()-t0)*1000)}
             except Exception as te:
@@ -1702,14 +1689,16 @@ def asana_webhook():
                     # New task added to project — create in To-Do
                     logger.info(f"[todo-sync] Asana webhook: task added {task_gid}")
                     try:
-                        task_data = asana_request("GET", f"/tasks/{task_gid}")
+                        task_data = asana_request("GET", f"/tasks/{task_gid}?opt_fields=name,notes,due_on,assignee.email")
                         if not task_data:
                             continue
                         name = task_data.get("name") or "Asana Task"
                         notes = task_data.get("notes") or ""
                         due_on = task_data.get("due_on")
-                        if not mapping:
-                            create_todo_task(name, notes, due_on, asana_gid=task_gid)
+                        assignee = task_data.get("assignee") or {}
+                        assignee_email = (assignee.get("email") or "").lower()
+                        if not mapping and assignee_email and assignee_email.endswith("@negevlabs.com"):
+                            create_todo_task(name, user_email=assignee_email, notes=notes, due_date=due_on, asana_gid=task_gid)
                     except Exception as e:
                         logger.error(f"[todo-sync] Failed to create To-Do for new Asana task {task_gid}: {e}", exc_info=True)
 
@@ -1731,9 +1720,9 @@ def asana_webhook():
                         logger.info(f"[todo-sync] Asana webhook: updating To-Do for {task_gid} field={field}")
                         try:
                             if field == "name":
-                                update_todo_task(mapping["todo_task_id"], title=new_val)
+                                update_todo_task(mapping["todo_task_id"], asana_gid=task_gid, title=new_val)
                             else:
-                                update_todo_task(mapping["todo_task_id"], due_date=new_val)
+                                update_todo_task(mapping["todo_task_id"], asana_gid=task_gid, due_date=new_val)
                         except Exception as e:
                             logger.error(f"[todo-sync] update_todo_task failed for {task_gid}: {e}", exc_info=True)
 
@@ -1753,15 +1742,16 @@ def asana_webhook():
 
 @app.route("/todo/setup", methods=["GET", "POST"])
 def todo_setup():
-    """GET-friendly setup: create To-Do list and store its ID. Safe to call multiple times."""
+    """Setup: create To-Do list for a user. Pass ?user=email@negevlabs.com"""
+    user_email = request.args.get("user", "bk@negevlabs.com")
     try:
-        list_id = get_or_create_todo_list()
+        list_id = get_or_create_todo_list(user_email)
         sync_map = load_sync_map()
-        sync_map["todo_list_id"] = list_id
+        sync_map.setdefault("user_lists", {})[user_email] = list_id
         save_sync_map(sync_map)
-        return jsonify({"status": "ok", "todo_list_id": list_id, "list_name": TODO_LIST_NAME}), 200
+        return jsonify({"status": "ok", "user": user_email, "todo_list_id": list_id, "list_name": TODO_LIST_NAME}), 200
     except Exception as e:
-        logger.error(f"[todo/setup] Failed: {e}", exc_info=True)
+        logger.error(f"[todo/setup] Failed for {user_email}: {e}", exc_info=True)
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
@@ -1770,12 +1760,8 @@ def sync_setup():
     """One-time setup: create To-Do list, register Asana webhook, do initial full sync."""
     results = {}
     try:
-        # 1. Get/create To-Do list
-        list_id = get_or_create_todo_list()
+        # Per-user lists created automatically during sync
         sync_map = load_sync_map()
-        sync_map["todo_list_id"] = list_id
-        save_sync_map(sync_map)
-        results["todo_list_id"] = list_id
 
         # 2. Register Asana webhook
         if ASANA_PROJECT_GID:
@@ -1811,15 +1797,21 @@ def sync_setup():
                     if task.get("completed"):
                         continue
                     gid = task.get("gid")
-                    if not gid or gid in sync_map["mappings"]:
+                    if not gid or gid in sync_map.get("mappings", {}):
+                        continue
+                    assignee = task.get("assignee") or {}
+                    assignee_email = (assignee.get("email") or "").lower()
+                    if not assignee_email or not assignee_email.endswith("@negevlabs.com"):
                         continue
                     try:
                         create_todo_task(
                             title=task.get("name") or "Asana Task",
+                            user_email=assignee_email,
                             notes=task.get("notes") or "",
                             due_date=task.get("due_on"),
                             asana_gid=gid,
                         )
+                        tasks_synced += 1
                         tasks_synced += 1
                     except Exception as e:
                         logger.warning(f"[todo-sync] Initial sync failed for {gid}: {e}")
@@ -1852,20 +1844,14 @@ def sync_status():
 
 @app.route("/sync/full", methods=["POST"])
 def sync_full():
-    """Manual full re-sync: create To-Do tasks for any unmapped Asana tasks."""
+    """Full re-sync: create To-Do tasks for all assigned, unmapped Asana tasks (per-user)."""
     if not ASANA_PROJECT_GID:
         return jsonify({"status": "error", "reason": "ASANA_PROJECT_GID not set"}), 400
     tasks_synced = 0
     tasks_skipped = 0
+    users_synced = set()
     errors = []
     try:
-        sync_map = load_sync_map()
-        list_id = sync_map.get("todo_list_id")
-        if not list_id:
-            list_id = get_or_create_todo_list()
-            sync_map["todo_list_id"] = list_id
-            save_sync_map(sync_map)
-
         project_tasks = asana_request("GET", f"/projects/{ASANA_PROJECT_GID}/tasks?opt_fields=gid,name,notes,due_on,completed,assignee.email")
         task_list = project_tasks if isinstance(project_tasks, list) else []
         for task in task_list:
@@ -1875,57 +1861,59 @@ def sync_full():
             gid = task.get("gid")
             if not gid:
                 continue
-            # Only sync tasks assigned to the To-Do user (delegated auth is single-user)
-            assignee = task.get('assignee') or {}
-            assignee_email = (assignee.get('email') or '').lower()
-            if assignee_email != TODO_SYNC_USER_EMAIL.lower():
+            assignee = task.get("assignee") or {}
+            assignee_email = (assignee.get("email") or "").lower().strip()
+            if not assignee_email or not assignee_email.endswith("@negevlabs.com"):
                 tasks_skipped += 1
                 continue
             sync_map = load_sync_map()
-            if gid in sync_map["mappings"]:
+            if gid in sync_map.get("mappings", {}):
                 tasks_skipped += 1
                 continue
             try:
                 create_todo_task(
                     title=task.get("name") or "Asana Task",
+                    user_email=assignee_email,
                     notes=task.get("notes") or "",
                     due_date=task.get("due_on"),
                     asana_gid=gid,
                 )
                 tasks_synced += 1
+                users_synced.add(assignee_email)
             except Exception as e:
-                errors.append(f"{gid}: {e}")
-                logger.warning(f"[todo-sync] Full sync failed for {gid}: {e}")
-        return jsonify({"status": "ok", "tasks_synced": tasks_synced, "tasks_skipped": tasks_skipped, "errors": errors})
+                errors.append(f"{gid} ({assignee_email}): {e}")
+                logger.warning(f"[todo-sync] Full sync failed for {gid} ({assignee_email}): {e}")
+        return jsonify({"status": "ok", "tasks_synced": tasks_synced, "tasks_skipped": tasks_skipped, "users": sorted(users_synced), "errors": errors})
     except Exception as e:
         logger.error(f"[todo-sync] Full sync error: {e}", exc_info=True)
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
 
+
 @app.route("/sync/reset", methods=["POST"])
 def sync_reset():
-    """Clear sync map and delete all tasks from the To-Do list. Use to start fresh."""
+    """Clear sync map and delete all tasks from all user To-Do lists. Start fresh."""
     try:
         sync_map = load_sync_map()
-        list_id = sync_map.get("todo_list_id")
+        user_lists = sync_map.get("user_lists") or {}
         deleted = 0
-        if list_id:
-            # Delete all tasks from the To-Do list
-            url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks"
-            data = _graph_request_with_retry("GET", url, force_delegated=True)
-            for task in (data.get("value") or []):
-                try:
-                    _graph_request_with_retry("DELETE",
-                        f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{task['id']}",
-                        force_delegated=True)
-                    deleted += 1
-                except Exception as e:
-                    logger.warning(f"[sync-reset] Could not delete task {task['id']}: {e}")
-        # Reset sync map but keep list_id
-        new_map = {"todo_list_id": list_id, "mappings": {}}
+        for user_email, list_id in user_lists.items():
+            try:
+                url = f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks"
+                data = _graph_request_with_retry("GET", url)
+                for task in (data.get("value") or []):
+                    try:
+                        _graph_request_with_retry("DELETE",
+                            f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks/{task['id']}")
+                        deleted += 1
+                    except Exception as e:
+                        logger.warning(f"[sync-reset] Could not delete task {task['id']} for {user_email}: {e}")
+            except Exception as e:
+                logger.warning(f"[sync-reset] Could not list tasks for {user_email}: {e}")
+        new_map = {"user_lists": {}, "mappings": {}}
         save_sync_map(new_map)
-        return jsonify({"status": "ok", "tasks_deleted": deleted, "mappings_cleared": len(sync_map.get("mappings", {}))})
+        return jsonify({"status": "ok", "tasks_deleted": deleted, "users_cleared": list(user_lists.keys()), "mappings_cleared": len(sync_map.get("mappings", {}))})
     except Exception as e:
         logger.error(f"[sync-reset] Error: {e}", exc_info=True)
         return jsonify({"status": "error", "error": str(e)}), 500
