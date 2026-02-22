@@ -392,6 +392,7 @@ def get_ms_graph_token() -> str:
 
 
 def get_delegated_graph_token() -> str:
+    global MS_GRAPH_REFRESH_TOKEN
     """Always use refresh token (delegated) -- required for /me/todo/* endpoints."""
     now = time.time()
     if _ms_delegated_token_cache["token"] and _ms_delegated_token_cache["expires_at"] > now + 60:
@@ -409,7 +410,6 @@ def get_delegated_graph_token() -> str:
     token_data = resp.json()
     _ms_delegated_token_cache["token"] = token_data["access_token"]
     _ms_delegated_token_cache["expires_at"] = now + token_data.get("expires_in", 3600)
-    global MS_GRAPH_REFRESH_TOKEN
     if token_data.get("refresh_token"):
         MS_GRAPH_REFRESH_TOKEN = token_data["refresh_token"]
         logger.info("[todo-sync] Refresh token rotated, updated in memory")
@@ -1547,7 +1547,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.5.3-todo-token-rotation", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.5.4-todo-global-fix", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1575,7 +1575,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.5.3-todo-token-rotation", "steps": {}}
+    results = {"version": "2.5.4-todo-global-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
