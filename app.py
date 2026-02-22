@@ -1,4 +1,4 @@
-"""
+﻿"""
 Post-Meeting Intelligence Pipeline v2
 # Fireflies -> Claude AI -> Approval UI -> HubSpot/Asana/Outlook
 
@@ -343,6 +343,7 @@ MS_GRAPH_TOKEN_URL = f"https://login.microsoftonline.com/{MS_GRAPH_TENANT_ID}/oa
 MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 _ms_token_cache = {"token": None, "expires_at": 0}
+_ms_delegated_token_cache = {"token": None, "expires_at": 0}
 
 
 def is_app_only_mode() -> bool:
@@ -388,6 +389,28 @@ def get_ms_graph_token() -> str:
     _ms_token_cache["token"] = token_data["access_token"]
     _ms_token_cache["expires_at"] = now + token_data.get("expires_in", 3600)
     return _ms_token_cache["token"]
+
+
+def get_delegated_graph_token() -> str:
+    """Always use refresh token (delegated) -- required for /me/todo/* endpoints."""
+    now = time.time()
+    if _ms_delegated_token_cache["token"] and _ms_delegated_token_cache["expires_at"] > now + 60:
+        return _ms_delegated_token_cache["token"]
+    if not MS_GRAPH_REFRESH_TOKEN:
+        raise RuntimeError("MS_GRAPH_REFRESH_TOKEN not set -- required for To-Do API (delegated auth)")
+    data = {
+        "client_id": MS_GRAPH_CLIENT_ID,
+        "client_secret": MS_GRAPH_CLIENT_SECRET,
+        "refresh_token": MS_GRAPH_REFRESH_TOKEN,
+        "grant_type": "refresh_token",
+        "scope": "https://graph.microsoft.com/Tasks.ReadWrite Mail.ReadWrite",
+    }
+    resp = requests.post(MS_GRAPH_TOKEN_URL, data=data, timeout=30)
+    resp.raise_for_status()
+    token_data = resp.json()
+    _ms_delegated_token_cache["token"] = token_data["access_token"]
+    _ms_delegated_token_cache["expires_at"] = now + token_data.get("expires_in", 3600)
+    return _ms_delegated_token_cache["token"]
 
 
 def create_outlook_draft(
@@ -708,9 +731,11 @@ def save_sync_map(sync_map: dict):
         json.dump(sync_map, f, indent=2, default=str)
 
 
-def _graph_request_with_retry(method: str, url: str, json_body: dict = None, headers: dict = None) -> dict:
-    """Microsoft Graph request with 3x retry on 429/5xx (5s/10s/15s backoff)."""
-    token = get_ms_graph_token()
+def _graph_request_with_retry(method: str, url: str, json_body: dict = None, headers: dict = None, force_delegated: bool = False) -> dict:
+    """Microsoft Graph request with 3x retry on 429/5xx (5s/10s/15s backoff).
+    force_delegated=True: always use refresh token (required for /me/todo/* endpoints).
+    """
+    token = get_delegated_graph_token() if force_delegated else get_ms_graph_token()
     hdrs = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     if headers:
         hdrs.update(headers)
@@ -721,7 +746,7 @@ def _graph_request_with_retry(method: str, url: str, json_body: dict = None, hea
         try:
             resp = requests.request(method, url, json=json_body, headers=hdrs, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-                logger.warning(f"[todo-sync] Graph {method} {url} → {resp.status_code}, retrying (attempt {attempt+1}/3)")
+                logger.warning(f"[todo-sync] Graph {method} {url} â†’ {resp.status_code}, retrying (attempt {attempt+1}/3)")
                 continue
             resp.raise_for_status()
             return resp.json() if resp.content else {}
@@ -735,13 +760,13 @@ def get_or_create_todo_list(list_name: str = None) -> str:
     """Find or create a Microsoft To-Do list by name. Returns list_id."""
     list_name = list_name or TODO_LIST_NAME
     url = f"{MS_GRAPH_BASE}/me/todo/lists"
-    data = _graph_request_with_retry("GET", url)
+    data = _graph_request_with_retry("GET", url, force_delegated=True)
     for lst in (data.get("value") or []):
         if lst.get("displayName", "").lower() == list_name.lower():
             logger.info(f"[todo-sync] Found existing To-Do list '{list_name}': {lst['id']}")
             return lst["id"]
     # Create new list
-    created = _graph_request_with_retry("POST", url, json_body={"displayName": list_name})
+    created = _graph_request_with_retry("POST", url, json_body={"displayName": list_name}, force_delegated=True)
     list_id = created["id"]
     logger.info(f"[todo-sync] Created To-Do list '{list_name}': {list_id}")
     return list_id
@@ -766,7 +791,7 @@ def create_todo_task(title: str, notes: str = None, due_date: str = None,
 
     url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks"
     logger.info(f"[todo-sync] Creating To-Do task for Asana {asana_gid}: '{title}'")
-    task = _graph_request_with_retry("POST", url, json_body=body)
+    task = _graph_request_with_retry("POST", url, json_body=body, force_delegated=True)
     todo_task_id = task["id"]
 
     # Add linked resource back to Asana
@@ -776,6 +801,7 @@ def create_todo_task(title: str, notes: str = None, due_date: str = None,
         try:
             _graph_request_with_retry("POST",
                 f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{todo_task_id}/linkedResources",
+                force_delegated=True,
                 json_body={"webUrl": linked_url, "applicationName": "Asana", "displayName": "View in Asana"})
         except Exception as e:
             logger.warning(f"[todo-sync] Could not add linked resource: {e}")
@@ -812,7 +838,7 @@ def update_todo_task(todo_task_id: str, title: str = None, notes: str = None, du
         return
     url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{todo_task_id}"
     logger.info(f"[todo-sync] Updating To-Do task {todo_task_id}")
-    _graph_request_with_retry("PATCH", url, json_body=body)
+    _graph_request_with_retry("PATCH", url, json_body=body, force_delegated=True)
 
 
 def complete_todo_task(todo_task_id: str, asana_gid: str = None):
@@ -824,7 +850,7 @@ def complete_todo_task(todo_task_id: str, asana_gid: str = None):
         return
     url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks/{todo_task_id}"
     logger.info(f"[todo-sync] Completing To-Do task {todo_task_id} (triggered by Asana {asana_gid})")
-    _graph_request_with_retry("PATCH", url, json_body={"status": "completed"})
+    _graph_request_with_retry("PATCH", url, json_body={"status": "completed"}, force_delegated=True)
     if asana_gid and asana_gid in sync_map["mappings"]:
         sync_map["mappings"][asana_gid]["completed_by"] = "asana"
         sync_map["mappings"][asana_gid]["last_synced"] = datetime.now(timezone.utc).isoformat()
@@ -857,7 +883,7 @@ def poll_todo_completions():
         return
     try:
         url = f"{MS_GRAPH_BASE}/me/todo/lists/{list_id}/tasks?$filter=status eq 'completed'&$top=100"
-        data = _graph_request_with_retry("GET", url)
+        data = _graph_request_with_retry("GET", url, force_delegated=True)
         completed_tasks = data.get("value") or []
         newly_synced = 0
         # Build reverse mapping: todo_task_id -> asana_gid
@@ -869,7 +895,7 @@ def poll_todo_completions():
                 continue
             mapping = sync_map["mappings"][asana_gid]
             if mapping.get("completed_by"):
-                # Already synced in either direction — skip to prevent infinite loop
+                # Already synced in either direction â€” skip to prevent infinite loop
                 continue
             complete_asana_task(asana_gid, todo_task_id=tid)
             newly_synced += 1
@@ -1518,7 +1544,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.5.0-todo-sync", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.5.1-todo-delegated-auth", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1546,7 +1572,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.5.0-todo-sync", "steps": {}}
+    results = {"version": "2.5.1-todo-delegated-auth", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1574,7 +1600,7 @@ def test_pipeline():
                 t0 = _time.time()
                 token = get_ms_graph_token()
                 url = f"{MS_GRAPH_BASE}/me/todo/lists"
-                todo_resp = _graph_request_with_retry("GET", url)
+                todo_resp = _graph_request_with_retry("GET", url, force_delegated=True)
                 lists = todo_resp.get("value") or []
                 results["steps"]["todo_api"] = {"status": "ok", "lists_count": len(lists), "ms": int((_time.time()-t0)*1000)}
             except Exception as te:
@@ -1592,7 +1618,7 @@ def test_pipeline():
 
 @app.route("/webhook/asana", methods=["POST"])
 def asana_webhook():
-    """Asana webhook handler — handshake + event processing."""
+    """Asana webhook handler â€” handshake + event processing."""
     import threading
 
     # Handshake: echo X-Hook-Secret back
@@ -1621,7 +1647,7 @@ def asana_webhook():
                 mapping = sync_map["mappings"].get(task_gid)
 
                 if action == "added":
-                    # New task added to project — create in To-Do
+                    # New task added to project â€” create in To-Do
                     logger.info(f"[todo-sync] Asana webhook: task added {task_gid}")
                     try:
                         task_data = asana_request("GET", f"/tasks/{task_gid}")
@@ -1640,7 +1666,7 @@ def asana_webhook():
                     new_val = change.get("new_value")
 
                     if field == "completed" and new_val is True:
-                        # Task completed in Asana → complete in To-Do
+                        # Task completed in Asana â†’ complete in To-Do
                         if mapping and not mapping.get("completed_by"):
                             logger.info(f"[todo-sync] Asana webhook: completing To-Do for {task_gid}")
                             try:
@@ -1649,7 +1675,7 @@ def asana_webhook():
                                 logger.error(f"[todo-sync] complete_todo_task failed for {task_gid}: {e}", exc_info=True)
 
                     elif field in ("name", "due_on") and mapping:
-                        # Name or due date changed → update To-Do
+                        # Name or due date changed â†’ update To-Do
                         logger.info(f"[todo-sync] Asana webhook: updating To-Do for {task_gid} field={field}")
                         try:
                             if field == "name":
@@ -1660,7 +1686,7 @@ def asana_webhook():
                             logger.error(f"[todo-sync] update_todo_task failed for {task_gid}: {e}", exc_info=True)
 
                 elif action in ("deleted", "removed") and mapping:
-                    # Task removed — mark To-Do complete (best effort)
+                    # Task removed â€” mark To-Do complete (best effort)
                     try:
                         complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
                     except Exception as e:
@@ -1671,6 +1697,20 @@ def asana_webhook():
 
     threading.Thread(target=_process_events, daemon=True).start()
     return jsonify({"status": "processing"}), 200
+
+
+@app.route("/todo/setup", methods=["GET", "POST"])
+def todo_setup():
+    """GET-friendly setup: create To-Do list and store its ID. Safe to call multiple times."""
+    try:
+        list_id = get_or_create_todo_list()
+        sync_map = load_sync_map()
+        sync_map["todo_list_id"] = list_id
+        save_sync_map(sync_map)
+        return jsonify({"status": "ok", "todo_list_id": list_id, "list_name": TODO_LIST_NAME}), 200
+    except Exception as e:
+        logger.error(f"[todo/setup] Failed: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route("/sync/setup", methods=["POST"])
@@ -2029,3 +2069,8 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Post-Meeting Intelligence Pipeline v2 on port {port}")
     app.run(host="0.0.0.0", port=port)
+
+
+
+
+
