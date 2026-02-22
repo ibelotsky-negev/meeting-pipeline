@@ -807,8 +807,16 @@ def create_todo_task(title: str, user_email: str, notes: str = None, due_date: s
         save_sync_map(sync_map)
 
     body: dict = {"title": title}
+    # Build body with Asana link + notes
+    body_parts = []
+    if asana_gid:
+        _proj = asana_project_gid or ASANA_PROJECT_GID
+        _asana_url = f"https://app.asana.com/0/{_proj}/{asana_gid}" if _proj else f"https://app.asana.com/0/0/{asana_gid}"
+        body_parts.append(f"Asana: {_asana_url}")
     if notes:
-        body["body"] = {"content": notes, "contentType": "text"}
+        body_parts.append(notes)
+    if body_parts:
+        body["body"] = {"content": "\n\n".join(body_parts), "contentType": "text"}
     if due_date:
         body["dueDateTime"] = {"dateTime": f"{due_date}T00:00:00", "timeZone": "UTC"}
     body["status"] = "notStarted"
@@ -1581,7 +1589,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.7.0-app-only-scalable", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.7.1-link-and-sync-fix", "deployed": "2026-02-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1610,7 +1618,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.7.0-app-only-scalable", "steps": {}}
+    results = {"version": "2.7.1-link-and-sync-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1715,17 +1723,22 @@ def asana_webhook():
                             except Exception as e:
                                 logger.error(f"[todo-sync] complete_todo_task failed for {task_gid}: {e}", exc_info=True)
 
-                    elif field in ("name", "due_on") and mapping:
-                        # Name or due date changed → update To-Do
+                    elif field in ("name", "due_on", "notes") and mapping:
+                        # Name, due date, or notes changed -> update To-Do
                         logger.info(f"[todo-sync] Asana webhook: updating To-Do for {task_gid} field={field}")
                         try:
                             if field == "name":
                                 update_todo_task(mapping["todo_task_id"], asana_gid=task_gid, title=new_val)
+                            elif field == "notes":
+                                # Rebuild body with Asana link + new notes
+                                _proj = ASANA_PROJECT_GID
+                                _link = f"Asana: https://app.asana.com/0/{_proj}/{task_gid}" if _proj else ""
+                                _body = f"{_link}\n\n{new_val or str()}" if _link else (new_val or "")
+                                update_todo_task(mapping["todo_task_id"], asana_gid=task_gid, notes=_body.strip())
                             else:
                                 update_todo_task(mapping["todo_task_id"], asana_gid=task_gid, due_date=new_val)
                         except Exception as e:
                             logger.error(f"[todo-sync] update_todo_task failed for {task_gid}: {e}", exc_info=True)
-
                 elif action in ("deleted", "removed") and mapping:
                     # Task removed — mark To-Do complete (best effort)
                     try:
