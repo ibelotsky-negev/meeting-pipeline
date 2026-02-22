@@ -1569,7 +1569,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.5.7-env-wins", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.5.8-secret-fix", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1597,7 +1597,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.5.7-env-wins", "steps": {}}
+    results = {"version": "2.5.8-secret-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
