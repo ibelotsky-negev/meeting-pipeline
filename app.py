@@ -1565,7 +1565,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.6.1-no-disk-read", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.6.2-debug-endpoint", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1588,12 +1588,45 @@ def config_check():
 
 
 
+
+@app.route("/debug-auth", methods=["GET"])
+def debug_auth():
+    """Test token exchange and show exact Microsoft response."""
+    import requests as req
+    data = {
+        "client_id": MS_GRAPH_CLIENT_ID,
+        "client_secret": MS_GRAPH_CLIENT_SECRET,
+        "refresh_token": MS_GRAPH_REFRESH_TOKEN,
+        "grant_type": "refresh_token",
+        "scope": "https://graph.microsoft.com/Tasks.ReadWrite Mail.ReadWrite",
+    }
+    debug_info = {
+        "client_id_len": len(MS_GRAPH_CLIENT_ID or ""),
+        "client_secret_len": len(MS_GRAPH_CLIENT_SECRET or ""),
+        "client_secret_first3": (MS_GRAPH_CLIENT_SECRET or "")[:3],
+        "client_secret_last3": (MS_GRAPH_CLIENT_SECRET or "")[-3:],
+        "refresh_token_len": len(MS_GRAPH_REFRESH_TOKEN or ""),
+        "refresh_token_first5": (MS_GRAPH_REFRESH_TOKEN or "")[:5],
+        "token_url": MS_GRAPH_TOKEN_URL,
+    }
+    try:
+        resp = req.post(MS_GRAPH_TOKEN_URL, data=data, timeout=30)
+        debug_info["status_code"] = resp.status_code
+        debug_info["response_body"] = resp.text[:2000]
+        if resp.status_code == 200:
+            debug_info["result"] = "SUCCESS"
+        else:
+            debug_info["result"] = "FAILED"
+    except Exception as e:
+        debug_info["exception"] = str(e)
+    return jsonify(debug_info)
+
 @app.route("/test", methods=["GET"])
 def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.6.1-no-disk-read", "steps": {}}
+    results = {"version": "2.6.2-debug-endpoint", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
