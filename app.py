@@ -423,7 +423,10 @@ def get_delegated_graph_token() -> str:
         "scope": "https://graph.microsoft.com/Tasks.ReadWrite Mail.ReadWrite",
     }
     resp = requests.post(MS_GRAPH_TOKEN_URL, data=data, timeout=30)
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        logger.error(f"[todo-sync] Token request FAILED {resp.status_code}: {resp.text}")
+        logger.error(f"[todo-sync] client_id present: {bool(data.get('client_id'))}, client_secret present: {bool(data.get('client_secret'))}, refresh_token length: {len(data.get('refresh_token',''))}")
+        resp.raise_for_status()
     token_data = resp.json()
     _ms_delegated_token_cache["token"] = token_data["access_token"]
     _ms_delegated_token_cache["expires_at"] = now + token_data.get("expires_in", 3600)
@@ -1570,7 +1573,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.5.9-secret-fix2", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.6.0-debug-auth", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1578,7 +1581,7 @@ def config_check():
     """Diagnostic: verify team-wide config (no secrets exposed)."""
     return jsonify({
         "graph_auth_mode": "app-only (team-wide)" if is_app_only_mode() else "delegated (single-user)",
-        "graph_client_id_set": bool(MS_GRAPH_CLIENT_ID),
+        "graph_client_id_set": bool(MS_GRAPH_CLIENT_ID), "graph_client_secret_set": bool(MS_GRAPH_CLIENT_SECRET), "refresh_token_len": len(MS_GRAPH_REFRESH_TOKEN),
         "graph_tenant_id_set": bool(MS_GRAPH_TENANT_ID),
         "bot_sender": BOT_SENDER_EMAIL or "(not set)",
         "hubspot_owner_map_raw": HUBSPOT_OWNER_MAP_RAW[:200] if HUBSPOT_OWNER_MAP_RAW else "(empty)",
@@ -1598,7 +1601,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.5.9-secret-fix2", "steps": {}}
+    results = {"version": "2.6.0-debug-auth", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
