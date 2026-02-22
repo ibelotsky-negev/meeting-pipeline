@@ -404,15 +404,7 @@ def get_delegated_graph_token() -> str:
     now = time.time()
     if _ms_delegated_token_cache["token"] and _ms_delegated_token_cache["expires_at"] > now + 60:
         return _ms_delegated_token_cache["token"]
-    # Always read latest rotated token from disk (cross-worker, cross-restart)
-    try:
-        if os.path.exists("/data/refresh_token.txt"):
-            with open("/data/refresh_token.txt") as f:
-                _disk_token = f.read().strip()
-            if _disk_token:
-                MS_GRAPH_REFRESH_TOKEN = _disk_token
-    except Exception as _e:
-        logger.warning(f"[todo-sync] Could not read refresh token from disk: {_e}")
+    # Disk re-read removed -- startup handles env-vs-disk priority
     if not MS_GRAPH_REFRESH_TOKEN:
         raise RuntimeError("MS_GRAPH_REFRESH_TOKEN not set -- required for To-Do API (delegated auth)")
     data = {
@@ -1573,7 +1565,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.6.0-debug-auth", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.6.1-no-disk-read", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1601,7 +1593,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.6.0-debug-auth", "steps": {}}
+    results = {"version": "2.6.1-no-disk-read", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
