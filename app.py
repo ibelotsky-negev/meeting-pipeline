@@ -1606,7 +1606,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.7.3-reopen-and-webhook-verify", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.7.4-fetch-on-change", "deployed": "2026-02-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1635,7 +1635,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.7.3-reopen-and-webhook-verify", "steps": {}}
+    results = {"version": "2.7.4-fetch-on-change", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1750,19 +1750,22 @@ def asana_webhook():
 
 
                     elif field in ("name", "due_on", "notes") and mapping:
-                        # Name, due date, or notes changed -> update To-Do
-                        logger.info(f"[todo-sync] Asana webhook: updating To-Do for {task_gid} field={field}")
+                        # Name, due date, or notes changed -> fetch current values from Asana then update To-Do
+                        # NOTE: Asana webhooks do NOT include new_value for most fields - must fetch
+                        logger.info(f"[todo-sync] Asana webhook: {field} changed for {task_gid}, fetching current values")
                         try:
-                            if field == "name":
-                                update_todo_task(mapping["todo_task_id"], asana_gid=task_gid, title=new_val)
-                            elif field == "notes":
-                                # Rebuild body with Asana link + new notes
+                            td = asana_request("GET", f"/tasks/{task_gid}?opt_fields=name,notes,due_on")
+                            if td:
+                                _title = td.get("name")
+                                _notes_raw = td.get("notes") or ""
+                                _due = td.get("due_on")
                                 _proj = ASANA_PROJECT_GID
                                 _link = f"Asana: https://app.asana.com/0/{_proj}/{task_gid}" if _proj else ""
-                                _body = f"{_link}\n\n{new_val or str()}" if _link else (new_val or "")
-                                update_todo_task(mapping["todo_task_id"], asana_gid=task_gid, notes=_body.strip())
+                                _body = f"{_link}\n\n{_notes_raw}".strip() if _link else _notes_raw
+                                logger.info(f"[todo-sync] Fetched: name='{_title}', due={_due}, notes_len={len(_notes_raw)}")
+                                update_todo_task(mapping["todo_task_id"], asana_gid=task_gid, title=_title, notes=_body, due_date=_due)
                             else:
-                                update_todo_task(mapping["todo_task_id"], asana_gid=task_gid, due_date=new_val)
+                                logger.warning(f"[todo-sync] Could not fetch task {task_gid} from Asana")
                         except Exception as e:
                             logger.error(f"[todo-sync] update_todo_task failed for {task_gid}: {e}", exc_info=True)
                 elif action in ("deleted", "removed") and mapping:
