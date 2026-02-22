@@ -1589,7 +1589,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.7.1-link-and-sync-fix", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.7.2-webhook-resilient", "deployed": "2026-02-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1618,7 +1618,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.7.1-link-and-sync-fix", "steps": {}}
+    results = {"version": "2.7.2-webhook-resilient", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1785,11 +1785,27 @@ def sync_setup():
                     results["asana_webhook_id"] = existing_wh_id
                     results["webhook_note"] = "Already registered"
                 else:
-                    wh = asana_request("POST", "/webhooks", {
-                        "resource": ASANA_PROJECT_GID,
-                        "target": webhook_target,
-                    })
-                    wh_id = (wh or {}).get("gid", "pending_handshake")
+                    try:
+                        wh = asana_request("POST", "/webhooks", {
+                            "resource": ASANA_PROJECT_GID,
+                            "target": webhook_target,
+                        })
+                        wh_id = (wh or {}).get("gid", "pending_handshake")
+                    except Exception as wh_err:
+                        # 403 = webhook already exists, list and reuse
+                        logger.info(f"[todo-sync] Webhook create failed ({wh_err}), listing existing...")
+                        wh_id = None
+                        try:
+                            existing = asana_request("GET", f"/webhooks?workspace={ASANA_WORKSPACE_GID}&resource={ASANA_PROJECT_GID}")
+                            for wh_item in (existing if isinstance(existing, list) else []):
+                                if webhook_target in (wh_item.get("target") or ""):
+                                    wh_id = wh_item.get("gid")
+                                    logger.info(f"[todo-sync] Found existing webhook: {wh_id}")
+                                    break
+                        except Exception as list_err:
+                            logger.warning(f"[todo-sync] Could not list webhooks: {list_err}")
+                        if not wh_id:
+                            raise wh_err
                     sync_map = load_sync_map()
                     sync_map["asana_webhook_id"] = wh_id
                     save_sync_map(sync_map)
