@@ -373,7 +373,6 @@ def get_ms_graph_token() -> str:
  # Delegated flow (send as specific user -> single user only)
         data = {
             "client_id": MS_GRAPH_CLIENT_ID,
-            "client_secret": MS_GRAPH_CLIENT_SECRET,
             "refresh_token": MS_GRAPH_REFRESH_TOKEN,
             "grant_type": "refresh_token",
             "scope": "https://graph.microsoft.com/Mail.ReadWrite",
@@ -409,7 +408,6 @@ def get_delegated_graph_token() -> str:
         raise RuntimeError("MS_GRAPH_REFRESH_TOKEN not set -- required for To-Do API (delegated auth)")
     data = {
         "client_id": MS_GRAPH_CLIENT_ID,
-        "client_secret": MS_GRAPH_CLIENT_SECRET,
         "refresh_token": MS_GRAPH_REFRESH_TOKEN,
         "grant_type": "refresh_token",
         "scope": "https://graph.microsoft.com/Tasks.ReadWrite Mail.ReadWrite",
@@ -1565,7 +1563,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.6.2-debug-endpoint", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.6.3-public-client-fix", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1595,7 +1593,6 @@ def debug_auth():
     import requests as req
     data = {
         "client_id": MS_GRAPH_CLIENT_ID,
-        "client_secret": MS_GRAPH_CLIENT_SECRET,
         "refresh_token": MS_GRAPH_REFRESH_TOKEN,
         "grant_type": "refresh_token",
         "scope": "https://graph.microsoft.com/Tasks.ReadWrite Mail.ReadWrite",
@@ -1626,7 +1623,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.6.2-debug-endpoint", "steps": {}}
+    results = {"version": "2.6.3-public-client-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
