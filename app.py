@@ -1560,7 +1560,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.5.5-todo-persist"deployed": "2026-02-22"})
+    return jsonify({"version": "2.5.5-todo-persist", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2085,6 +2085,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Post-Meeting Intelligence Pipeline v2 on port {port}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
