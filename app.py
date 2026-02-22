@@ -1606,7 +1606,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.7.4-fetch-on-change", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.7.5-debug-reopen", "deployed": "2026-02-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1635,7 +1635,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.7.4-fetch-on-change", "steps": {}}
+    results = {"version": "2.7.5-debug-reopen", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1695,6 +1695,14 @@ def asana_webhook():
     events = payload.get("events") or []
     logger.info(f"[todo-sync] Asana webhook: {len(events)} events")
 
+    def _log_event_debug(ev):
+        a = ev.get("action")
+        r = ev.get("resource") or {}
+        c = ev.get("change") or {}
+        logger.info(f"[todo-sync] EVENT: action={a} type={r.get('resource_type')} gid={r.get('gid')} field={c.get('field')} new_value={c.get('new_value')} new_value_type={type(c.get('new_value')).__name__}")
+    for _ev in events:
+        _log_event_debug(_ev)
+
     def _process_events():
         try:
             for event in events:
@@ -1739,7 +1747,7 @@ def asana_webhook():
                                 complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
                             except Exception as e:
                                 logger.error(f"[todo-sync] complete_todo_task failed for {task_gid}: {e}", exc_info=True)
-                    elif field == "completed" and new_val is False:
+                    elif field == "completed" and new_val == False and new_val is not None:
                         # Task re-opened in Asana -> reopen in To-Do
                         if mapping:
                             logger.info(f"[todo-sync] Asana webhook: reopening To-Do for {task_gid}")
