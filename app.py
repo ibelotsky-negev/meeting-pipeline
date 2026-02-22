@@ -1,4 +1,4 @@
-﻿"""
+"""
 Post-Meeting Intelligence Pipeline v2
 # Fireflies -> Claude AI -> Approval UI -> HubSpot/Asana/Outlook
 
@@ -771,7 +771,7 @@ def _graph_request_with_retry(method: str, url: str, json_body: dict = None, hea
         try:
             resp = requests.request(method, url, json=json_body, headers=hdrs, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-                logger.warning(f"[todo-sync] Graph {method} {url} â†’ {resp.status_code}, retrying (attempt {attempt+1}/3)")
+                logger.warning(f"[todo-sync] Graph {method} {url} → {resp.status_code}, retrying (attempt {attempt+1}/3)")
                 continue
             resp.raise_for_status()
             return resp.json() if resp.content else {}
@@ -920,7 +920,7 @@ def poll_todo_completions():
                 continue
             mapping = sync_map["mappings"][asana_gid]
             if mapping.get("completed_by"):
-                # Already synced in either direction â€” skip to prevent infinite loop
+                # Already synced in either direction — skip to prevent infinite loop
                 continue
             complete_asana_task(asana_gid, todo_task_id=tid)
             newly_synced += 1
@@ -1569,7 +1569,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.5.6-disk-token", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.5.7-env-wins", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1597,7 +1597,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.5.6-disk-token", "steps": {}}
+    results = {"version": "2.5.7-env-wins", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1643,7 +1643,7 @@ def test_pipeline():
 
 @app.route("/webhook/asana", methods=["POST"])
 def asana_webhook():
-    """Asana webhook handler â€” handshake + event processing."""
+    """Asana webhook handler — handshake + event processing."""
     import threading
 
     # Handshake: echo X-Hook-Secret back
@@ -1672,7 +1672,7 @@ def asana_webhook():
                 mapping = sync_map["mappings"].get(task_gid)
 
                 if action == "added":
-                    # New task added to project â€” create in To-Do
+                    # New task added to project — create in To-Do
                     logger.info(f"[todo-sync] Asana webhook: task added {task_gid}")
                     try:
                         task_data = asana_request("GET", f"/tasks/{task_gid}")
@@ -1691,7 +1691,7 @@ def asana_webhook():
                     new_val = change.get("new_value")
 
                     if field == "completed" and new_val is True:
-                        # Task completed in Asana â†’ complete in To-Do
+                        # Task completed in Asana → complete in To-Do
                         if mapping and not mapping.get("completed_by"):
                             logger.info(f"[todo-sync] Asana webhook: completing To-Do for {task_gid}")
                             try:
@@ -1700,7 +1700,7 @@ def asana_webhook():
                                 logger.error(f"[todo-sync] complete_todo_task failed for {task_gid}: {e}", exc_info=True)
 
                     elif field in ("name", "due_on") and mapping:
-                        # Name or due date changed â†’ update To-Do
+                        # Name or due date changed → update To-Do
                         logger.info(f"[todo-sync] Asana webhook: updating To-Do for {task_gid} field={field}")
                         try:
                             if field == "name":
@@ -1711,7 +1711,7 @@ def asana_webhook():
                             logger.error(f"[todo-sync] update_todo_task failed for {task_gid}: {e}", exc_info=True)
 
                 elif action in ("deleted", "removed") and mapping:
-                    # Task removed â€” mark To-Do complete (best effort)
+                    # Task removed — mark To-Do complete (best effort)
                     try:
                         complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
                     except Exception as e:
