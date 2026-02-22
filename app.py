@@ -404,6 +404,15 @@ def get_delegated_graph_token() -> str:
     now = time.time()
     if _ms_delegated_token_cache["token"] and _ms_delegated_token_cache["expires_at"] > now + 60:
         return _ms_delegated_token_cache["token"]
+    # Always read latest rotated token from disk (cross-worker, cross-restart)
+    try:
+        if os.path.exists("/data/refresh_token.txt"):
+            with open("/data/refresh_token.txt") as f:
+                _disk_token = f.read().strip()
+            if _disk_token:
+                MS_GRAPH_REFRESH_TOKEN = _disk_token
+    except Exception as _e:
+        logger.warning(f"[todo-sync] Could not read refresh token from disk: {_e}")
     if not MS_GRAPH_REFRESH_TOKEN:
         raise RuntimeError("MS_GRAPH_REFRESH_TOKEN not set -- required for To-Do API (delegated auth)")
     data = {
@@ -1560,7 +1569,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.5.5-todo-persist", "deployed": "2026-02-22"})
+    return jsonify({"version": "2.5.6-disk-token", "deployed": "2026-02-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1588,7 +1597,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.5.5-todo-persist", "steps": {}}
+    results = {"version": "2.5.6-disk-token", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -2085,6 +2094,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Post-Meeting Intelligence Pipeline v2 on port {port}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
