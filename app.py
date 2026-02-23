@@ -1,4 +1,4 @@
-﻿"""
+"""
 Post-Meeting Intelligence Pipeline v2
 # Fireflies -> Claude AI -> Approval UI -> HubSpot/Asana/Outlook
 
@@ -805,7 +805,7 @@ def _graph_request_with_retry(method: str, url: str, json_body: dict = None, hea
         try:
             resp = requests.request(method, url, json=json_body, headers=hdrs, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-                logger.warning(f"[todo-sync] Graph {method} {url} â†’ {resp.status_code}, retrying (attempt {attempt+1}/3)")
+                logger.warning(f"[todo-sync] Graph {method} {url} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {resp.status_code}, retrying (attempt {attempt+1}/3)")
                 continue
             resp.raise_for_status()
             return resp.json() if resp.content else {}
@@ -1646,7 +1646,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.8.0-owner-routing", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.8.1-force-reprocess", "deployed": "2026-02-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1675,7 +1675,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.8.0-owner-routing", "steps": {}}
+    results = {"version": "2.8.1-force-reprocess", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1722,7 +1722,7 @@ def test_pipeline():
 
 @app.route("/webhook/asana", methods=["POST"])
 def asana_webhook():
-    """Asana webhook handler â€” handshake + event processing."""
+    """Asana webhook handler ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â handshake + event processing."""
     import threading
 
     # Handshake: echo X-Hook-Secret back
@@ -2111,9 +2111,13 @@ def fireflies_webhook():
         logger.error(f"Webhook: failed to load processed list: {e}", exc_info=True)
         processed = set()
 
-    if transcript_id in processed:
+
+    force = payload.get("force", False)
+    if transcript_id in processed and not force:
         logger.info(f"Webhook: {transcript_id} already processed, skipping")
         return jsonify({"status": "already_processed"})
+    if force:
+        logger.info(f"Webhook: FORCE reprocess requested for {transcript_id}")
 
     logger.info(f"Webhook: starting background processing for {transcript_id}")
 
