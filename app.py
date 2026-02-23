@@ -65,6 +65,8 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared ops channel for admin visibility
 BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@negevlabs.com (shared mailbox)
 BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
+# Internal domains -- emails outside these domains are never sent notifications
+INTERNAL_DOMAINS = [d.strip().lower() for d in os.environ.get("INTERNAL_DOMAINS", "negevlabs.com,negevcap.com,ariadnebio.com,zirmania.com").split(",") if d.strip()]
 # HubSpot owner map: maps organizer email -- HubSpot owner ID
 # Supports two formats:
 #   JSON:   {"bk@negevlabs.com":"241153249","shlomi@negevlabs.com":"241153250"}
@@ -96,6 +98,39 @@ TODO_LIST_NAME = os.environ.get("TODO_LIST_NAME", "Asana Tasks")
 # TODO_SYNC_USER_EMAIL removed - app-only mode syncs all @negevlabs.com users automatically
 TODO_POLL_INTERVAL = int(os.environ.get("TODO_POLL_INTERVAL", "300"))
 RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL", "https://meeting-pipeline-production.up.railway.app")
+
+
+def is_internal_email(email: str) -> bool:
+    """Check if an email belongs to an internal domain."""
+    if not email or "@" not in email:
+        return False
+    domain = email.lower().split("@")[1]
+    return domain in INTERNAL_DOMAINS
+
+
+def resolve_internal_organizer(organizer_email: str, participants: list, internal_lead_email: str = "") -> str:
+    """Determine internal organizer for task/draft ownership.
+    If meeting organizer is internal, use them.
+    If external, prefer Claude-detected internal_lead (most active speaker),
+    then HUBSPOT_OWNER_MAP members, then first internal participant."""
+    if organizer_email and is_internal_email(organizer_email):
+        return organizer_email.lower()
+    # External organizer -- Claude identified most active internal speaker
+    if internal_lead_email and is_internal_email(internal_lead_email):
+        logger.info(f"[organizer] External organizer {organizer_email} -> internal lead {internal_lead_email} (Claude-detected)")
+        return internal_lead_email.lower()
+    # Fallback: internal participant in HUBSPOT_OWNER_MAP
+    for email in (participants or []):
+        if is_internal_email(email) and email.lower() in HUBSPOT_OWNER_MAP:
+            logger.info(f"[organizer] External organizer {organizer_email} -> internal owner {email} (from owner map)")
+            return email.lower()
+    # Fallback: any internal participant
+    for email in (participants or []):
+        if is_internal_email(email):
+            logger.info(f"[organizer] External organizer {organizer_email} -> internal fallback {email}")
+            return email.lower()
+    logger.warning(f"[organizer] No internal participant found, keeping original: {organizer_email}")
+    return organizer_email
 
 
 def strip_emojis(text: str) -> str:
@@ -296,6 +331,7 @@ Return a JSON object with exactly this structure:
             "create_in": "hubspot or asana"
         }}
     ],
+    "internal_lead_email": "email@negevlabs.com -- the most active internal team member on this call (by speaking volume/engagement). Use this when the organizer is external to route ownership. Leave empty string if organizer is internal.",
     "hubspot_note": "Comprehensive meeting note for HubSpot CRM",
     "follow_up_email": {{
         "to_recipients": [
@@ -323,6 +359,7 @@ RULES:
 - from_email must be the meeting organizer's email
 - body_html should use simple HTML (<p>, <br>, <strong>) for Outlook rendering
 - Identify ALL external contacts (non-organizer attendees) from speaker names in the transcript
+- internal_lead_email: When the organizer is external (not @negevlabs.com, @ariadnebio.com, @negevcap.com), identify which internal team member was MOST ACTIVE on the call (spoke most, drove the discussion). Set their email as internal_lead_email. If organizer is internal, set to empty string ""
 - Rate interest level based on language, engagement, and commitments made
 - Action items should be specific and assignable
 - For each action item, set owner_email to the person's email if known from participants or organizer info. If the owner is the organizer, use their email. If unknown, leave as empty string.
@@ -994,6 +1031,11 @@ def notify_organizer(recipients, approval_id: str, meeting_title: str, intellige
     # Normalize to list
     if isinstance(recipients, str):
         recipients = [recipients]
+    # Safety: never send notification emails outside internal domains
+    recipients = [r for r in recipients if is_internal_email(r)]
+    if not recipients:
+        logger.warning(f"[notify] No internal recipients after filtering -- skipping notification for {meeting_title}")
+        return
     organizer_email = recipients[0] if recipients else ""
     review_url = f"{APP_BASE_URL}/review/{approval_id}"
     # Ensure URL has protocol for mobile auto-linking
@@ -1204,12 +1246,19 @@ def process_transcript_phase1(transcript: dict) -> str:
     transcript_id = transcript["id"]
     title = transcript.get("title", "Unknown Meeting")
     meeting_date = transcript.get("dateString", datetime.now(timezone.utc).isoformat())
-    organizer_email = transcript.get("organizer_email", "")
+    raw_organizer = transcript.get("organizer_email", "")
+    participants = transcript.get("participants") or []
 
     logger.info(f"=== Phase 1: Extracting intelligence for '{title}' ===")
 
     # Extract intelligence via Claude
     intelligence = extract_meeting_intelligence(transcript)
+
+    # Resolve internal organizer (handles external organizer -> most active internal speaker)
+    internal_lead = intelligence.get("internal_lead_email", "")
+    organizer_email = resolve_internal_organizer(raw_organizer, participants, internal_lead)
+    if organizer_email != raw_organizer:
+        logger.info(f"[phase1] Organizer resolved: {raw_organizer} -> {organizer_email}")
 
     # Create approval record
     approval_id = str(uuid.uuid4())[:8]
@@ -1219,7 +1268,8 @@ def process_transcript_phase1(transcript: dict) -> str:
         "title": title,
         "meeting_date": meeting_date,
         "organizer_email": organizer_email,
-        "participants": transcript.get("participants") or [],
+        "raw_organizer_email": raw_organizer,
+        "participants": participants,
         "intelligence": intelligence,
         "status": "pending",  # pending -> approved -> executed
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1229,20 +1279,10 @@ def process_transcript_phase1(transcript: dict) -> str:
     pending[approval_id] = approval
     save_pending(pending)
 
-    # Collect all internal recipient emails (organizer + internal contacts from transcript)
-    internal_emails = set()
-    if organizer_email:
-        internal_emails.add(organizer_email.lower())
-    for c in intelligence.get("contacts", []):
-        if c.get("is_internal") and c.get("email"):
-            email = c["email"].lower()
-            if email and "@" in email and "placeholder" not in email:
-                internal_emails.add(email)
-    notify_recipients = list(internal_emails) or [organizer_email]
-    logger.info(f"Notifying internal team: {notify_recipients}")
-
-    # Notify all internal participants
-    notify_organizer(notify_recipients, approval_id, title, intelligence, meeting_date)
+    # Notify ONLY the resolved internal organizer (not all participants)
+    # Sara is a tool for the meeting owner, not a broadcast system
+    logger.info(f"[phase1] Notifying organizer only: {organizer_email}")
+    notify_organizer([organizer_email], approval_id, title, intelligence, meeting_date)
 
     logger.info(f"Phase 1 complete. Approval ID: {approval_id}  --  awaiting organizer review.")
     return approval_id
@@ -1606,7 +1646,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.7.6-fetch-completed", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.8.0-owner-routing", "deployed": "2026-02-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1635,7 +1675,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.7.6-fetch-completed", "steps": {}}
+    results = {"version": "2.8.0-owner-routing", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1719,7 +1759,7 @@ def asana_webhook():
                 mapping = sync_map["mappings"].get(task_gid)
 
                 if action == "added":
-                    # New task added to project â€” create in To-Do
+                    # New task added to project -> create in To-Do
                     logger.info(f"[todo-sync] Asana webhook: task added {task_gid}")
                     try:
                         task_data = asana_request("GET", f"/tasks/{task_gid}?opt_fields=name,notes,due_on,assignee.email")
@@ -1779,7 +1819,7 @@ def asana_webhook():
                         except Exception as e:
                             logger.error(f"[todo-sync] update_todo_task failed for {task_gid}: {e}", exc_info=True)
                 elif action in ("deleted", "removed") and mapping:
-                    # Task removed â€” mark To-Do complete (best effort)
+                    # Task removed -> mark To-Do complete (best effort)
                     try:
                         complete_todo_task(mapping["todo_task_id"], asana_gid=task_gid)
                     except Exception as e:
