@@ -1,4 +1,4 @@
-"""
+﻿"""
 Post-Meeting Intelligence Pipeline v2
 # Fireflies -> Claude AI -> Approval UI -> HubSpot/Asana/Outlook
 
@@ -683,11 +683,11 @@ def log_hubspot_meeting(contact_id: str, meeting_body: str, meeting_date: str,
     end_dt = start_dt + timedelta(minutes=duration_min)
 
     properties = {
-        "hs_timestamp": start_dt.isoformat(),
+        "hs_timestamp": int(start_dt.timestamp() * 1000),
         "hs_meeting_title": title or "Meeting",
         "hs_meeting_body": body_with_link,
-        "hs_meeting_start_time": start_dt.isoformat(),
-        "hs_meeting_end_time": end_dt.isoformat(),
+        "hs_meeting_start_time": int(start_dt.timestamp() * 1000),
+        "hs_meeting_end_time": int(end_dt.timestamp() * 1000),
         "hs_meeting_outcome": "COMPLETED",
     }
 
@@ -718,7 +718,7 @@ def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str,
         "properties": {
             "hs_task_subject": subject, "hs_task_body": body,
             "hs_task_status": "NOT_STARTED", "hs_task_priority": "HIGH",
-            "hs_timestamp": due_date,
+            "hs_timestamp": int(datetime.strptime(due_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000) if due_date else int(datetime.now(timezone.utc).timestamp() * 1000),
         },
         "associations": [{"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 204}]}],
     }
@@ -805,7 +805,7 @@ def _graph_request_with_retry(method: str, url: str, json_body: dict = None, hea
         try:
             resp = requests.request(method, url, json=json_body, headers=hdrs, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-                logger.warning(f"[todo-sync] Graph {method} {url} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ {resp.status_code}, retrying (attempt {attempt+1}/3)")
+                logger.warning(f"[todo-sync] Graph {method} {url} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ {resp.status_code}, retrying (attempt {attempt+1}/3)")
                 continue
             resp.raise_for_status()
             return resp.json() if resp.content else {}
@@ -1646,7 +1646,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.8.1-force-reprocess", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.8.2-hubspot-timestamps", "deployed": "2026-03-04"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1675,7 +1675,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.8.1-force-reprocess", "steps": {}}
+    results = {"version": "2.8.2-hubspot-timestamps", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1722,7 +1722,7 @@ def test_pipeline():
 
 @app.route("/webhook/asana", methods=["POST"])
 def asana_webhook():
-    """Asana webhook handler ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â handshake + event processing."""
+    """Asana webhook handler ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â handshake + event processing."""
     import threading
 
     # Handshake: echo X-Hook-Secret back
@@ -2320,6 +2320,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Post-Meeting Intelligence Pipeline v2 on port {port}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
