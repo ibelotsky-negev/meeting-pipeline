@@ -104,6 +104,10 @@ TEAMS_WEBHOOK_SECRET = os.environ.get("TEAMS_WEBHOOK_SECRET", "sara-teams-transc
 TEAMS_TRANSCRIPT_ENABLED = os.environ.get("TEAMS_TRANSCRIPT_ENABLED", "true").lower() == "true"
 # User ID for the organizer whose meetings we subscribe to (from Application Access Policy)
 TEAMS_ORGANIZER_USER_ID = os.environ.get("TEAMS_ORGANIZER_USER_ID", "1824e8e3-027d-440a-b224-787e6d749dae")
+# Comma-separated user IDs to poll for Teams transcripts
+TEAMS_POLL_USER_IDS = [u.strip() for u in os.environ.get("TEAMS_POLL_USER_IDS",
+    "1824e8e3-027d-440a-b224-787e6d749dae").split(",") if u.strip()]
+TEAMS_POLL_INTERVAL = int(os.environ.get("TEAMS_POLL_INTERVAL", "300"))
 SUBSCRIPTION_FILE = os.path.join(DATA_DIR, "graph_subscription.json")
 
 
@@ -2000,9 +2004,67 @@ def teams_fetch_recent():
         results["error"] = str(e)
     return jsonify(results)
 
+
+def poll_teams_transcripts():
+    """Poll Graph API for new Teams transcripts. Runs on a schedule."""
+    if not TEAMS_TRANSCRIPT_ENABLED or not MS_GRAPH_CLIENT_ID:
+        return
+    logger.info(f"[teams-poll] Checking {len(TEAMS_POLL_USER_IDS)} user(s) for new transcripts...")
+    try:
+        token = get_graph_app_only_token()
+    except Exception as e:
+        logger.error(f"[teams-poll] Token error: {e}")
+        return
+    total_new = 0
+    for user_id in TEAMS_POLL_USER_IDS:
+        try:
+            url = (f"https://graph.microsoft.com/v1.0/users/{user_id}"
+                   f"/onlineMeetings/getAllTranscripts(meetingOrganizerUserId='{user_id}')")
+            resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+            if resp.status_code != 200:
+                logger.warning(f"[teams-poll] User {user_id[:8]}: {resp.status_code}")
+                continue
+            transcripts = resp.json().get("value") or []
+            processed = load_processed()
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+            for t in transcripts:
+                tid = f"teams-{t['id']}"
+                if tid in processed:
+                    continue
+                created = t.get("createdDateTime", "")
+                try:
+                    t_date = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if t_date < cutoff:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                meeting_id = t.get("meetingId", "")
+                transcript_id = t.get("id", "")
+                logger.info(f"[teams-poll] New transcript: {transcript_id[:30]}... (created {created})")
+                total_new += 1
+                thread = _teams_threading.Thread(
+                    target=process_teams_transcript_background,
+                    args=(user_id, meeting_id, transcript_id),
+                    daemon=True)
+                thread.start()
+        except Exception as e:
+            logger.error(f"[teams-poll] Error for user {user_id[:8]}: {e}", exc_info=True)
+    logger.info(f"[teams-poll] Done. {total_new} new transcript(s) found.")
+
+
+@app.route("/teams/poll-now", methods=["GET", "POST"])
+def teams_poll_now():
+    """Manually trigger Teams transcript polling."""
+    try:
+        thread = _teams_threading.Thread(target=poll_teams_transcripts, daemon=True)
+        thread.start()
+        return jsonify({"status": "polling_started"})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.9.3-teams-fetch", "deployed": "2026-03-08"})
+    return jsonify({"version": "2.9.4-teams-poll", "deployed": "2026-03-08"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2034,7 +2096,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.9.3-teams-fetch", "steps": {}}
+    results = {"version": "2.9.4-teams-poll", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
