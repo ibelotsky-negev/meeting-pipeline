@@ -99,6 +99,13 @@ TODO_LIST_NAME = os.environ.get("TODO_LIST_NAME", "Asana Tasks")
 TODO_POLL_INTERVAL = int(os.environ.get("TODO_POLL_INTERVAL", "300"))
 RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL", "https://meeting-pipeline-production.up.railway.app")
 
+# Teams Transcript Integration
+TEAMS_WEBHOOK_SECRET = os.environ.get("TEAMS_WEBHOOK_SECRET", "sara-teams-transcript-secret")
+TEAMS_TRANSCRIPT_ENABLED = os.environ.get("TEAMS_TRANSCRIPT_ENABLED", "true").lower() == "true"
+# User ID for the organizer whose meetings we subscribe to (from Application Access Policy)
+TEAMS_ORGANIZER_USER_ID = os.environ.get("TEAMS_ORGANIZER_USER_ID", "1824e8e3-027d-440a-b224-787e6d749dae")
+SUBSCRIPTION_FILE = os.path.join(DATA_DIR, "graph_subscription.json")
+
 
 def is_internal_email(email: str) -> bool:
     """Check if an email belongs to an internal domain."""
@@ -1665,9 +1672,243 @@ def health():
     return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
 
 
+
+
+
+# ======================================================================
+# TEAMS TRANSCRIPT INTEGRATION
+# ======================================================================
+
+import re as _re
+import threading as _teams_threading
+
+_teams_subscription_id = None
+_teams_subscription_lock = _teams_threading.Lock()
+
+
+def get_graph_app_only_token() -> str:
+    now = time.time()
+    if _ms_token_cache.get("app_only_token") and _ms_token_cache.get("app_only_expires", 0) > now + 60:
+        return _ms_token_cache["app_only_token"]
+    data = {
+        "client_id": MS_GRAPH_CLIENT_ID,
+        "client_secret": MS_GRAPH_CLIENT_SECRET,
+        "grant_type": "client_credentials",
+        "scope": "https://graph.microsoft.com/.default",
+    }
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{MS_GRAPH_TENANT_ID}/oauth2/v2.0/token",
+        data=data, timeout=15
+    )
+    resp.raise_for_status()
+    td = resp.json()
+    _ms_token_cache["app_only_token"] = td["access_token"]
+    _ms_token_cache["app_only_expires"] = now + td.get("expires_in", 3600)
+    logger.info("[teams] Got app-only Graph token")
+    return _ms_token_cache["app_only_token"]
+
+
+def parse_vtt_to_sentences(vtt_content: str) -> list:
+    sentences = []
+    lines = vtt_content.split("\n")
+    current_speaker = "Unknown"
+    current_text = []
+    for line in lines:
+        line = line.strip()
+        if not line or line == "WEBVTT" or "-->" in line or line.startswith("NOTE"):
+            if current_text:
+                sentences.append({"speaker_name": current_speaker, "text": " ".join(current_text)})
+                current_text = []
+            continue
+        v_match = _re.match(r"<v\s+([^>]+)>(.+?)(?:</v>)?$", line)
+        if v_match:
+            if current_text:
+                sentences.append({"speaker_name": current_speaker, "text": " ".join(current_text)})
+                current_text = []
+            current_speaker = v_match.group(1).strip()
+            text = _re.sub(r"<[^>]+>", "", v_match.group(2)).strip()
+            if text:
+                current_text.append(text)
+            continue
+        colon_match = _re.match(r"^([A-Za-z][A-Za-z .\x27-]+):\s+(.+)$", line)
+        if colon_match and not _re.match(r"^\d", line):
+            if current_text:
+                sentences.append({"speaker_name": current_speaker, "text": " ".join(current_text)})
+                current_text = []
+            current_speaker = colon_match.group(1).strip()
+            current_text.append(colon_match.group(2).strip())
+            continue
+        if line and not _re.match(r"^\d+$", line):
+            clean = _re.sub(r"<[^>]+>", "", line).strip()
+            if clean:
+                current_text.append(clean)
+    if current_text:
+        sentences.append({"speaker_name": current_speaker, "text": " ".join(current_text)})
+    logger.info(f"[teams] Parsed VTT: {len(sentences)} sentences")
+    return sentences
+
+
+def get_teams_meeting_details(user_id: str, meeting_id: str) -> dict:
+    token = get_graph_app_only_token()
+    url = f"https://graph.microsoft.com/v1.0/users/{user_id}/onlineMeetings/{meeting_id}"
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    if resp.status_code == 200:
+        return resp.json()
+    logger.warning(f"[teams] Meeting details failed: {resp.status_code} {resp.text[:200]}")
+    return {}
+
+
+def get_teams_transcript_content(user_id: str, meeting_id: str, transcript_id: str) -> str:
+    token = get_graph_app_only_token()
+    url = (f"https://graph.microsoft.com/v1.0/users/{user_id}"
+           f"/onlineMeetings/{meeting_id}/transcripts/{transcript_id}/content")
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}", "Accept": "text/vtt"}, timeout=60)
+    if resp.status_code == 200:
+        return resp.text
+    logger.error(f"[teams] Transcript content failed: {resp.status_code} {resp.text[:200]}")
+    return ""
+
+
+def process_teams_transcript_background(user_id, meeting_id, transcript_id):
+    try:
+        logger.info(f"[teams] Processing: user={user_id} meeting={meeting_id}")
+        teams_tid = f"teams-{transcript_id}"
+        processed = load_processed()
+        if teams_tid in processed:
+            logger.info(f"[teams] Already processed {teams_tid}")
+            return
+        time.sleep(30)
+        meeting = get_teams_meeting_details(user_id, meeting_id)
+        subject = meeting.get("subject") or "Teams Meeting"
+        join_url = meeting.get("joinWebUrl", "")
+        start_time = meeting.get("startDateTime", "")
+        end_time = meeting.get("endDateTime", "")
+        duration = 0
+        if start_time and end_time:
+            try:
+                s = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                e = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+                duration = int((e - s).total_seconds() / 60)
+            except (ValueError, TypeError):
+                pass
+        organizer_info = (meeting.get("participants") or {}).get("organizer") or {}
+        organizer_identity = (organizer_info.get("identity") or {}).get("user") or {}
+        organizer_email = organizer_info.get("upn", "")
+        if not organizer_email and organizer_identity.get("id"):
+            try:
+                tk = get_graph_app_only_token()
+                ur = requests.get(f"https://graph.microsoft.com/v1.0/users/{organizer_identity['id']}",
+                    headers={"Authorization": f"Bearer {tk}"}, timeout=15)
+                if ur.status_code == 200:
+                    organizer_email = ur.json().get("mail") or ur.json().get("userPrincipalName", "")
+            except Exception:
+                pass
+        attendees = (meeting.get("participants") or {}).get("attendees") or []
+        participant_names = []
+        for att in attendees:
+            identity = (att.get("identity") or {}).get("user") or {}
+            upn = att.get("upn", "")
+            name = identity.get("displayName", "")
+            participant_names.append(upn if upn else name)
+        if organizer_email and organizer_email not in participant_names:
+            participant_names.insert(0, organizer_email)
+        logger.info(f"[teams] '{subject}' | org={organizer_email} | {len(participant_names)} participants | {duration}min")
+        vtt = get_teams_transcript_content(user_id, meeting_id, transcript_id)
+        if not vtt:
+            logger.error(f"[teams] Empty transcript, aborting")
+            return
+        sentences = parse_vtt_to_sentences(vtt)
+        if not sentences:
+            logger.warning(f"[teams] No sentences parsed")
+            return
+        transcript_dict = {
+            "id": teams_tid,
+            "title": subject,
+            "dateString": start_time or datetime.now(timezone.utc).isoformat(),
+            "duration": duration,
+            "organizer_email": organizer_email,
+            "participants": participant_names,
+            "summary": {
+                "short_summary": f"Teams meeting: {subject}",
+                "action_items": "",
+                "keywords": "",
+                "overview": f"Auto-transcribed Teams meeting with {len(participant_names)} participants.",
+                "notes": ""
+            },
+            "sentences": sentences,
+            "_source": "teams",
+            "_join_url": join_url,
+        }
+        logger.info(f"[teams] Feeding into pipeline: '{subject}' ({len(sentences)} sentences)")
+        process_transcript_phase1(transcript_dict)
+        processed = load_processed()
+        processed.add(teams_tid)
+        save_processed(processed)
+        logger.info(f"[teams] Done: {teams_tid}")
+    except Exception as e:
+        logger.error(f"[teams] Error: {e}", exc_info=True)
+
+
+def create_teams_transcript_subscription():
+    global _teams_subscription_id
+    if not TEAMS_TRANSCRIPT_ENABLED or not MS_GRAPH_CLIENT_ID or not MS_GRAPH_TENANT_ID:
+        return
+    try:
+        token = get_graph_app_only_token()
+        expiry = (datetime.utcnow() + timedelta(minutes=55)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+        body = {
+            "changeType": "created",
+            "notificationUrl": f"{RAILWAY_PUBLIC_URL}/webhook/teams-transcript",
+            "resource": "communications/onlineMeetings/getAllTranscripts",
+            "expirationDateTime": expiry,
+            "clientState": TEAMS_WEBHOOK_SECRET,
+        }
+        resp = requests.post("https://graph.microsoft.com/v1.0/subscriptions",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body, timeout=30)
+        if resp.status_code in (200, 201):
+            sub = resp.json()
+            with _teams_subscription_lock:
+                _teams_subscription_id = sub.get("id")
+            logger.info(f"[teams] Subscription created: {_teams_subscription_id}")
+        else:
+            logger.error(f"[teams] Subscription failed: {resp.status_code} {resp.text[:300]}")
+    except Exception as e:
+        logger.error(f"[teams] Subscription error: {e}", exc_info=True)
+
+
+def renew_teams_transcript_subscription():
+    global _teams_subscription_id
+    if not TEAMS_TRANSCRIPT_ENABLED:
+        return
+    with _teams_subscription_lock:
+        sub_id = _teams_subscription_id
+    if not sub_id:
+        create_teams_transcript_subscription()
+        return
+    try:
+        token = get_graph_app_only_token()
+        expiry = (datetime.utcnow() + timedelta(minutes=55)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+        resp = requests.patch(f"https://graph.microsoft.com/v1.0/subscriptions/{sub_id}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"expirationDateTime": expiry}, timeout=30)
+        if resp.status_code == 200:
+            logger.info(f"[teams] Subscription renewed: {sub_id}")
+        else:
+            logger.warning(f"[teams] Renewal failed ({resp.status_code}), recreating")
+            with _teams_subscription_lock:
+                _teams_subscription_id = None
+            create_teams_transcript_subscription()
+    except Exception as e:
+        logger.error(f"[teams] Renewal error: {e}", exc_info=True)
+        with _teams_subscription_lock:
+            _teams_subscription_id = None
+        create_teams_transcript_subscription()
+
+
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.8.3-confident-email-tone", "deployed": "2026-03-04"})
+    return jsonify({"version": "2.9.0-teams-transcript-all", "deployed": "2026-03-08"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1678,6 +1919,9 @@ def config_check():
         "graph_client_id_set": bool(MS_GRAPH_CLIENT_ID), "graph_client_secret_set": bool(MS_GRAPH_CLIENT_SECRET), "refresh_token_len": len(MS_GRAPH_REFRESH_TOKEN),
         "graph_tenant_id_set": bool(MS_GRAPH_TENANT_ID),
         "bot_sender": BOT_SENDER_EMAIL or "(not set)",
+        "teams_transcript_enabled": TEAMS_TRANSCRIPT_ENABLED,
+        "teams_organizer_user_id": TEAMS_ORGANIZER_USER_ID[:8] + "..." if TEAMS_ORGANIZER_USER_ID else "(not set)",
+        "teams_subscription_active": bool(_teams_subscription_id),
         "hubspot_owner_map_raw": HUBSPOT_OWNER_MAP_RAW[:200] if HUBSPOT_OWNER_MAP_RAW else "(empty)",
         "hubspot_owner_map_entries": len(HUBSPOT_OWNER_MAP),
         "hubspot_owner_map_emails": list(HUBSPOT_OWNER_MAP.keys()),
@@ -1696,7 +1940,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.8.3-confident-email-tone", "steps": {}}
+    results = {"version": "2.9.0-teams-transcript-all", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -1740,6 +1984,42 @@ def test_pipeline():
         results["error"] = str(e)
         results["traceback"] = _tb.format_exc()
         return jsonify(results), 500
+
+
+
+# ======================================================================
+# TEAMS TRANSCRIPT WEBHOOK
+# ======================================================================
+
+@app.route("/webhook/teams-transcript", methods=["POST"])
+def webhook_teams_transcript():
+    validation_token = request.args.get("validationToken")
+    if validation_token:
+        logger.info(f"[teams-webhook] Validation: {validation_token[:20]}...")
+        return validation_token, 200, {"Content-Type": "text/plain"}
+    data = request.get_json(silent=True) or {}
+    notifications = data.get("value") or []
+    logger.info(f"[teams-webhook] Received {len(notifications)} notification(s)")
+    for notif in notifications:
+        if notif.get("clientState") != TEAMS_WEBHOOK_SECRET:
+            logger.warning("[teams-webhook] Invalid clientState")
+            continue
+        resource = notif.get("resource", "")
+        logger.info(f"[teams-webhook] Resource: {resource}")
+        parts = resource.split("/")
+        if len(parts) >= 6 and "transcripts" in parts:
+            user_id = parts[1]
+            meeting_id = parts[3]
+            transcript_id = parts[5]
+            logger.info(f"[teams-webhook] Processing: {transcript_id}")
+            thread = _teams_threading.Thread(
+                target=process_teams_transcript_background,
+                args=(user_id, meeting_id, transcript_id),
+                daemon=True)
+            thread.start()
+        else:
+            logger.warning(f"[teams-webhook] Unexpected resource: {resource}")
+    return "", 202
 
 @app.route("/webhook/asana", methods=["POST"])
 def asana_webhook():
