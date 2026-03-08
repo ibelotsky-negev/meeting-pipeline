@@ -1915,9 +1915,40 @@ def teams_subscribe_trigger():
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
+@app.route("/teams/debug", methods=["GET"])
+def teams_debug():
+    """Debug Teams transcript integration."""
+    results = {"subscription_id": _teams_subscription_id}
+    try:
+        token = get_graph_app_only_token()
+        results["token"] = "ok"
+        # List active subscriptions
+        sr = requests.get("https://graph.microsoft.com/v1.0/subscriptions",
+            headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if sr.status_code == 200:
+            subs = sr.json().get("value", [])
+            results["graph_subscriptions"] = [{"id": s["id"], "resource": s["resource"],
+                "expiry": s.get("expirationDateTime")} for s in subs]
+        else:
+            results["graph_subscriptions_error"] = f"{sr.status_code}: {sr.text[:200]}"
+        # Try to list recent meetings for the user
+        user_id = TEAMS_ORGANIZER_USER_ID
+        mr = requests.get(f"https://graph.microsoft.com/v1.0/users/{user_id}/onlineMeetings",
+            headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        results["meetings_status"] = mr.status_code
+        if mr.status_code == 200:
+            meetings = mr.json().get("value", [])
+            results["recent_meetings"] = [{"id": m["id"], "subject": m.get("subject"),
+                "start": m.get("startDateTime")} for m in meetings[:5]]
+        else:
+            results["meetings_error"] = mr.text[:200]
+    except Exception as e:
+        results["error"] = str(e)
+    return jsonify(results)
+
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.9.1-teams-delayed-sub", "deployed": "2026-03-08"})
+    return jsonify({"version": "2.9.2-teams-debug", "deployed": "2026-03-08"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1949,7 +1980,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.9.1-teams-delayed-sub", "steps": {}}
+    results = {"version": "2.9.2-teams-debug", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
