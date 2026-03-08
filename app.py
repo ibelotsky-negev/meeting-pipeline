@@ -1906,9 +1906,18 @@ def renew_teams_transcript_subscription():
         create_teams_transcript_subscription()
 
 
+@app.route("/teams/subscribe", methods=["POST", "GET"])
+def teams_subscribe_trigger():
+    """Manually trigger Teams transcript subscription creation."""
+    try:
+        create_teams_transcript_subscription()
+        return jsonify({"status": "ok", "subscription_id": _teams_subscription_id})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.9.0-teams-transcript-all", "deployed": "2026-03-08"})
+    return jsonify({"version": "2.9.1-teams-delayed-sub", "deployed": "2026-03-08"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1940,7 +1949,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.9.0-teams-transcript-all", "steps": {}}
+    results = {"version": "2.9.1-teams-delayed-sub", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
