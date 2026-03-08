@@ -1946,9 +1946,63 @@ def teams_debug():
         results["error"] = str(e)
     return jsonify(results)
 
+@app.route("/teams/fetch-recent", methods=["GET"])
+def teams_fetch_recent():
+    """Manually check for recent Teams transcripts via Graph API."""
+    results = {"checked_users": []}
+    try:
+        token = get_graph_app_only_token()
+        # Check recent calendar events for the organizer
+        user_id = TEAMS_ORGANIZER_USER_ID
+        # Get recent events with online meeting info
+        now = datetime.utcnow()
+        start = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        cal_url = (f"https://graph.microsoft.com/v1.0/users/{user_id}/calendarView"
+                   f"?startDateTime={start}&endDateTime={end}"
+                   f"&$select=id,subject,start,end,onlineMeeting")
+        cr = requests.get(cal_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if cr.status_code == 200:
+            events = cr.json().get("value", [])
+            results["calendar_events"] = len(events)
+            for ev in events:
+                om = ev.get("onlineMeeting") or {}
+                join_url = om.get("joinUrl", "")
+                ev_info = {"subject": ev.get("subject"), "join_url": join_url[:80] if join_url else "none"}
+                if join_url:
+                    # Try to get meeting ID from joinUrl
+                    meet_r = requests.get(
+                        f"https://graph.microsoft.com/v1.0/users/{user_id}/onlineMeetings"
+                        f"?$filter=JoinWebUrl eq '{join_url}'",
+                        headers={"Authorization": f"Bearer {token}"}, timeout=15)
+                    if meet_r.status_code == 200:
+                        meetings = meet_r.json().get("value", [])
+                        if meetings:
+                            mid = meetings[0]["id"]
+                            ev_info["meeting_id"] = mid[:30] + "..."
+                            # Try to list transcripts
+                            tr = requests.get(
+                                f"https://graph.microsoft.com/v1.0/users/{user_id}/onlineMeetings/{mid}/transcripts",
+                                headers={"Authorization": f"Bearer {token}"}, timeout=15)
+                            if tr.status_code == 200:
+                                transcripts = tr.json().get("value", [])
+                                ev_info["transcripts"] = len(transcripts)
+                                if transcripts:
+                                    ev_info["transcript_ids"] = [t["id"][:20] for t in transcripts]
+                            else:
+                                ev_info["transcripts_error"] = f"{tr.status_code}"
+                    else:
+                        ev_info["meeting_lookup"] = f"{meet_r.status_code}: {meet_r.text[:100]}"
+                results["checked_users"].append(ev_info)
+        else:
+            results["calendar_error"] = f"{cr.status_code}: {cr.text[:200]}"
+    except Exception as e:
+        results["error"] = str(e)
+    return jsonify(results)
+
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.9.2-teams-debug", "deployed": "2026-03-08"})
+    return jsonify({"version": "2.9.3-teams-fetch", "deployed": "2026-03-08"})
 
 
 @app.route("/config", methods=["GET"])
@@ -1980,7 +2034,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.9.2-teams-debug", "steps": {}}
+    results = {"version": "2.9.3-teams-fetch", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
