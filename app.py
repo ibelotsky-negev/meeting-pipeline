@@ -1,4 +1,4 @@
-﻿﻿"""
+"""
 Post-Meeting Intelligence Pipeline v2
 # Fireflies -> Claude AI -> Approval UI -> HubSpot/Asana/Outlook
 
