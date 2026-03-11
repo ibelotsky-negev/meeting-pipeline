@@ -1,4 +1,4 @@
-﻿"""
+﻿﻿"""
 Post-Meeting Intelligence Pipeline v2
 # Fireflies -> Claude AI -> Approval UI -> HubSpot/Asana/Outlook
 
@@ -2064,7 +2064,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.9.4-teams-poll", "deployed": "2026-03-08"})
+    return jsonify({"version": "2.9.5-teams-debug", "deployed": "2026-03-08"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2096,7 +2096,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.9.4-teams-poll", "steps": {}}
+    results = {"version": "2.9.5-teams-debug", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -2777,6 +2777,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Post-Meeting Intelligence Pipeline v2 on port {port}")
     app.run(host="0.0.0.0", port=port)
+
 
 
 
