@@ -538,9 +538,13 @@ def pulse_collect_meetings(start_dt, end_dt):
         for t in (data.get("transcripts") or []):
             summary = t.get("summary") or {}
             duration = t.get("duration")
+            # Fireflies returns date as Unix timestamp (int) — convert to ISO string
+            raw_date = t.get("date", "")
+            if isinstance(raw_date, (int, float)) and raw_date > 0:
+                raw_date = datetime.fromtimestamp(raw_date / 1000, tz=timezone.utc).isoformat()
             meetings.append({
                 "title": t.get("title", ""),
-                "date": t.get("date", ""),
+                "date": str(raw_date),
                 "duration_minutes": round(duration / 60) if duration else 0,
                 "summary": summary.get("overview") or summary.get("shorthand_bullet") or "",
                 "action_items": summary.get("action_items") or "",
@@ -839,7 +843,8 @@ def _pulse_format_meetings(meeting_data):
     """Format meeting data for Claude prompt."""
     lines = []
     for i, m in enumerate(meeting_data, 1):
-        lines.append(f"{i}. [{m['date'][:10] if m.get('date') else 'unknown'}] {m['title']} ({m['duration_minutes']}min)")
+        date_str = str(m.get('date', ''))[:10] or 'unknown'
+        lines.append(f"{i}. [{date_str}] {m['title']} ({m['duration_minutes']}min)")
         if m.get("summary"):
             lines.append(f"   Summary: {m['summary']}")
         if m.get("action_items"):
@@ -2928,7 +2933,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.3-pulse-email-filter", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.4-pulse-date-fix", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2960,7 +2965,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.3-pulse-email-filter", "steps": {}}
+    results = {"version": "2.10.4-pulse-date-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
