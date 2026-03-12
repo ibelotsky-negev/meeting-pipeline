@@ -1,4 +1,4 @@
-"""
+﻿﻿"""
 Post-Meeting Intelligence Pipeline v2
 # Fireflies -> Claude AI -> Approval UI -> HubSpot/Asana/Outlook
 
@@ -84,27 +84,6 @@ if HUBSPOT_OWNER_MAP_RAW:
                 email, owner_id = pair.rsplit(":", 1)
                 HUBSPOT_OWNER_MAP[email.strip()] = owner_id.strip()
     logger.info(f"Parsed HUBSPOT_OWNER_MAP: {HUBSPOT_OWNER_MAP}")
-
-# Team members for review UI dropdown (email -> display name)
-# Loaded from TEAM_MEMBER_NAMES env var (JSON: {"email":"Name"}) or auto-built from HUBSPOT_OWNER_MAP keys
-TEAM_MEMBER_NAMES_RAW = os.environ.get("TEAM_MEMBER_NAMES", "")
-TEAM_MEMBER_NAMES = {}
-if TEAM_MEMBER_NAMES_RAW:
-    try:
-        TEAM_MEMBER_NAMES = json.loads(TEAM_MEMBER_NAMES_RAW)
-    except (json.JSONDecodeError, TypeError):
-        pass
-# Default team if env var not set
-if not TEAM_MEMBER_NAMES:
-    TEAM_MEMBER_NAMES = {
-        "bk@negevlabs.com": "Ken Belotsky",
-        "shlomi@negevlabs.com": "Shlomi Raz",
-        "dan@negevlabs.com": "Dan Jeffries",
-        "ka@negevlabs.com": "Kostia Adamsky",
-    }
-# Build list for template: [{email, name}, ...]
-TEAM_MEMBERS_LIST = [{"email": e, "name": n} for e, n in sorted(TEAM_MEMBER_NAMES.items(), key=lambda x: x[1])]
-logger.info(f"Team members for UI: {[m['name'] for m in TEAM_MEMBERS_LIST]}")
 
 # Track processed transcripts and pending approvals
 # Railway volume mount: attach a volume at /data for persistence across deploys
@@ -1572,15 +1551,8 @@ REVIEW_TEMPLATE = """
                             <div style="display:flex; gap:12px;">
                                 <div style="flex:1;">
                                     <label>OWNER</label>
-                                    <select name="task_owner_email_{{ loop.index0 }}" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:6px;">
-                                        {% for member in team_members %}
-                                        <option value="{{ member.email }}" {{ 'selected' if member.email == item.get('owner_email', '') or member.name == item.get('owner', '') }}>{{ member.name }}</option>
-                                        {% endfor %}
-                                        {% if item.get('owner_email') and item.get('owner_email') not in team_members|map(attribute='email')|list %}
-                                        <option value="{{ item.get('owner_email', '') }}" selected>{{ item.get('owner', item.get('owner_email', 'Unknown')) }}</option>
-                                        {% endif %}
-                                    </select>
-                                    <input type="hidden" name="task_owner_{{ loop.index0 }}" value="{{ item.get('owner', '') }}">
+                                    <input type="text" name="task_owner_{{ loop.index0 }}" value="{{ item.get('owner', '') }}">
+                                    <input type="hidden" name="task_owner_email_{{ loop.index0 }}" value="{{ item.get('owner_email', '') }}">
                                 </div>
                                 <div style="flex:0.5;">
                                     <label>CREATE IN</label>
@@ -1653,24 +1625,6 @@ REVIEW_TEMPLATE = """
             </div>
             {% endif %}
         </form>
-        <script>
-        // Sync hidden owner name when dropdown changes
-        document.querySelectorAll('select[name^="task_owner_email_"]').forEach(function(sel) {
-            sel.addEventListener('change', function() {
-                var idx = this.name.replace('task_owner_email_', '');
-                var nameField = document.querySelector('input[name="task_owner_' + idx + '"]');
-                if (nameField) {
-                    nameField.value = this.options[this.selectedIndex].text;
-                }
-            });
-            // Initialize name on page load
-            var idx = sel.name.replace('task_owner_email_', '');
-            var nameField = document.querySelector('input[name="task_owner_' + idx + '"]');
-            if (nameField && sel.selectedIndex >= 0) {
-                nameField.value = sel.options[sel.selectedIndex].text;
-            }
-        });
-        </script>
     </div>
 </body>
 </html>
@@ -2110,7 +2064,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.9.6-owner-dropdown", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.9.5-teams-debug", "deployed": "2026-03-08"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2142,7 +2096,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.9.6-owner-dropdown", "steps": {}}
+    results = {"version": "2.9.5-teams-debug", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -2666,7 +2620,7 @@ def review_page(approval_id: str):
     data = pending.get(approval_id)
     if not data:
         return "Approval not found or expired.", 404
-    return render_template_string(REVIEW_TEMPLATE, data=data, team_members=TEAM_MEMBERS_LIST)
+    return render_template_string(REVIEW_TEMPLATE, data=data)
 
 
 @app.route("/review/<approval_id>/approve", methods=["POST"])
