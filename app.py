@@ -2933,7 +2933,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.4-pulse-date-fix", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.5-gunicorn-timeout", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2965,7 +2965,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.4-pulse-date-fix", "steps": {}}
+    results = {"version": "2.10.5-gunicorn-timeout", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
