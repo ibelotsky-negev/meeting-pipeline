@@ -2401,110 +2401,170 @@ RESULT_TEMPLATE = """
 #  WEEKLY PULSE ENDPOINTS
 # ======================================================================
 
-@app.route("/pulse/debug", methods=["GET"])
-def pulse_debug():
-    """Debug pulse pipeline step by step. Use ?step=collect|analyze|all"""
-    import traceback
-    step = request.args.get("step", "collect")
-    days = int(request.args.get("days", 1))
-    results = {"step": step, "days": days}
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=days)
+PULSE_STATUS_FILE = os.path.join(DATA_DIR, "pulse_status.json")
 
-    # Step 1: collect
+
+def _pulse_save_status(status_data):
+    """Save pulse run status to disk for polling."""
     try:
-        logger.info(f"[pulse-debug] Collecting emails...")
-        emails = pulse_collect_emails(start_dt, end_dt)
-        results["emails"] = {"count": len(emails), "sample": emails[:2] if emails else []}
+        with open(PULSE_STATUS_FILE, "w") as f:
+            json.dump(status_data, f, indent=2, default=str)
     except Exception as e:
-        results["emails"] = {"error": str(e), "traceback": traceback.format_exc()}
-        return jsonify(results), 500
+        logger.error(f"[pulse] Failed to save status: {e}")
+
+
+def _pulse_run_background(days, dry_run):
+    """Run the full pulse pipeline in a background thread."""
+    import traceback as tb
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    status = {"run_id": run_id, "phase": "starting", "dry_run": dry_run, "days": days,
+              "started_at": datetime.now(timezone.utc).isoformat()}
+    _pulse_save_status(status)
 
     try:
-        logger.info(f"[pulse-debug] Collecting Teams...")
-        teams = pulse_collect_teams(start_dt, end_dt)
-        results["teams"] = {"count": len(teams), "sample": teams[:2] if teams else []}
-    except Exception as e:
-        results["teams"] = {"error": str(e), "traceback": traceback.format_exc()}
-        return jsonify(results), 500
-
-    try:
-        logger.info(f"[pulse-debug] Collecting meetings...")
-        meetings = pulse_collect_meetings(start_dt, end_dt)
-        results["meetings"] = {"count": len(meetings), "sample": meetings[:2] if meetings else []}
-    except Exception as e:
-        results["meetings"] = {"error": str(e), "traceback": traceback.format_exc()}
-        return jsonify(results), 500
-
-    if step == "collect":
-        return jsonify(results)
-
-    # Step 2: analyze (only if step=analyze or step=all)
-    try:
-        logger.info(f"[pulse-debug] Starting analysis...")
-        report, raw_signals = pulse_analyze(emails, teams, meetings, start_dt, end_dt)
-        results["analysis"] = {"report_preview": report[:500] if report else "", "signals_keys": list(raw_signals.keys())}
-    except Exception as e:
-        results["analysis"] = {"error": str(e), "traceback": traceback.format_exc()}
-        return jsonify(results), 500
-
-    return jsonify(results)
-
-
-@app.route("/pulse/trigger", methods=["GET"])
-def pulse_trigger():
-    """Manually trigger a weekly pulse. Runs synchronously."""
-    try:
-        days = int(request.args.get("days", PULSE_LOOKBACK_DAYS))
-        dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
-
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=days)
-        logger.info(f"[pulse] Trigger: {start_dt.date()} to {end_dt.date()}, dry_run={dry_run}")
 
-        # Collect data
+        # Phase 1: collect
+        status["phase"] = "collecting emails"
+        _pulse_save_status(status)
         emails = pulse_collect_emails(start_dt, end_dt)
+        status["emails_count"] = len(emails)
+
+        status["phase"] = "collecting Teams"
+        _pulse_save_status(status)
         teams = pulse_collect_teams(start_dt, end_dt)
+        status["teams_count"] = len(teams)
+
+        status["phase"] = "collecting meetings"
+        _pulse_save_status(status)
         meetings = pulse_collect_meetings(start_dt, end_dt)
+        status["meetings_count"] = len(meetings)
 
         stats = {
             "emails_scanned": len(emails),
             "teams_messages_scanned": len(teams),
             "meetings_analyzed": len(meetings),
         }
+        status["stats"] = stats
 
-        # Analyze
+        # Phase 2: analyze (4 Claude passes with rate-limit sleeps)
+        status["phase"] = "analyzing (4 Claude passes, ~4 min)"
+        _pulse_save_status(status)
         report, raw_signals = pulse_analyze(emails, teams, meetings, start_dt, end_dt)
+        status["report_preview"] = report[:1000] if report else ""
 
-        # Deliver
+        # Phase 3: deliver
         email_sent = False
         archived = False
         if not dry_run:
+            status["phase"] = "sending email"
+            _pulse_save_status(status)
             try:
                 pulse_send_email(report, start_dt, end_dt)
                 email_sent = True
             except Exception as e:
                 logger.error(f"[pulse] Email send failed: {e}", exc_info=True)
+                status["email_error"] = str(e)
+
+            status["phase"] = "archiving"
+            _pulse_save_status(status)
             try:
                 pulse_archive(report, raw_signals, start_dt, end_dt, stats)
                 archived = True
             except Exception as e:
                 logger.error(f"[pulse] Archive failed: {e}", exc_info=True)
-        else:
-            logger.info("[pulse] Dry run -- skipping email and archive")
+                status["archive_error"] = str(e)
 
-        return jsonify({
-            "status": "complete",
-            "dry_run": dry_run,
-            "period": {"start": start_dt.isoformat(), "end": end_dt.isoformat()},
-            "stats": stats,
-            "report_preview": report[:500] if report else "",
+        status.update({
+            "phase": "complete",
             "email_sent": email_sent,
             "archived": archived,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
         })
+        _pulse_save_status(status)
+        logger.info(f"[pulse] Background run {run_id} complete")
+
     except Exception as e:
-        logger.error(f"[pulse] Trigger failed: {e}", exc_info=True)
+        logger.error(f"[pulse] Background run failed: {e}", exc_info=True)
+        status.update({
+            "phase": "error",
+            "error": str(e),
+            "traceback": tb.format_exc(),
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        _pulse_save_status(status)
+
+
+@app.route("/pulse/trigger", methods=["GET"])
+def pulse_trigger():
+    """Trigger a weekly pulse. Runs in background thread, poll /pulse/status for progress."""
+    import threading
+    days = int(request.args.get("days", PULSE_LOOKBACK_DAYS))
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+
+    # Check if already running
+    try:
+        if os.path.exists(PULSE_STATUS_FILE):
+            with open(PULSE_STATUS_FILE) as f:
+                current = json.load(f)
+            if current.get("phase") not in ("complete", "error", None):
+                return jsonify({"status": "already_running", "current": current}), 409
+    except Exception:
+        pass
+
+    logger.info(f"[pulse] Trigger: days={days}, dry_run={dry_run} -- launching background thread")
+    t = threading.Thread(target=_pulse_run_background, args=(days, dry_run), daemon=True)
+    t.start()
+
+    return jsonify({
+        "status": "started",
+        "message": "Pulse running in background. Poll /pulse/status for progress.",
+        "days": days,
+        "dry_run": dry_run,
+    })
+
+
+@app.route("/pulse/status", methods=["GET"])
+def pulse_status():
+    """Poll pulse run status. Returns current phase, stats, and result when complete."""
+    try:
+        if not os.path.exists(PULSE_STATUS_FILE):
+            return jsonify({"status": "no_runs", "message": "No pulse run has been triggered yet."})
+        with open(PULSE_STATUS_FILE) as f:
+            return jsonify(json.load(f))
+    except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/pulse/debug", methods=["GET"])
+def pulse_debug():
+    """Debug: test data collection only (no Claude calls). Returns in <60s."""
+    import traceback as tb
+    days = int(request.args.get("days", 1))
+    results = {"days": days}
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+
+    try:
+        emails = pulse_collect_emails(start_dt, end_dt)
+        results["emails"] = {"count": len(emails), "sample": emails[:2] if emails else []}
+    except Exception as e:
+        results["emails"] = {"error": str(e), "traceback": tb.format_exc()}
+
+    try:
+        teams = pulse_collect_teams(start_dt, end_dt)
+        results["teams"] = {"count": len(teams), "sample": teams[:2] if teams else []}
+    except Exception as e:
+        results["teams"] = {"error": str(e), "traceback": tb.format_exc()}
+
+    try:
+        meetings = pulse_collect_meetings(start_dt, end_dt)
+        results["meetings"] = {"count": len(meetings), "sample": meetings[:2] if meetings else []}
+    except Exception as e:
+        results["meetings"] = {"error": str(e), "traceback": tb.format_exc()}
+
+    return jsonify(results)
 
 
 @app.route("/pulse/check", methods=["GET"])
@@ -3013,7 +3073,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.8-teams-app-only", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.9-async-pulse", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3045,7 +3105,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.8-teams-app-only", "steps": {}}
+    results = {"version": "2.10.9-async-pulse", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -3704,28 +3764,11 @@ def poll_and_process():
 
 
 def pulse_weekly_run():
-    """Scheduled weekly pulse. On failure, sends error email instead of silently failing."""
+    """Scheduled weekly pulse. Uses same background runner as /pulse/trigger."""
     try:
         logger.info("[pulse] Starting scheduled weekly pulse")
-        end_dt = datetime.now(timezone.utc)
-        start_dt = end_dt - timedelta(days=PULSE_LOOKBACK_DAYS)
-
-        emails = pulse_collect_emails(start_dt, end_dt)
-        teams = pulse_collect_teams(start_dt, end_dt)
-        meetings = pulse_collect_meetings(start_dt, end_dt)
-
-        report, raw_signals = pulse_analyze(emails, teams, meetings, start_dt, end_dt)
-
-        stats = {
-            "emails_scanned": len(emails),
-            "teams_messages_scanned": len(teams),
-            "meetings_analyzed": len(meetings),
-        }
-
-        pulse_send_email(report, start_dt, end_dt)
-        pulse_archive(report, raw_signals, start_dt, end_dt, stats)
-
-        logger.info("[pulse] Weekly pulse complete and delivered")
+        _pulse_run_background(days=PULSE_LOOKBACK_DAYS, dry_run=False)
+        logger.info("[pulse] Weekly pulse complete")
     except Exception as e:
         logger.error(f"[pulse] Failed: {e}", exc_info=True)
         # Send failure notification
