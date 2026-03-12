@@ -2349,7 +2349,7 @@ def health():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.7.6-fetch-completed", "deployed": "2026-02-23"})
+    return jsonify({"version": "2.10.0-weekly-pulse", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
