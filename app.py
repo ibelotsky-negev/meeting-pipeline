@@ -2393,17 +2393,20 @@ def pulse_check_permissions():
     diagnostics = {}
 
     # Test Mail.Read (also satisfied by Mail.ReadWrite): try reading one message
+    # Some users may have inactive/on-prem mailboxes, so try multiple users
     try:
         users = pulse_get_team_users()
         team_users = len(users)
-        if users:
-            test_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/messages?$top=1&$select=id"
+        mail_errors = []
+        for u in users[:5]:  # Try up to 5 users
+            test_url = f"{MS_GRAPH_BASE}/users/{u['id']}/messages?$top=1&$select=id"
             resp = requests.get(test_url, headers=headers, timeout=15)
-            results["Mail.Read"] = resp.status_code == 200
-            if resp.status_code != 200:
-                diagnostics["Mail.Read"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
-        else:
-            diagnostics["Mail.Read"] = "No team users found"
+            if resp.status_code == 200:
+                results["Mail.Read"] = True
+                break
+            mail_errors.append(f"{u.get('mail','?')}: HTTP {resp.status_code}")
+        if not results["Mail.Read"]:
+            diagnostics["Mail.Read"] = "; ".join(mail_errors) if mail_errors else "No team users found"
     except Exception as e:
         logger.warning(f"[pulse] Mail.Read check failed: {e}")
         diagnostics["Mail.Read"] = str(e)
@@ -2427,7 +2430,7 @@ def pulse_check_permissions():
     # Note: /teams requires Group.Read.All; use /users/{id}/joinedTeams instead
     try:
         if team_users > 0:
-            teams_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/joinedTeams?$top=1"
+            teams_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/joinedTeams"
             resp = requests.get(teams_url, headers=headers, timeout=15)
             results["ChannelMessage.Read.All"] = resp.status_code == 200
             if resp.status_code != 200:
@@ -2879,7 +2882,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.1-pulse-check-fix", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.2-pulse-check-v2", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2911,7 +2914,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.1-pulse-check-fix", "steps": {}}
+    results = {"version": "2.10.2-pulse-check-v2", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
