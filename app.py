@@ -703,7 +703,7 @@ RULES:
 """
 
     message = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-20250514",
         max_tokens=8000,
         system="""You are drafting on behalf of a senior partner or team member at Negev Labs, a biotech venture studio. The sender communicates as a peer to investors, founders, and executives - never as someone asking for a favor. The tone is direct, warm, and authoritative regardless of who the sender is.
 
@@ -901,7 +901,7 @@ def _pulse_call_claude(prompt_text):
     prompt_text = _pulse_truncate_input(prompt_text)
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-20250514",
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt_text}],
     )
