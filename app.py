@@ -358,8 +358,23 @@ def pulse_should_skip_email(msg):
     return False
 
 
+def _pulse_has_team_in_from_or_to(msg):
+    """Check if at least one team member (PULSE_DOMAINS) is in From or To fields.
+    Emails where team is only in CC/BCC are excluded."""
+    from_addr = (msg.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
+    if any(from_addr.endswith(f"@{d}") for d in PULSE_DOMAINS):
+        return True
+    for recip in (msg.get("toRecipients") or []):
+        addr = (recip.get("emailAddress", {}).get("address") or "").lower()
+        if any(addr.endswith(f"@{d}") for d in PULSE_DOMAINS):
+            return True
+    return False
+
+
 def pulse_collect_emails(start_dt, end_dt):
-    """Collect business emails from all team mailboxes for the pulse period."""
+    """Collect business emails from all team mailboxes for the pulse period.
+    Only bodyPreview is used — no attachments are read or processed.
+    Only includes emails where a team member is in From or To (not CC/BCC only)."""
     users = pulse_get_team_users()
     start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -367,6 +382,7 @@ def pulse_collect_emails(start_dt, end_dt):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     all_emails = []
     total_scanned = 0
+    skipped_cc_only = 0
     for user in users:
         user_id = user["id"]
         url = (f"{MS_GRAPH_BASE}/users/{user_id}/messages"
@@ -384,6 +400,9 @@ def pulse_collect_emails(start_dt, end_dt):
             for msg in messages:
                 if pulse_should_skip_email(msg):
                     continue
+                if not _pulse_has_team_in_from_or_to(msg):
+                    skipped_cc_only += 1
+                    continue
                 from_info = msg.get("from", {}).get("emailAddress", {})
                 all_emails.append({
                     "subject": msg.get("subject", ""),
@@ -395,7 +414,7 @@ def pulse_collect_emails(start_dt, end_dt):
                 })
         except Exception as e:
             logger.warning(f"[pulse] Failed to fetch emails for {user['mail']}: {e}")
-    logger.info(f"[pulse] Emails: {total_scanned} scanned, {len(all_emails)} after filtering")
+    logger.info(f"[pulse] Emails: {total_scanned} scanned, {skipped_cc_only} skipped (CC/BCC only), {len(all_emails)} after filtering")
     return all_emails
 
 
@@ -828,8 +847,20 @@ def _pulse_format_meetings(meeting_data):
     return "\n".join(lines) if lines else "(No meetings collected)"
 
 
+PULSE_MAX_INPUT_CHARS = 80000  # ~20K tokens at ~4 chars/token
+
+
+def _pulse_truncate_input(text, max_chars=PULSE_MAX_INPUT_CHARS):
+    """Truncate text to stay under ~20K token limit for a single analysis pass."""
+    if len(text) <= max_chars:
+        return text
+    logger.warning(f"[pulse] Truncating input from {len(text)} to {max_chars} chars (~20K tokens)")
+    return text[:max_chars] + "\n\n[... TRUNCATED — input exceeded 20K token limit ...]"
+
+
 def _pulse_call_claude(prompt_text):
     """Call Claude API for pulse analysis. Returns raw response text."""
+    prompt_text = _pulse_truncate_input(prompt_text)
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -856,6 +887,8 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
     """Run 4-pass Claude analysis. Returns (report_markdown, raw_signals_dict)."""
     logger.info("[pulse] Starting 4-pass analysis pipeline")
 
+    rate_limit_delay = 65  # seconds between Claude calls to stay under 30K TPM
+
     # Pass 1: Email signals
     logger.info(f"[pulse] Pass 1/4: Analyzing {len(email_data)} emails")
     email_prompt = PULSE_EMAIL_PROMPT.format(
@@ -864,6 +897,11 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
     logger.info(f"[pulse] Pass 1 complete: {len(email_signals.get('green', []))}G "
                 f"{len(email_signals.get('yellow', []))}Y {len(email_signals.get('red', []))}R")
 
+    # Rate-limit pause
+    logger.info(f"[pulse] Waiting {rate_limit_delay}s for rate limit...")
+    import time
+    time.sleep(rate_limit_delay)
+
     # Pass 2: Teams signals
     logger.info(f"[pulse] Pass 2/4: Analyzing {len(teams_data)} Teams messages")
     teams_prompt = PULSE_TEAMS_PROMPT.format(
@@ -871,6 +909,10 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
     teams_signals = _pulse_parse_json(_pulse_call_claude(teams_prompt))
     logger.info(f"[pulse] Pass 2 complete: {len(teams_signals.get('green', []))}G "
                 f"{len(teams_signals.get('yellow', []))}Y {len(teams_signals.get('red', []))}R")
+
+    # Rate-limit pause
+    logger.info(f"[pulse] Waiting {rate_limit_delay}s for rate limit...")
+    time.sleep(rate_limit_delay)
 
     # Pass 3: Meeting signals
     logger.info(f"[pulse] Pass 3/4: Analyzing {len(meeting_data)} meetings")
@@ -884,6 +926,10 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
     all_entities = set()
     for signals in [email_signals, teams_signals, meeting_signals]:
         all_entities.update(signals.get("key_entities") or [])
+
+    # Rate-limit pause
+    logger.info(f"[pulse] Waiting {rate_limit_delay}s for rate limit...")
+    time.sleep(rate_limit_delay)
 
     # Pass 4: Synthesis
     logger.info("[pulse] Pass 4/4: Synthesizing final report")
@@ -2882,7 +2928,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.2-pulse-check-v2", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.3-pulse-email-filter", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2914,7 +2960,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.2-pulse-check-v2", "steps": {}}
+    results = {"version": "2.10.3-pulse-email-filter", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
