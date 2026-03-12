@@ -431,37 +431,51 @@ def pulse_should_skip_teams_msg(msg):
 
 
 def pulse_collect_teams(start_dt, end_dt):
-    """Collect Teams messages: channels + group chats + 1:1 chats."""
+    """Collect Teams messages: channels + chats. Uses app-only compatible endpoints."""
     import re
     start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     token = get_ms_graph_token()
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+               "ConsistencyLevel": "eventual"}
     all_messages = []
+    channel_count = 0
+    chat_count = 0
 
-    # 1. Collect channel messages from all teams
+    # 1. Channel messages: use /groups (app-only) instead of /teams (delegated-only)
     try:
-        teams_resp = requests.get(f"{MS_GRAPH_BASE}/teams", headers=headers, timeout=30)
-        if teams_resp.status_code == 200:
-            teams = teams_resp.json().get("value") or []
+        groups_url = (f"{MS_GRAPH_BASE}/groups"
+                      f"?$filter=resourceProvisioningOptions/Any(x:x eq 'Team')"
+                      f"&$select=id,displayName&$top=999")
+        groups_resp = requests.get(groups_url, headers=headers, timeout=30)
+        if groups_resp.status_code == 200:
+            teams = groups_resp.json().get("value") or []
+            logger.info(f"[pulse] Found {len(teams)} Teams via /groups")
             for team in teams:
                 team_id = team["id"]
+                team_name = team.get("displayName", "")
                 try:
                     ch_resp = requests.get(
-                        f"{MS_GRAPH_BASE}/teams/{team_id}/channels",
+                        f"{MS_GRAPH_BASE}/teams/{team_id}/channels?$select=id,displayName",
                         headers=headers, timeout=30)
-                    ch_resp.raise_for_status()
+                    if ch_resp.status_code != 200:
+                        logger.warning(f"[pulse] Channels returned {ch_resp.status_code} for {team_name}")
+                        continue
                     channels = ch_resp.json().get("value") or []
                     for channel in channels:
                         channel_id = channel["id"]
                         channel_name = channel.get("displayName", "")
                         try:
-                            msg_resp = requests.get(
-                                f"{MS_GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages"
-                                f"?$filter=createdDateTime ge {start_iso}&$top=200",
-                                headers=headers, timeout=30)
+                            # ChannelMessage.Read.All works with app-only auth
+                            # Channel messages don't support $filter -- manual date check
+                            msg_url = (f"{MS_GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages"
+                                       f"?$top=50")
+                            msg_resp = requests.get(msg_url, headers=headers, timeout=30)
                             if msg_resp.status_code != 200:
                                 continue
                             for msg in (msg_resp.json().get("value") or []):
+                                msg_date = msg.get("createdDateTime", "")
+                                if msg_date and msg_date < start_iso:
+                                    continue
                                 if pulse_should_skip_teams_msg(msg):
                                     continue
                                 body = (msg.get("body", {}).get("content") or "").strip()
@@ -469,54 +483,73 @@ def pulse_collect_teams(start_dt, end_dt):
                                 all_messages.append({
                                     "content_preview": text[:300],
                                     "chat_type": "channel",
-                                    "channel_name": channel_name,
-                                    "date": msg.get("createdDateTime", ""),
+                                    "channel_name": f"{team_name}/{channel_name}",
+                                    "date": msg_date,
                                 })
+                                channel_count += 1
                         except Exception as e:
-                            logger.warning(f"[pulse] Channel messages failed {channel_name}: {e}")
+                            logger.warning(f"[pulse] Channel msgs failed {team_name}/{channel_name}: {e}")
                 except Exception as e:
-                    logger.warning(f"[pulse] Channels list failed for team {team_id}: {e}")
+                    logger.warning(f"[pulse] Channels list failed for {team_name}: {e}")
         else:
-            logger.warning(f"[pulse] Teams list returned {teams_resp.status_code}")
+            logger.warning(f"[pulse] Groups list returned {groups_resp.status_code}: "
+                           f"{groups_resp.text[:200]}")
     except Exception as e:
         logger.warning(f"[pulse] Teams channel collection failed: {e}")
 
-    # 2. Collect chat messages (1:1 and group chats, excluding meeting chats)
+    # 2. Chat messages per user (app-only: /users/{id}/chats, not /chats)
     try:
-        chats_resp = requests.get(
-            f"{MS_GRAPH_BASE}/chats?$filter=chatType ne 'meeting'&$top=200",
-            headers=headers, timeout=30)
-        if chats_resp.status_code == 200:
-            chats = chats_resp.json().get("value") or []
-            for chat in chats:
-                chat_id = chat["id"]
-                chat_type = chat.get("chatType", "unknown")
-                try:
-                    msg_resp = requests.get(
-                        f"{MS_GRAPH_BASE}/chats/{chat_id}/messages"
-                        f"?$filter=createdDateTime ge {start_iso}&$top=50",
-                        headers=headers, timeout=30)
-                    if msg_resp.status_code != 200:
+        users = pulse_get_team_users()
+        seen_chat_ids = set()  # deduplicate chats shared between team members
+        for user in users:
+            user_id = user["id"]
+            try:
+                chats_url = (f"{MS_GRAPH_BASE}/users/{user_id}/chats"
+                             f"?$select=id,chatType&$top=50")
+                chats_resp = requests.get(chats_url, headers=headers, timeout=30)
+                if chats_resp.status_code != 200:
+                    logger.warning(f"[pulse] Chats returned {chats_resp.status_code} for {user['mail']}")
+                    continue
+                chats = chats_resp.json().get("value") or []
+                for chat in chats:
+                    chat_id = chat["id"]
+                    if chat_id in seen_chat_ids:
                         continue
-                    for msg in (msg_resp.json().get("value") or []):
-                        if pulse_should_skip_teams_msg(msg):
+                    seen_chat_ids.add(chat_id)
+                    chat_type = chat.get("chatType", "unknown")
+                    # Skip meeting chats
+                    if chat_type == "meeting":
+                        continue
+                    try:
+                        # Chat.Read.All works with app-only auth for /chats/{id}/messages
+                        msg_url = f"{MS_GRAPH_BASE}/chats/{chat_id}/messages?$top=50"
+                        msg_resp = requests.get(msg_url, headers=headers, timeout=30)
+                        if msg_resp.status_code != 200:
                             continue
-                        body = (msg.get("body", {}).get("content") or "").strip()
-                        text = re.sub(r'<[^>]+>', '', body).strip()
-                        all_messages.append({
-                            "content_preview": text[:300],
-                            "chat_type": chat_type,
-                            "channel_name": "",
-                            "date": msg.get("createdDateTime", ""),
-                        })
-                except Exception as e:
-                    logger.warning(f"[pulse] Chat messages failed {chat_id}: {e}")
-        else:
-            logger.warning(f"[pulse] Chats list returned {chats_resp.status_code}")
+                        for msg in (msg_resp.json().get("value") or []):
+                            msg_date = msg.get("createdDateTime", "")
+                            if msg_date and msg_date < start_iso:
+                                continue
+                            if pulse_should_skip_teams_msg(msg):
+                                continue
+                            body = (msg.get("body", {}).get("content") or "").strip()
+                            text = re.sub(r'<[^>]+>', '', body).strip()
+                            all_messages.append({
+                                "content_preview": text[:300],
+                                "chat_type": chat_type,
+                                "channel_name": "",
+                                "date": msg_date,
+                            })
+                            chat_count += 1
+                    except Exception as e:
+                        logger.warning(f"[pulse] Chat messages failed {chat_id}: {e}")
+            except Exception as e:
+                logger.warning(f"[pulse] Chats list failed for {user['mail']}: {e}")
     except Exception as e:
         logger.warning(f"[pulse] Teams chat collection failed: {e}")
 
-    logger.info(f"[pulse] Teams: {len(all_messages)} messages collected")
+    logger.info(f"[pulse] Teams: {len(all_messages)} messages "
+                f"({channel_count} channel, {chat_count} chat)")
     return all_messages
 
 
@@ -2980,7 +3013,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.7-fix-format-braces", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.8-teams-app-only", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3012,7 +3045,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.7-fix-format-braces", "steps": {}}
+    results = {"version": "2.10.8-teams-app-only", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
