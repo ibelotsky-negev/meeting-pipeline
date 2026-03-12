@@ -717,12 +717,12 @@ RULES:
 - Ignore routine scheduling, FYIs with no substance, and automated notifications that slipped through filters.
 
 OUTPUT (JSON):
-{{
+{
   "green": ["signal 1", "signal 2"],
   "yellow": ["signal 1"],
   "red": ["signal 1"],
   "key_entities": ["company or deal names mentioned"]
-}}
+}
 
 EMAILS:
 {emails_text}"""
@@ -739,12 +739,12 @@ RULES:
 - Group related messages into themes rather than listing each message.
 
 OUTPUT (JSON):
-{{
+{
   "green": ["signal 1", "signal 2"],
   "yellow": ["signal 1"],
   "red": ["signal 1"],
   "key_entities": ["company or deal names mentioned"]
-}}
+}
 
 TEAMS MESSAGES:
 {teams_text}"""
@@ -760,12 +760,12 @@ RULES:
 - Cross-reference action items: items assigned but potentially at risk are Yellow; items overdue or blocked are Red.
 
 OUTPUT (JSON):
-{{
+{
   "green": ["signal 1", "signal 2"],
   "yellow": ["signal 1"],
   "red": ["signal 1"],
   "key_entities": ["company or deal names mentioned"]
-}}
+}
 
 MEETING SUMMARIES:
 {meetings_text}"""
@@ -896,8 +896,7 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
 
     # Pass 1: Email signals
     logger.info(f"[pulse] Pass 1/4: Analyzing {len(email_data)} emails")
-    email_prompt = PULSE_EMAIL_PROMPT.format(
-        emails_text=_pulse_format_emails(email_data))
+    email_prompt = PULSE_EMAIL_PROMPT.replace("{emails_text}", _pulse_format_emails(email_data))
     email_signals = _pulse_parse_json(_pulse_call_claude(email_prompt))
     logger.info(f"[pulse] Pass 1 complete: {len(email_signals.get('green', []))}G "
                 f"{len(email_signals.get('yellow', []))}Y {len(email_signals.get('red', []))}R")
@@ -909,8 +908,7 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
 
     # Pass 2: Teams signals
     logger.info(f"[pulse] Pass 2/4: Analyzing {len(teams_data)} Teams messages")
-    teams_prompt = PULSE_TEAMS_PROMPT.format(
-        teams_text=_pulse_format_teams(teams_data))
+    teams_prompt = PULSE_TEAMS_PROMPT.replace("{teams_text}", _pulse_format_teams(teams_data))
     teams_signals = _pulse_parse_json(_pulse_call_claude(teams_prompt))
     logger.info(f"[pulse] Pass 2 complete: {len(teams_signals.get('green', []))}G "
                 f"{len(teams_signals.get('yellow', []))}Y {len(teams_signals.get('red', []))}R")
@@ -921,8 +919,7 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
 
     # Pass 3: Meeting signals
     logger.info(f"[pulse] Pass 3/4: Analyzing {len(meeting_data)} meetings")
-    meetings_prompt = PULSE_MEETINGS_PROMPT.format(
-        meetings_text=_pulse_format_meetings(meeting_data))
+    meetings_prompt = PULSE_MEETINGS_PROMPT.replace("{meetings_text}", _pulse_format_meetings(meeting_data))
     meeting_signals = _pulse_parse_json(_pulse_call_claude(meetings_prompt))
     logger.info(f"[pulse] Pass 3 complete: {len(meeting_signals.get('green', []))}G "
                 f"{len(meeting_signals.get('yellow', []))}Y {len(meeting_signals.get('red', []))}R")
@@ -939,15 +936,15 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
     # Pass 4: Synthesis
     logger.info("[pulse] Pass 4/4: Synthesizing final report")
     date_range = f"{period_start.strftime('%b %d')} - {period_end.strftime('%b %d, %Y')}"
-    synthesis_prompt = PULSE_SYNTHESIS_PROMPT.format(
-        date_range=date_range,
-        email_count=len(email_data),
-        teams_count=len(teams_data),
-        meetings_count=len(meeting_data),
-        entities=", ".join(sorted(all_entities)) if all_entities else "none detected",
-        email_json=json.dumps(email_signals, indent=2),
-        teams_json=json.dumps(teams_signals, indent=2),
-        meetings_json=json.dumps(meeting_signals, indent=2),
+    synthesis_prompt = (PULSE_SYNTHESIS_PROMPT
+        .replace("{date_range}", date_range)
+        .replace("{email_count}", str(len(email_data)))
+        .replace("{teams_count}", str(len(teams_data)))
+        .replace("{meetings_count}", str(len(meeting_data)))
+        .replace("{entities}", ", ".join(sorted(all_entities)) if all_entities else "none detected")
+        .replace("{email_json}", json.dumps(email_signals, indent=2))
+        .replace("{teams_json}", json.dumps(teams_signals, indent=2))
+        .replace("{meetings_json}", json.dumps(meeting_signals, indent=2))
     )
     report = _pulse_call_claude(synthesis_prompt)
     logger.info("[pulse] Analysis pipeline complete")
@@ -2983,7 +2980,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.6-pulse-debug", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.7-fix-format-braces", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3015,7 +3012,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.6-pulse-debug", "steps": {}}
+    results = {"version": "2.10.7-fix-format-braces", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
