@@ -131,6 +131,32 @@ TEAMS_POLL_USER_IDS = [u.strip() for u in os.environ.get("TEAMS_POLL_USER_IDS",
 TEAMS_POLL_INTERVAL = int(os.environ.get("TEAMS_POLL_INTERVAL", "300"))
 SUBSCRIPTION_FILE = os.path.join(DATA_DIR, "graph_subscription.json")
 
+# ======================================================================
+# WEEKLY PULSE CONFIGURATION
+# ======================================================================
+
+PULSE_RECIPIENT = "bk@negevlabs.com"
+PULSE_SENDER = "sara@negevlabs.com"
+PULSE_DOMAINS = ["negevlabs.com", "ariadnebio.com"]
+PULSE_ARCHIVE_DIR = os.path.join(DATA_DIR, "pulse")
+PULSE_LOOKBACK_DAYS = 7
+
+# Email noise filters
+PULSE_SKIP_SENDERS = [
+    "noreply", "no-reply", "notification", "mailer-daemon",
+    "calendar-notification", "postmaster",
+]
+PULSE_SKIP_DOMAINS = [
+    "linkedin.com", "slack.com", "asana.com", "hubspot.com",
+    "calendly.com", "zoom.us", "fireflies.ai", "github.com",
+    "atlassian.com", "jira.com", "confluence.com",
+]
+PULSE_SKIP_SUBJECTS = [
+    "out of office", "ooo", "automatic reply", "auto-reply",
+    "unsubscribe", "newsletter", "digest", "accepted:",
+    "declined:", "tentative:", "canceled:", "updated invitation:",
+]
+
 
 def is_internal_email(email: str) -> bool:
     """Check if an email belongs to an internal domain."""
@@ -287,6 +313,226 @@ def get_transcript_by_id(transcript_id: str) -> dict:
 
 
 # ======================================================================
+# WEEKLY PULSE -> DATA COLLECTION
+# ======================================================================
+
+def pulse_get_team_users():
+    """Get all users across negevlabs.com and ariadnebio.com domains."""
+    token = get_ms_graph_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+               "ConsistencyLevel": "eventual"}
+    users = []
+    for domain in PULSE_DOMAINS:
+        url = (f"{MS_GRAPH_BASE}/users?$filter=endsWith(mail,'@{domain}')"
+               f"&$select=id,displayName,mail&$count=true&$top=999")
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            for u in (data.get("value") or []):
+                if u.get("mail"):
+                    users.append({"id": u["id"], "displayName": u.get("displayName", ""),
+                                  "mail": u["mail"]})
+        except Exception as e:
+            logger.warning(f"[pulse] Failed to enumerate users for {domain}: {e}")
+    logger.info(f"[pulse] Found {len(users)} team members across {PULSE_DOMAINS}")
+    return users
+
+
+def pulse_should_skip_email(msg):
+    """Pre-filter: skip automated, notification, calendar, and social emails."""
+    subject = (msg.get("subject") or "").lower()
+    from_addr = (msg.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
+    # Skip by sender pattern
+    if any(p in from_addr for p in PULSE_SKIP_SENDERS):
+        return True
+    # Skip by sender domain
+    if any(d in from_addr for d in PULSE_SKIP_DOMAINS):
+        return True
+    # Skip by subject pattern
+    if any(p in subject for p in PULSE_SKIP_SUBJECTS):
+        return True
+    # Skip very short subjects (likely automated)
+    if len(subject.strip()) < 3:
+        return True
+    return False
+
+
+def pulse_collect_emails(start_dt, end_dt):
+    """Collect business emails from all team mailboxes for the pulse period."""
+    users = pulse_get_team_users()
+    start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    token = get_ms_graph_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    all_emails = []
+    total_scanned = 0
+    for user in users:
+        user_id = user["id"]
+        url = (f"{MS_GRAPH_BASE}/users/{user_id}/messages"
+               f"?$filter=receivedDateTime ge {start_iso} and receivedDateTime le {end_iso}"
+               f"&$select=subject,bodyPreview,from,toRecipients,receivedDateTime,isRead"
+               f"&$top=200&$orderby=receivedDateTime desc")
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code == 403:
+                logger.warning(f"[pulse] No Mail.Read permission for {user['mail']}, skipping")
+                continue
+            resp.raise_for_status()
+            messages = resp.json().get("value") or []
+            total_scanned += len(messages)
+            for msg in messages:
+                if pulse_should_skip_email(msg):
+                    continue
+                from_info = msg.get("from", {}).get("emailAddress", {})
+                all_emails.append({
+                    "subject": msg.get("subject", ""),
+                    "bodyPreview": msg.get("bodyPreview", ""),
+                    "from_name": from_info.get("name", ""),
+                    "from_addr": from_info.get("address", ""),
+                    "date": msg.get("receivedDateTime", ""),
+                    "to_count": len(msg.get("toRecipients") or []),
+                })
+        except Exception as e:
+            logger.warning(f"[pulse] Failed to fetch emails for {user['mail']}: {e}")
+    logger.info(f"[pulse] Emails: {total_scanned} scanned, {len(all_emails)} after filtering")
+    return all_emails
+
+
+def pulse_should_skip_teams_msg(msg):
+    """Pre-filter: skip system messages, short messages, emoji-only."""
+    if msg.get("messageType") != "message":
+        return True
+    import re
+    body = (msg.get("body", {}).get("content") or "").strip()
+    text = re.sub(r'<[^>]+>', '', body).strip()
+    if len(text) < 20:
+        return True
+    return False
+
+
+def pulse_collect_teams(start_dt, end_dt):
+    """Collect Teams messages: channels + group chats + 1:1 chats."""
+    import re
+    start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    token = get_ms_graph_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    all_messages = []
+
+    # 1. Collect channel messages from all teams
+    try:
+        teams_resp = requests.get(f"{MS_GRAPH_BASE}/teams", headers=headers, timeout=30)
+        if teams_resp.status_code == 200:
+            teams = teams_resp.json().get("value") or []
+            for team in teams:
+                team_id = team["id"]
+                try:
+                    ch_resp = requests.get(
+                        f"{MS_GRAPH_BASE}/teams/{team_id}/channels",
+                        headers=headers, timeout=30)
+                    ch_resp.raise_for_status()
+                    channels = ch_resp.json().get("value") or []
+                    for channel in channels:
+                        channel_id = channel["id"]
+                        channel_name = channel.get("displayName", "")
+                        try:
+                            msg_resp = requests.get(
+                                f"{MS_GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages"
+                                f"?$filter=createdDateTime ge {start_iso}&$top=200",
+                                headers=headers, timeout=30)
+                            if msg_resp.status_code != 200:
+                                continue
+                            for msg in (msg_resp.json().get("value") or []):
+                                if pulse_should_skip_teams_msg(msg):
+                                    continue
+                                body = (msg.get("body", {}).get("content") or "").strip()
+                                text = re.sub(r'<[^>]+>', '', body).strip()
+                                all_messages.append({
+                                    "content_preview": text[:300],
+                                    "chat_type": "channel",
+                                    "channel_name": channel_name,
+                                    "date": msg.get("createdDateTime", ""),
+                                })
+                        except Exception as e:
+                            logger.warning(f"[pulse] Channel messages failed {channel_name}: {e}")
+                except Exception as e:
+                    logger.warning(f"[pulse] Channels list failed for team {team_id}: {e}")
+        else:
+            logger.warning(f"[pulse] Teams list returned {teams_resp.status_code}")
+    except Exception as e:
+        logger.warning(f"[pulse] Teams channel collection failed: {e}")
+
+    # 2. Collect chat messages (1:1 and group chats, excluding meeting chats)
+    try:
+        chats_resp = requests.get(
+            f"{MS_GRAPH_BASE}/chats?$filter=chatType ne 'meeting'&$top=200",
+            headers=headers, timeout=30)
+        if chats_resp.status_code == 200:
+            chats = chats_resp.json().get("value") or []
+            for chat in chats:
+                chat_id = chat["id"]
+                chat_type = chat.get("chatType", "unknown")
+                try:
+                    msg_resp = requests.get(
+                        f"{MS_GRAPH_BASE}/chats/{chat_id}/messages"
+                        f"?$filter=createdDateTime ge {start_iso}&$top=50",
+                        headers=headers, timeout=30)
+                    if msg_resp.status_code != 200:
+                        continue
+                    for msg in (msg_resp.json().get("value") or []):
+                        if pulse_should_skip_teams_msg(msg):
+                            continue
+                        body = (msg.get("body", {}).get("content") or "").strip()
+                        text = re.sub(r'<[^>]+>', '', body).strip()
+                        all_messages.append({
+                            "content_preview": text[:300],
+                            "chat_type": chat_type,
+                            "channel_name": "",
+                            "date": msg.get("createdDateTime", ""),
+                        })
+                except Exception as e:
+                    logger.warning(f"[pulse] Chat messages failed {chat_id}: {e}")
+        else:
+            logger.warning(f"[pulse] Chats list returned {chats_resp.status_code}")
+    except Exception as e:
+        logger.warning(f"[pulse] Teams chat collection failed: {e}")
+
+    logger.info(f"[pulse] Teams: {len(all_messages)} messages collected")
+    return all_messages
+
+
+def pulse_collect_meetings(start_dt, end_dt):
+    """Collect meeting intelligence from Fireflies for the pulse period."""
+    start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    meetings = []
+    try:
+        query = """
+        query PulseMeetings($fromDate: DateTime, $toDate: DateTime) {
+            transcripts(fromDate: $fromDate, toDate: $toDate) {
+                id title date duration
+                summary { overview action_items shorthand_bullet }
+            }
+        }
+        """
+        data = fireflies_query(query, {"fromDate": start_iso, "toDate": end_iso})
+        for t in (data.get("transcripts") or []):
+            summary = t.get("summary") or {}
+            duration = t.get("duration")
+            meetings.append({
+                "title": t.get("title", ""),
+                "date": t.get("date", ""),
+                "duration_minutes": round(duration / 60) if duration else 0,
+                "summary": summary.get("overview") or summary.get("shorthand_bullet") or "",
+                "action_items": summary.get("action_items") or "",
+            })
+    except Exception as e:
+        logger.warning(f"[pulse] Fireflies collection failed: {e}")
+    logger.info(f"[pulse] Meetings: {len(meetings)} transcripts collected")
+    return meetings
+
+
+# ======================================================================
 # CLAUDE AI -> INTELLIGENCE EXTRACTION
 # ======================================================================
 
@@ -431,6 +677,363 @@ REQUIRED:
         response_text = response_text.split("\n", 1)[1]
         response_text = response_text.rsplit("```", 1)[0]
     return json.loads(response_text)
+
+
+# ======================================================================
+# WEEKLY PULSE -> ANALYSIS PIPELINE (MULTI-PASS CLAUDE)
+# ======================================================================
+
+PULSE_EMAIL_PROMPT = """You are analyzing one week of business emails for Negev Labs, a biotech venture studio with portfolio companies including Ariadne Bio, Reset Pharma, and Filament Health. They also run Negev Capital, a psychedelic medicine investment fund.
+
+Below are email subjects and previews from the past week. Extract ONLY business signals.
+
+RULES:
+- BUSINESS ONLY. Skip anything personal (health, family, social plans).
+- DO NOT attribute anything to individuals. Say "there was discussion about" not "someone emailed about."
+- Look for: deal progress, investor communications, portfolio company updates, regulatory news, partnership developments, hiring, operational decisions, financial matters.
+- Ignore routine scheduling, FYIs with no substance, and automated notifications that slipped through filters.
+
+OUTPUT (JSON):
+{{
+  "green": ["signal 1", "signal 2"],
+  "yellow": ["signal 1"],
+  "red": ["signal 1"],
+  "key_entities": ["company or deal names mentioned"]
+}}
+
+EMAILS:
+{emails_text}"""
+
+PULSE_TEAMS_PROMPT = """You are analyzing one week of Microsoft Teams messages for Negev Labs, a biotech venture studio.
+
+Below are Teams messages from channels, group chats, and direct messages. Extract ONLY business signals.
+
+RULES:
+- BUSINESS ONLY. Skip personal conversations, social chat, lunch plans, etc.
+- DO NOT attribute anything to individuals. No names, no "someone said."
+- For 1:1 DMs that contain personal content mixed with business: extract ONLY the business part, discard the rest entirely.
+- Look for: decisions made, blockers raised, project updates, asks/requests, deadlines discussed, escalations, celebrations of wins.
+- Group related messages into themes rather than listing each message.
+
+OUTPUT (JSON):
+{{
+  "green": ["signal 1", "signal 2"],
+  "yellow": ["signal 1"],
+  "red": ["signal 1"],
+  "key_entities": ["company or deal names mentioned"]
+}}
+
+TEAMS MESSAGES:
+{teams_text}"""
+
+PULSE_MEETINGS_PROMPT = """You are analyzing one week of meeting summaries for Negev Labs, a biotech venture studio.
+
+Below are meeting titles and AI-generated summaries from the past week. Extract ONLY business signals.
+
+RULES:
+- BUSINESS ONLY. No personal references.
+- DO NOT attribute anything to individuals.
+- Meetings are the richest source of strategic signals -- look for: investment decisions, portfolio company health, fundraising progress, partnership negotiations, regulatory updates, team capacity issues, timeline changes.
+- Cross-reference action items: items assigned but potentially at risk are Yellow; items overdue or blocked are Red.
+
+OUTPUT (JSON):
+{{
+  "green": ["signal 1", "signal 2"],
+  "yellow": ["signal 1"],
+  "red": ["signal 1"],
+  "key_entities": ["company or deal names mentioned"]
+}}
+
+MEETING SUMMARIES:
+{meetings_text}"""
+
+PULSE_SYNTHESIS_PROMPT = """You are Sara, the intelligence system for Negev Labs. You have analyzed all team communications for the past week across email, Teams, and meetings. Below are the extracted signals from each source.
+
+Synthesize these into a single executive briefing. Your reader is the managing partner who needs to know what matters this week.
+
+RULES:
+- Merge duplicate signals that appear across sources (e.g., same deal mentioned in email AND meeting).
+- Rank by importance within each category.
+- Be specific: include company names, deal stages, deadlines, numbers when available.
+- Flag trajectory: "moved from X to Y" is more valuable than "X was discussed."
+- If a signal appears in multiple sources, it's likely more important -- weight accordingly.
+- Keep each bullet to 1-2 sentences. Crisp, not verbose.
+- Green: 3-7 items. Yellow: 3-7 items. Red: 0-5 items (empty is fine).
+- Add a "Recommended Focus" section: 2-3 specific actions for the week ahead based on the signals.
+
+OUTPUT FORMAT (use this exact markdown structure):
+
+## Weekly Pulse: {date_range}
+
+### Green -- Wins & Progress
+- [bullet]
+
+### Yellow -- Watch Items
+- [bullet]
+
+### Red -- Critical
+- [bullet]
+
+### Activity Summary
+- Emails scanned: {email_count}
+- Teams messages scanned: {teams_count}
+- Meetings analyzed: {meetings_count}
+- Key entities this week: {entities}
+
+### Recommended Focus This Week
+1. [action]
+2. [action]
+
+---
+
+EMAIL SIGNALS:
+{email_json}
+
+TEAMS SIGNALS:
+{teams_json}
+
+MEETING SIGNALS:
+{meetings_json}"""
+
+
+def _pulse_format_emails(email_data):
+    """Format email data for Claude prompt."""
+    lines = []
+    for i, e in enumerate(email_data, 1):
+        lines.append(f"{i}. [{e['date'][:10]}] Subject: {e['subject']}")
+        if e.get("bodyPreview"):
+            lines.append(f"   Preview: {e['bodyPreview'][:255]}")
+        lines.append(f"   From: {e['from_addr']} | To count: {e['to_count']}")
+    return "\n".join(lines) if lines else "(No emails collected)"
+
+
+def _pulse_format_teams(teams_data):
+    """Format Teams data for Claude prompt."""
+    lines = []
+    for i, m in enumerate(teams_data, 1):
+        source = m.get("channel_name") or m.get("chat_type", "chat")
+        lines.append(f"{i}. [{m['date'][:10]}] ({source}): {m['content_preview']}")
+    return "\n".join(lines) if lines else "(No Teams messages collected)"
+
+
+def _pulse_format_meetings(meeting_data):
+    """Format meeting data for Claude prompt."""
+    lines = []
+    for i, m in enumerate(meeting_data, 1):
+        lines.append(f"{i}. [{m['date'][:10] if m.get('date') else 'unknown'}] {m['title']} ({m['duration_minutes']}min)")
+        if m.get("summary"):
+            lines.append(f"   Summary: {m['summary']}")
+        if m.get("action_items"):
+            lines.append(f"   Action items: {m['action_items']}")
+    return "\n".join(lines) if lines else "(No meetings collected)"
+
+
+def _pulse_call_claude(prompt_text):
+    """Call Claude API for pulse analysis. Returns raw response text."""
+    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt_text}],
+    )
+    return response.content[0].text
+
+
+def _pulse_parse_json(raw_text):
+    """Parse JSON from Claude response, stripping markdown fences if present."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1]
+        text = text.rsplit("```", 1)[0]
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning(f"[pulse] Failed to parse Claude JSON, returning raw text")
+        return {"green": [], "yellow": [], "red": [], "key_entities": [], "_raw": text}
+
+
+def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end):
+    """Run 4-pass Claude analysis. Returns (report_markdown, raw_signals_dict)."""
+    logger.info("[pulse] Starting 4-pass analysis pipeline")
+
+    # Pass 1: Email signals
+    logger.info(f"[pulse] Pass 1/4: Analyzing {len(email_data)} emails")
+    email_prompt = PULSE_EMAIL_PROMPT.format(
+        emails_text=_pulse_format_emails(email_data))
+    email_signals = _pulse_parse_json(_pulse_call_claude(email_prompt))
+    logger.info(f"[pulse] Pass 1 complete: {len(email_signals.get('green', []))}G "
+                f"{len(email_signals.get('yellow', []))}Y {len(email_signals.get('red', []))}R")
+
+    # Pass 2: Teams signals
+    logger.info(f"[pulse] Pass 2/4: Analyzing {len(teams_data)} Teams messages")
+    teams_prompt = PULSE_TEAMS_PROMPT.format(
+        teams_text=_pulse_format_teams(teams_data))
+    teams_signals = _pulse_parse_json(_pulse_call_claude(teams_prompt))
+    logger.info(f"[pulse] Pass 2 complete: {len(teams_signals.get('green', []))}G "
+                f"{len(teams_signals.get('yellow', []))}Y {len(teams_signals.get('red', []))}R")
+
+    # Pass 3: Meeting signals
+    logger.info(f"[pulse] Pass 3/4: Analyzing {len(meeting_data)} meetings")
+    meetings_prompt = PULSE_MEETINGS_PROMPT.format(
+        meetings_text=_pulse_format_meetings(meeting_data))
+    meeting_signals = _pulse_parse_json(_pulse_call_claude(meetings_prompt))
+    logger.info(f"[pulse] Pass 3 complete: {len(meeting_signals.get('green', []))}G "
+                f"{len(meeting_signals.get('yellow', []))}Y {len(meeting_signals.get('red', []))}R")
+
+    # Collect all key entities for synthesis
+    all_entities = set()
+    for signals in [email_signals, teams_signals, meeting_signals]:
+        all_entities.update(signals.get("key_entities") or [])
+
+    # Pass 4: Synthesis
+    logger.info("[pulse] Pass 4/4: Synthesizing final report")
+    date_range = f"{period_start.strftime('%b %d')} - {period_end.strftime('%b %d, %Y')}"
+    synthesis_prompt = PULSE_SYNTHESIS_PROMPT.format(
+        date_range=date_range,
+        email_count=len(email_data),
+        teams_count=len(teams_data),
+        meetings_count=len(meeting_data),
+        entities=", ".join(sorted(all_entities)) if all_entities else "none detected",
+        email_json=json.dumps(email_signals, indent=2),
+        teams_json=json.dumps(teams_signals, indent=2),
+        meetings_json=json.dumps(meeting_signals, indent=2),
+    )
+    report = _pulse_call_claude(synthesis_prompt)
+    logger.info("[pulse] Analysis pipeline complete")
+
+    return report, {
+        "email_signals": email_signals,
+        "teams_signals": teams_signals,
+        "meeting_signals": meeting_signals,
+    }
+
+
+# ======================================================================
+# WEEKLY PULSE -> DELIVERY (EMAIL + ARCHIVE)
+# ======================================================================
+
+def _pulse_markdown_to_html(md_text):
+    """Convert pulse markdown to styled HTML email body."""
+    import re
+    lines = md_text.split("\n")
+    html_parts = []
+    in_list = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            html_parts.append("<br>")
+            continue
+        # H2 headers
+        if stripped.startswith("## "):
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            text = stripped[3:]
+            html_parts.append(f'<h2 style="color:#1a1a1a;font-size:22px;margin:24px 0 8px 0;">{text}</h2>')
+            continue
+        # H3 headers with color coding
+        if stripped.startswith("### "):
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            text = stripped[4:]
+            color = "#1a1a1a"
+            if "green" in text.lower() or "wins" in text.lower():
+                color = "#2e7d32"
+            elif "yellow" in text.lower() or "watch" in text.lower():
+                color = "#f9a825"
+            elif "red" in text.lower() or "critical" in text.lower():
+                color = "#c62828"
+            html_parts.append(f'<h3 style="color:{color};font-size:17px;margin:20px 0 6px 0;">{text}</h3>')
+            continue
+        # Numbered list items
+        num_match = re.match(r'^(\d+)\.\s+(.+)', stripped)
+        if num_match:
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            text = num_match.group(2)
+            text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+            html_parts.append(f'<p style="margin:4px 0 4px 16px;">{num_match.group(1)}. {text}</p>')
+            continue
+        # Bullet list items
+        if stripped.startswith("- "):
+            if not in_list:
+                html_parts.append('<ul style="margin:4px 0;padding-left:24px;">')
+                in_list = True
+            text = stripped[2:]
+            text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+            html_parts.append(f'<li style="margin:3px 0;">{text}</li>')
+            continue
+        # Horizontal rule
+        if stripped == "---":
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            html_parts.append('<hr style="border:none;border-top:1px solid #ddd;margin:16px 0;">')
+            continue
+        # Plain text
+        if in_list:
+            html_parts.append("</ul>")
+            in_list = False
+        text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', stripped)
+        html_parts.append(f'<p style="margin:4px 0;">{text}</p>')
+    if in_list:
+        html_parts.append("</ul>")
+
+    body = "\n".join(html_parts)
+    return (
+        '<div style="font-family:Segoe UI,Helvetica,Arial,sans-serif;font-size:14px;'
+        'line-height:1.6;color:#1a1a1a;max-width:680px;margin:0 auto;padding:16px;">'
+        f'{body}'
+        '</div>'
+    )
+
+
+def pulse_send_email(report_markdown, period_start, period_end):
+    """Send pulse report via Microsoft Graph (sara@negevlabs.com -> bk@negevlabs.com)."""
+    subject = f"Weekly Pulse: {period_start.strftime('%b %d')} - {period_end.strftime('%b %d')}"
+    html_body = _pulse_markdown_to_html(report_markdown)
+    html_body = strip_emojis(html_body)
+
+    token = get_ms_graph_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    send_payload = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": html_body},
+            "toRecipients": [{"emailAddress": {"address": PULSE_RECIPIENT}}],
+            "from": {"emailAddress": {"name": BOT_SENDER_NAME, "address": PULSE_SENDER}},
+        },
+    }
+    url = f"{MS_GRAPH_BASE}/users/{PULSE_SENDER}/sendMail"
+    resp = requests.post(url, json=send_payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    logger.info(f"[pulse] Email sent to {PULSE_RECIPIENT} from {PULSE_SENDER}")
+
+
+def pulse_archive(report_markdown, raw_signals, period_start, period_end, stats):
+    """Save pulse to /data/pulse/ for trend tracking."""
+    os.makedirs(PULSE_ARCHIVE_DIR, exist_ok=True)
+    iso_year, iso_week, _ = period_end.isocalendar()
+    filename = f"{iso_year}-W{iso_week:02d}.json"
+    filepath = os.path.join(PULSE_ARCHIVE_DIR, filename)
+    archive = {
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "version": "1.0",
+        "stats": stats,
+        "signals": raw_signals,
+        "report_markdown": report_markdown,
+    }
+    with open(filepath, "w") as f:
+        json.dump(archive, f, indent=2, default=str)
+    logger.info(f"[pulse] Archived to {filepath}")
+    return filepath
 
 
 # ======================================================================
@@ -1714,6 +2317,146 @@ RESULT_TEMPLATE = """
 
 
 # ======================================================================
+#  WEEKLY PULSE ENDPOINTS
+# ======================================================================
+
+@app.route("/pulse/trigger", methods=["GET"])
+def pulse_trigger():
+    """Manually trigger a weekly pulse. Runs synchronously."""
+    try:
+        days = int(request.args.get("days", PULSE_LOOKBACK_DAYS))
+        dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=days)
+        logger.info(f"[pulse] Trigger: {start_dt.date()} to {end_dt.date()}, dry_run={dry_run}")
+
+        # Collect data
+        emails = pulse_collect_emails(start_dt, end_dt)
+        teams = pulse_collect_teams(start_dt, end_dt)
+        meetings = pulse_collect_meetings(start_dt, end_dt)
+
+        stats = {
+            "emails_scanned": len(emails),
+            "teams_messages_scanned": len(teams),
+            "meetings_analyzed": len(meetings),
+        }
+
+        # Analyze
+        report, raw_signals = pulse_analyze(emails, teams, meetings, start_dt, end_dt)
+
+        # Deliver
+        email_sent = False
+        archived = False
+        if not dry_run:
+            try:
+                pulse_send_email(report, start_dt, end_dt)
+                email_sent = True
+            except Exception as e:
+                logger.error(f"[pulse] Email send failed: {e}", exc_info=True)
+            try:
+                pulse_archive(report, raw_signals, start_dt, end_dt, stats)
+                archived = True
+            except Exception as e:
+                logger.error(f"[pulse] Archive failed: {e}", exc_info=True)
+        else:
+            logger.info("[pulse] Dry run -- skipping email and archive")
+
+        return jsonify({
+            "status": "complete",
+            "dry_run": dry_run,
+            "period": {"start": start_dt.isoformat(), "end": end_dt.isoformat()},
+            "stats": stats,
+            "report_preview": report[:500] if report else "",
+            "email_sent": email_sent,
+            "archived": archived,
+        })
+    except Exception as e:
+        logger.error(f"[pulse] Trigger failed: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/pulse/check", methods=["GET"])
+def pulse_check_permissions():
+    """Verify all required Graph permissions for Weekly Pulse."""
+    results = {
+        "Mail.Read": False,
+        "Chat.Read.All": False,
+        "ChannelMessage.Read.All": False,
+        "Mail.Send": True,  # Already confirmed working (Sara sends emails)
+    }
+    team_users = 0
+
+    token = get_ms_graph_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # Test Mail.Read: try reading one message from any team user
+    try:
+        users = pulse_get_team_users()
+        team_users = len(users)
+        if users:
+            test_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/messages?$top=1&$select=id"
+            resp = requests.get(test_url, headers=headers, timeout=15)
+            results["Mail.Read"] = resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"[pulse] Mail.Read check failed: {e}")
+
+    # Test Chat.Read.All: list chats
+    try:
+        resp = requests.get(f"{MS_GRAPH_BASE}/chats?$top=1", headers=headers, timeout=15)
+        results["Chat.Read.All"] = resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"[pulse] Chat.Read.All check failed: {e}")
+
+    # Test ChannelMessage.Read.All: list teams
+    try:
+        resp = requests.get(f"{MS_GRAPH_BASE}/teams", headers=headers, timeout=15)
+        results["ChannelMessage.Read.All"] = resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"[pulse] ChannelMessage.Read.All check failed: {e}")
+
+    ready = all(results.values()) and team_users > 0
+    return jsonify({
+        "permissions": results,
+        "team_users_found": team_users,
+        "ready": ready,
+    })
+
+
+@app.route("/pulse/history", methods=["GET"])
+def pulse_history():
+    """List archived pulse reports, or fetch a specific week's full content."""
+    specific_week = request.args.get("week")  # e.g. 2026-W11
+
+    if specific_week:
+        filepath = os.path.join(PULSE_ARCHIVE_DIR, f"{specific_week}.json")
+        if os.path.exists(filepath):
+            with open(filepath, "r") as f:
+                return jsonify(json.load(f))
+        return jsonify({"error": f"No pulse found for {specific_week}"}), 404
+
+    # List all archived pulses
+    reports = []
+    if os.path.exists(PULSE_ARCHIVE_DIR):
+        for fname in sorted(os.listdir(PULSE_ARCHIVE_DIR), reverse=True):
+            if not fname.endswith(".json"):
+                continue
+            filepath = os.path.join(PULSE_ARCHIVE_DIR, fname)
+            try:
+                with open(filepath, "r") as f:
+                    data = json.load(f)
+                reports.append({
+                    "filename": fname,
+                    "period_start": data.get("period_start"),
+                    "period_end": data.get("period_end"),
+                    "generated_at": data.get("generated_at"),
+                })
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return jsonify({"reports": reports, "count": len(reports)})
+
+
+# ======================================================================
 #  FLASK ROUTES
 # ======================================================================
 
@@ -2110,7 +2853,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.9.6-owner-dropdown", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.0-weekly-pulse", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2142,7 +2885,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.9.6-owner-dropdown", "steps": {}}
+    results = {"version": "2.10.0-weekly-pulse", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -2800,11 +3543,68 @@ def poll_and_process():
         logger.error(f"Polling error: {e}", exc_info=True)
 
 
+def pulse_weekly_run():
+    """Scheduled weekly pulse. On failure, sends error email instead of silently failing."""
+    try:
+        logger.info("[pulse] Starting scheduled weekly pulse")
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=PULSE_LOOKBACK_DAYS)
+
+        emails = pulse_collect_emails(start_dt, end_dt)
+        teams = pulse_collect_teams(start_dt, end_dt)
+        meetings = pulse_collect_meetings(start_dt, end_dt)
+
+        report, raw_signals = pulse_analyze(emails, teams, meetings, start_dt, end_dt)
+
+        stats = {
+            "emails_scanned": len(emails),
+            "teams_messages_scanned": len(teams),
+            "meetings_analyzed": len(meetings),
+        }
+
+        pulse_send_email(report, start_dt, end_dt)
+        pulse_archive(report, raw_signals, start_dt, end_dt, stats)
+
+        logger.info("[pulse] Weekly pulse complete and delivered")
+    except Exception as e:
+        logger.error(f"[pulse] Failed: {e}", exc_info=True)
+        # Send failure notification
+        try:
+            token = get_ms_graph_token()
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            error_payload = {
+                "message": {
+                    "subject": "[Sara] Weekly Pulse FAILED",
+                    "body": {
+                        "contentType": "Text",
+                        "content": f"Weekly pulse generation failed.\n\nError: {str(e)}\n\nCheck Railway logs for details.",
+                    },
+                    "toRecipients": [{"emailAddress": {"address": PULSE_RECIPIENT}}],
+                    "from": {"emailAddress": {"name": BOT_SENDER_NAME, "address": PULSE_SENDER}},
+                },
+            }
+            requests.post(
+                f"{MS_GRAPH_BASE}/users/{PULSE_SENDER}/sendMail",
+                json=error_payload, headers=headers, timeout=30)
+        except Exception:
+            logger.error("[pulse] Even the error notification email failed", exc_info=True)
+
+
 def start_scheduler():
     scheduler = BackgroundScheduler()
     scheduler.add_job(poll_and_process, "interval", minutes=POLL_INTERVAL_MINUTES)
+    scheduler.add_job(
+        pulse_weekly_run,
+        trigger="cron",
+        day_of_week="sun",
+        hour=22,
+        minute=0,
+        timezone="Asia/Jerusalem",
+        id="weekly_pulse",
+        replace_existing=True,
+    )
     scheduler.start()
-    logger.info(f"Scheduler started: polling every {POLL_INTERVAL_MINUTES} minutes")
+    logger.info(f"Scheduler started: polling every {POLL_INTERVAL_MINUTES} minutes, weekly pulse Sunday 22:00 IST")
 
 
 # Start background services for gunicorn (module-level, not just __main__)

@@ -96,12 +96,17 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/webhook/teams-transcript` | Teams transcript webhook |
 | `/review/<id>` | Approval review page |
 | `/review/<id>/approve` | Execute approved actions |
+| `/pulse/trigger` | Manual weekly pulse (supports `?dry_run=true&days=N`) |
+| `/pulse/check` | Verify Graph permissions for pulse |
+| `/pulse/history` | Browse archived pulse reports |
 
 ## Architecture Notes
 
 - **Phase 1 (auto):** Fireflies/Teams triggers -> Claude extracts intelligence -> notification email sent with review link
 - **Phase 2 (manual):** Organizer opens review page -> edits tasks/email -> clicks Approve -> HubSpot + Asana + Outlook actions created
+- **Weekly Pulse:** Sunday 22:00 IST, scans all team emails/Teams/meetings, 4-pass Claude analysis, Green/Yellow/Red report emailed to Ken
 - **Pending approvals** stored in `/data/pending_approvals.json` (Railway persistent volume at `/data/`)
+- **Pulse archives** stored in `/data/pulse/{YYYY}-W{WW}.json`
 - **Microsoft Graph** uses app-only auth (team-wide), refresh token persisted at `/data/refresh_token.txt`
 - **Teams transcripts** via Graph webhook subscription, renewed every 50 min via APScheduler
 - **To-Do sync** polls Asana tasks and creates matching Microsoft To-Do tasks for @negevlabs.com users
@@ -116,6 +121,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | HubSpot task wrong owner | organizer_email used instead of owner_email | Use task-level owner_email |
 | Webhook handler misses state change | Trusting new_value from payload | Fetch from API instead |
 | /test returns 502 timeout | Sequential API calls too slow | Known issue, use /version + /config |
+| /pulse/check shows false | Missing Azure AD permissions | Ken must grant + admin consent |
 
 ## Environment Variables (Railway)
 
@@ -125,3 +131,4 @@ Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_AP
 
 - Shlomi's HUBSPOT_OWNER_MAP entry had wrong ID (was `241153250`, fixed to `31267643`) -- verify in Railway env vars
 - Teams live transcription requires separate enablement from Teams recording (MP4 to OneDrive != callTranscript object)
+- Weekly Pulse requires Azure AD permissions: `Mail.Read`, `Chat.Read.All`, `ChannelMessage.Read.All` (must be granted + admin consented before `/pulse/trigger` will work)
