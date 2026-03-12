@@ -2371,6 +2371,56 @@ RESULT_TEMPLATE = """
 #  WEEKLY PULSE ENDPOINTS
 # ======================================================================
 
+@app.route("/pulse/debug", methods=["GET"])
+def pulse_debug():
+    """Debug pulse pipeline step by step. Use ?step=collect|analyze|all"""
+    import traceback
+    step = request.args.get("step", "collect")
+    days = int(request.args.get("days", 1))
+    results = {"step": step, "days": days}
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+
+    # Step 1: collect
+    try:
+        logger.info(f"[pulse-debug] Collecting emails...")
+        emails = pulse_collect_emails(start_dt, end_dt)
+        results["emails"] = {"count": len(emails), "sample": emails[:2] if emails else []}
+    except Exception as e:
+        results["emails"] = {"error": str(e), "traceback": traceback.format_exc()}
+        return jsonify(results), 500
+
+    try:
+        logger.info(f"[pulse-debug] Collecting Teams...")
+        teams = pulse_collect_teams(start_dt, end_dt)
+        results["teams"] = {"count": len(teams), "sample": teams[:2] if teams else []}
+    except Exception as e:
+        results["teams"] = {"error": str(e), "traceback": traceback.format_exc()}
+        return jsonify(results), 500
+
+    try:
+        logger.info(f"[pulse-debug] Collecting meetings...")
+        meetings = pulse_collect_meetings(start_dt, end_dt)
+        results["meetings"] = {"count": len(meetings), "sample": meetings[:2] if meetings else []}
+    except Exception as e:
+        results["meetings"] = {"error": str(e), "traceback": traceback.format_exc()}
+        return jsonify(results), 500
+
+    if step == "collect":
+        return jsonify(results)
+
+    # Step 2: analyze (only if step=analyze or step=all)
+    try:
+        logger.info(f"[pulse-debug] Starting analysis...")
+        report, raw_signals = pulse_analyze(emails, teams, meetings, start_dt, end_dt)
+        results["analysis"] = {"report_preview": report[:500] if report else "", "signals_keys": list(raw_signals.keys())}
+    except Exception as e:
+        results["analysis"] = {"error": str(e), "traceback": traceback.format_exc()}
+        return jsonify(results), 500
+
+    return jsonify(results)
+
+
 @app.route("/pulse/trigger", methods=["GET"])
 def pulse_trigger():
     """Manually trigger a weekly pulse. Runs synchronously."""
@@ -2933,7 +2983,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.5-gunicorn-timeout", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.6-pulse-debug", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2965,7 +3015,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.5-gunicorn-timeout", "steps": {}}
+    results = {"version": "2.10.6-pulse-debug", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
