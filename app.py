@@ -2390,7 +2390,9 @@ def pulse_check_permissions():
     token = get_ms_graph_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Test Mail.Read: try reading one message from any team user
+    diagnostics = {}
+
+    # Test Mail.Read (also satisfied by Mail.ReadWrite): try reading one message
     try:
         users = pulse_get_team_users()
         team_users = len(users)
@@ -2398,29 +2400,53 @@ def pulse_check_permissions():
             test_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/messages?$top=1&$select=id"
             resp = requests.get(test_url, headers=headers, timeout=15)
             results["Mail.Read"] = resp.status_code == 200
+            if resp.status_code != 200:
+                diagnostics["Mail.Read"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+        else:
+            diagnostics["Mail.Read"] = "No team users found"
     except Exception as e:
         logger.warning(f"[pulse] Mail.Read check failed: {e}")
+        diagnostics["Mail.Read"] = str(e)
 
-    # Test Chat.Read.All: list chats
+    # Test Chat.Read.All: use /users/{id}/chats (app-only auth compatible)
+    # Note: /chats is delegated-only and fails with app-only tokens
     try:
-        resp = requests.get(f"{MS_GRAPH_BASE}/chats?$top=1", headers=headers, timeout=15)
-        results["Chat.Read.All"] = resp.status_code == 200
+        if team_users > 0:
+            chat_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/chats?$top=1"
+            resp = requests.get(chat_url, headers=headers, timeout=15)
+            results["Chat.Read.All"] = resp.status_code == 200
+            if resp.status_code != 200:
+                diagnostics["Chat.Read.All"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+        else:
+            diagnostics["Chat.Read.All"] = "No team users to test with"
     except Exception as e:
         logger.warning(f"[pulse] Chat.Read.All check failed: {e}")
+        diagnostics["Chat.Read.All"] = str(e)
 
-    # Test ChannelMessage.Read.All: list teams
+    # Test ChannelMessage.Read.All: list joined teams for a user
+    # Note: /teams requires Group.Read.All; use /users/{id}/joinedTeams instead
     try:
-        resp = requests.get(f"{MS_GRAPH_BASE}/teams", headers=headers, timeout=15)
-        results["ChannelMessage.Read.All"] = resp.status_code == 200
+        if team_users > 0:
+            teams_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/joinedTeams?$top=1"
+            resp = requests.get(teams_url, headers=headers, timeout=15)
+            results["ChannelMessage.Read.All"] = resp.status_code == 200
+            if resp.status_code != 200:
+                diagnostics["ChannelMessage.Read.All"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+        else:
+            diagnostics["ChannelMessage.Read.All"] = "No team users to test with"
     except Exception as e:
         logger.warning(f"[pulse] ChannelMessage.Read.All check failed: {e}")
+        diagnostics["ChannelMessage.Read.All"] = str(e)
 
     ready = all(results.values()) and team_users > 0
-    return jsonify({
+    response = {
         "permissions": results,
         "team_users_found": team_users,
         "ready": ready,
-    })
+    }
+    if diagnostics:
+        response["diagnostics"] = diagnostics
+    return jsonify(response)
 
 
 @app.route("/pulse/history", methods=["GET"])
@@ -2853,7 +2879,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.0-weekly-pulse", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.1-pulse-check-fix", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -2885,7 +2911,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.0-weekly-pulse", "steps": {}}
+    results = {"version": "2.10.1-pulse-check-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
