@@ -553,6 +553,19 @@ def pulse_collect_teams(start_dt, end_dt):
     return all_messages
 
 
+PULSE_TEAM_DOMAINS = {"negevlabs.com", "negevcap.com", "ariadnebio.com", "zirmania.com"}
+
+
+def _pulse_is_team_meeting(participants):
+    """Check if any participant email belongs to a team domain."""
+    for p in (participants or []):
+        email = (p if isinstance(p, str) else "").lower()
+        domain = email.split("@")[-1] if "@" in email else ""
+        if domain in PULSE_TEAM_DOMAINS:
+            return True
+    return False
+
+
 def pulse_collect_meetings(start_dt, end_dt):
     """Collect meeting intelligence from Fireflies for the pulse period."""
     start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -560,18 +573,35 @@ def pulse_collect_meetings(start_dt, end_dt):
     meetings = []
     try:
         query = """
-        query PulseMeetings($fromDate: DateTime, $toDate: DateTime) {
-            transcripts(fromDate: $fromDate, toDate: $toDate) {
+        query PulseMeetings($fromDate: DateTime, $toDate: DateTime, $limit: Int) {
+            transcripts(fromDate: $fromDate, toDate: $toDate, limit: $limit) {
                 id title date duration
+                organizer_email
+                participants
                 summary { overview action_items shorthand_bullet }
             }
         }
         """
-        data = fireflies_query(query, {"fromDate": start_iso, "toDate": end_iso})
-        for t in (data.get("transcripts") or []):
+        data = fireflies_query(query, {
+            "fromDate": start_iso,
+            "toDate": end_iso,
+            "limit": 50,
+        })
+        all_transcripts = data.get("transcripts") or []
+        logger.info(f"[pulse] Fireflies returned {len(all_transcripts)} meetings for period {start_iso} - {end_iso}")
+        for t in all_transcripts:
+            # Filter: only include meetings where a team member participated
+            organizer = (t.get("organizer_email") or "").lower()
+            participants = t.get("participants") or []
+            org_domain = organizer.split("@")[-1] if "@" in organizer else ""
+            is_team = org_domain in PULSE_TEAM_DOMAINS or _pulse_is_team_meeting(participants)
+            if not is_team:
+                logger.debug(f"[pulse] Skipping meeting '{t.get('title')}' -- no team participants")
+                continue
+
             summary = t.get("summary") or {}
             duration = t.get("duration")
-            # Fireflies returns date as Unix timestamp (int) — convert to ISO string
+            # Fireflies returns date as Unix timestamp (int) -- convert to ISO string
             raw_date = t.get("date", "")
             if isinstance(raw_date, (int, float)) and raw_date > 0:
                 raw_date = datetime.fromtimestamp(raw_date / 1000, tz=timezone.utc).isoformat()
@@ -584,7 +614,7 @@ def pulse_collect_meetings(start_dt, end_dt):
             })
     except Exception as e:
         logger.warning(f"[pulse] Fireflies collection failed: {e}")
-    logger.info(f"[pulse] Meetings: {len(meetings)} transcripts collected")
+    logger.info(f"[pulse] Meetings: {len(meetings)} team transcripts collected (filtered from Fireflies results)")
     return meetings
 
 
@@ -739,6 +769,15 @@ REQUIRED:
 # WEEKLY PULSE -> ANALYSIS PIPELINE (MULTI-PASS CLAUDE)
 # ======================================================================
 
+PULSE_ANTI_HALLUCINATION = """
+CRITICAL STATUS RULES -- never violate these:
+- NEVER upgrade the status of deals, funding, partnerships, or agreements.
+- "Planning to" does NOT equal "achieved." "Discussing" does NOT equal "established." "Targeting" does NOT equal "secured."
+- If the source says "aiming for," "working toward," "exploring," or "in discussions" -- report it as in-progress, NOT as completed.
+- For any financial claim (funding secured, deal closed, amount raised), you must find EXPLICIT confirmation language like "signed," "wired," "closed," "committed." Without that, classify as Yellow (in progress), not Green (achieved).
+- When in doubt about status, DOWNGRADE the confidence level. A false negative (missing a win) is far less harmful than a false positive (reporting something achieved that has not happened).
+"""
+
 PULSE_EMAIL_PROMPT = """You are analyzing one week of business emails for Negev Labs, a biotech venture studio with portfolio companies including Ariadne Bio, Reset Pharma, and Filament Health. They also run Negev Capital, a psychedelic medicine investment fund.
 
 Below are email subjects and previews from the past week. Extract ONLY business signals.
@@ -748,7 +787,7 @@ RULES:
 - DO NOT attribute anything to individuals. Say "there was discussion about" not "someone emailed about."
 - Look for: deal progress, investor communications, portfolio company updates, regulatory news, partnership developments, hiring, operational decisions, financial matters.
 - Ignore routine scheduling, FYIs with no substance, and automated notifications that slipped through filters.
-
+""" + PULSE_ANTI_HALLUCINATION + """
 OUTPUT (JSON):
 {
   "green": ["signal 1", "signal 2"],
@@ -770,7 +809,7 @@ RULES:
 - For 1:1 DMs that contain personal content mixed with business: extract ONLY the business part, discard the rest entirely.
 - Look for: decisions made, blockers raised, project updates, asks/requests, deadlines discussed, escalations, celebrations of wins.
 - Group related messages into themes rather than listing each message.
-
+""" + PULSE_ANTI_HALLUCINATION + """
 OUTPUT (JSON):
 {
   "green": ["signal 1", "signal 2"],
@@ -791,7 +830,7 @@ RULES:
 - DO NOT attribute anything to individuals.
 - Meetings are the richest source of strategic signals -- look for: investment decisions, portfolio company health, fundraising progress, partnership negotiations, regulatory updates, team capacity issues, timeline changes.
 - Cross-reference action items: items assigned but potentially at risk are Yellow; items overdue or blocked are Red.
-
+""" + PULSE_ANTI_HALLUCINATION + """
 OUTPUT (JSON):
 {
   "green": ["signal 1", "signal 2"],
@@ -816,19 +855,27 @@ RULES:
 - Keep each bullet to 1-2 sentences. Crisp, not verbose.
 - Green: 3-7 items. Yellow: 3-7 items. Red: 0-5 items (empty is fine).
 - Add a "Recommended Focus" section: 2-3 specific actions for the week ahead based on the signals.
+- EVERY bullet MUST start with a confidence tag in brackets. Choose the appropriate tag for each section:
+  - Green items: [CONFIRMED] for explicit, unambiguous evidence; [ADVANCING] for clear forward progress but not yet complete.
+  - Yellow items: [MONITORING] for items needing attention but no action yet; [AT RISK] for items with identified risks or blockers.
+  - Red items: [BLOCKED] for items that cannot proceed without intervention; [URGENT] for items requiring immediate action.
 
+""" + PULSE_ANTI_HALLUCINATION + """
 OUTPUT FORMAT (use this exact markdown structure):
 
 ## Weekly Pulse: {date_range}
 
 ### Green -- Wins & Progress
-- [bullet]
+- [CONFIRMED] Item where evidence is explicit and unambiguous
+- [ADVANCING] Item where clear forward progress occurred but not yet complete
 
 ### Yellow -- Watch Items
-- [bullet]
+- [MONITORING] Item that needs attention but no action yet
+- [AT RISK] Item with identified risks or blockers
 
 ### Red -- Critical
-- [bullet]
+- [BLOCKED] Item that cannot proceed without intervention
+- [URGENT] Item requiring immediate action
 
 ### Activity Summary
 - Emails scanned: {email_count}
@@ -896,12 +943,18 @@ def _pulse_truncate_input(text, max_chars=PULSE_MAX_INPUT_CHARS):
     return text[:max_chars] + "\n\n[... TRUNCATED — input exceeded 20K token limit ...]"
 
 
-def _pulse_call_claude(prompt_text):
+PULSE_MODEL_EXTRACT = "claude-sonnet-4-20250514"    # Passes 1-3: signal extraction
+PULSE_MODEL_SYNTHESIZE = "claude-opus-4-20250514"   # Pass 4: synthesis (stronger reasoning)
+
+
+def _pulse_call_claude(prompt_text, model=None):
     """Call Claude API for pulse analysis. Returns raw response text."""
     prompt_text = _pulse_truncate_input(prompt_text)
+    use_model = model or PULSE_MODEL_EXTRACT
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    logger.info(f"[pulse] Calling Claude model={use_model}, input_len={len(prompt_text)}")
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=use_model,
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt_text}],
     )
@@ -979,7 +1032,7 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
         .replace("{teams_json}", json.dumps(teams_signals, indent=2))
         .replace("{meetings_json}", json.dumps(meeting_signals, indent=2))
     )
-    report = _pulse_call_claude(synthesis_prompt)
+    report = _pulse_call_claude(synthesis_prompt, model=PULSE_MODEL_SYNTHESIZE)
     logger.info("[pulse] Analysis pipeline complete")
 
     return report, {
@@ -3073,7 +3126,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.11-fix-model-name", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.12-pulse-quality-fix", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3105,7 +3158,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.11-fix-model-name", "steps": {}}
+    results = {"version": "2.10.12-pulse-quality-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
