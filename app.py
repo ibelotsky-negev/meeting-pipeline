@@ -877,6 +877,14 @@ CRITICAL STATUS RULES -- never violate these:
 - If the source says "aiming for," "working toward," "exploring," or "in discussions" -- report it as in-progress, NOT as completed.
 - For any financial claim (funding secured, deal closed, amount raised), you must find EXPLICIT confirmation language like "signed," "wired," "closed," "committed." Without that, classify as Yellow (in progress), not Green (achieved).
 - When in doubt about status, DOWNGRADE the confidence level. A false negative (missing a win) is far less harmful than a false positive (reporting something achieved that has not happened).
+
+TEMPORAL RULE -- only report events that OCCURRED during the analysis period:
+- If a historical fact is referenced in this week's communications, it is CONTEXT for a current activity -- NOT a standalone Green/Yellow/Red item.
+- "Ethics committee approved the protocol" mentioned in passing this week =/= "Ethics committee approved the protocol THIS WEEK."
+- "We secured regulatory approval" referenced as background in a meeting =/= a new approval this week.
+- To qualify as a Green item, there must be evidence the event HAPPENED within the pulse date range (e.g., an email announcing it, a meeting where the outcome was first reported).
+- Historical milestones referenced as context should appear ONLY as supporting detail under a current-week item, never as their own bullet.
+- If unsure when something occurred, classify it as CONTEXT and mention it parenthetically under the related current activity, not as a standalone item.
 """
 
 PULSE_EMAIL_PROMPT = """You are analyzing one week of business emails for Negev Labs, a biotech venture studio focused on drug development and discovery, with portfolio companies including Ariadne Bio, Reset Pharma, and Filament Health.
@@ -963,6 +971,14 @@ RULES:
   - Red items: [BLOCKED] for items that cannot proceed without intervention; [URGENT] for items requiring immediate action.
 
 """ + PULSE_ANTI_HALLUCINATION + """
+BEFORE including any item as Green, ask yourself:
+1. Did this event HAPPEN this week? (Look for: announcement emails, first-time mentions, meeting where result was reported for the first time)
+2. Or was it merely REFERENCED this week as background? (Look for: "as you know," "following the approval we received," "building on the ethics approval," past-tense references without new information)
+
+If #2, it is NOT a Green item. It is context. Mention it parenthetically if relevant:
+  WRONG: "[CONFIRMED] Israeli Ethics Committee approved Phase 1B protocol"
+  RIGHT: "[ADVANCING] Protocol amendment work progressing (building on the conditional ethics approval received earlier)"
+
 OUTPUT FORMAT (use this exact markdown structure):
 
 ## Weekly Pulse: {date_range}
@@ -3434,7 +3450,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.11.1-meeting-links", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.11.2-temporal-filter", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3466,7 +3482,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.11.1-meeting-links", "steps": {}}
+    results = {"version": "2.11.2-temporal-filter", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

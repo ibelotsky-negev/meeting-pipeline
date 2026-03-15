@@ -172,3 +172,5 @@ Internal domains: @negevlabs.com, @ariadnebio.com, @negevcap.com
 9. **Manufacturing chain:** API synthesis at Eurofins Advinus (India) -> capsule formulation at Recipharm (India/Israel) -> clinical sites in Israel/Austria.
 
 10. **When in doubt, DOWNGRADE confidence.** A false negative (missing a win) is far less harmful than a false positive (reporting something achieved that hasn't happened).
+
+11. **TEMPORAL FILTERING (Weekly Pulse only).** Only report events that OCCURRED during the analysis period. Historical milestones referenced in this week's communications are CONTEXT, not standalone items. Example: "Ethics committee approved the protocol" mentioned in passing =/= a new approval this week. If unsure when something happened, do not list it as a Green item -- mention it parenthetically as context under the related current activity.
