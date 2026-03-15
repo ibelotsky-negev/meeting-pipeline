@@ -150,11 +150,16 @@ PULSE_SKIP_DOMAINS = [
     "linkedin.com", "slack.com", "asana.com", "hubspot.com",
     "calendly.com", "zoom.us", "fireflies.ai", "github.com",
     "atlassian.com", "jira.com", "confluence.com",
+    # Excluded entities -- not in scope for pulse analysis
+    "click-ins.com", "click-ins.at", "clickins.com", "clickins.at",
+    "negevcap.com",
 ]
 PULSE_SKIP_SUBJECTS = [
     "out of office", "ooo", "automatic reply", "auto-reply",
     "unsubscribe", "newsletter", "digest", "accepted:",
     "declined:", "tentative:", "canceled:", "updated invitation:",
+    # Excluded entities
+    "click-ins", "clickins", "negev capital",
 ]
 
 
@@ -611,7 +616,8 @@ def pulse_collect_teams(start_dt, end_dt):
     return all_messages
 
 
-PULSE_TEAM_DOMAINS = {"negevlabs.com", "negevcap.com", "ariadnebio.com", "zirmania.com"}
+PULSE_TEAM_DOMAINS = {"negevlabs.com", "ariadnebio.com", "zirmania.com"}
+# Note: negevcap.com excluded -- Negev Capital is out of pulse scope
 
 
 def _pulse_is_team_meeting(participants):
@@ -827,6 +833,16 @@ REQUIRED:
 # WEEKLY PULSE -> ANALYSIS PIPELINE (MULTI-PASS CLAUDE)
 # ======================================================================
 
+PULSE_SCOPE = """
+SCOPE -- strictly enforced:
+- IN SCOPE: Negev Labs, Ariadne Bio, and all Negev Labs development/discovery programs and portfolio companies (e.g., Reset Pharma, Filament Health, any drug discovery or biotech R&D work).
+- OUT OF SCOPE -- COMPLETELY IGNORE these entities and anything related to them:
+  - Click-Ins / Click-Ins Austria GmbH (and any AWS guarantee, ERSTE Bank, Austrian financing)
+  - Negev Capital / Negev Cap (the psychedelic medicine investment fund, its LPs, fund admin, fund accounting)
+- If an email or message mentions BOTH in-scope and out-of-scope entities, extract ONLY the in-scope parts.
+- If a signal is ONLY about Click-Ins or Negev Capital, skip it entirely.
+"""
+
 PULSE_ANTI_HALLUCINATION = """
 CRITICAL STATUS RULES -- never violate these:
 - NEVER upgrade the status of deals, funding, partnerships, or agreements.
@@ -836,10 +852,10 @@ CRITICAL STATUS RULES -- never violate these:
 - When in doubt about status, DOWNGRADE the confidence level. A false negative (missing a win) is far less harmful than a false positive (reporting something achieved that has not happened).
 """
 
-PULSE_EMAIL_PROMPT = """You are analyzing one week of business emails for Negev Labs, a biotech venture studio with portfolio companies including Ariadne Bio, Reset Pharma, and Filament Health. They also run Negev Capital, a psychedelic medicine investment fund.
+PULSE_EMAIL_PROMPT = """You are analyzing one week of business emails for Negev Labs, a biotech venture studio focused on drug development and discovery, with portfolio companies including Ariadne Bio, Reset Pharma, and Filament Health.
 
 Below are email subjects and previews from the past week. Extract ONLY business signals.
-
+""" + PULSE_SCOPE + """
 RULES:
 - BUSINESS ONLY. Skip anything personal (health, family, social plans).
 - DO NOT attribute anything to individuals. Say "there was discussion about" not "someone emailed about."
@@ -857,10 +873,10 @@ OUTPUT (JSON):
 EMAILS:
 {emails_text}"""
 
-PULSE_TEAMS_PROMPT = """You are analyzing one week of Microsoft Teams messages for Negev Labs, a biotech venture studio.
+PULSE_TEAMS_PROMPT = """You are analyzing one week of Microsoft Teams messages for Negev Labs, a biotech venture studio focused on drug development and discovery.
 
 Below are Teams messages from channels, group chats, and direct messages. Extract ONLY business signals.
-
+""" + PULSE_SCOPE + """
 RULES:
 - BUSINESS ONLY. Skip personal conversations, social chat, lunch plans, etc.
 - DO NOT attribute anything to individuals. No names, no "someone said."
@@ -879,10 +895,10 @@ OUTPUT (JSON):
 TEAMS MESSAGES:
 {teams_text}"""
 
-PULSE_MEETINGS_PROMPT = """You are analyzing one week of meeting summaries for Negev Labs, a biotech venture studio.
+PULSE_MEETINGS_PROMPT = """You are analyzing one week of meeting summaries for Negev Labs, a biotech venture studio focused on drug development and discovery.
 
 Below are meeting titles and AI-generated summaries from the past week. Extract ONLY business signals.
-
+""" + PULSE_SCOPE + """
 RULES:
 - BUSINESS ONLY. No personal references.
 - DO NOT attribute anything to individuals.
@@ -903,7 +919,7 @@ MEETING SUMMARIES:
 PULSE_SYNTHESIS_PROMPT = """You are Sara, the intelligence system for Negev Labs. You have analyzed all team communications for the past week across email, Teams, and meetings. Below are the extracted signals from each source.
 
 Synthesize these into a single executive briefing. Your reader is the managing partner who needs to know what matters this week.
-
+""" + PULSE_SCOPE + """
 RULES:
 - Merge duplicate signals that appear across sources (e.g., same deal mentioned in email AND meeting).
 - Rank by importance within each category.
@@ -3190,7 +3206,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.13-parallel-collect", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.10.14-scope-filter", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3222,7 +3238,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.13-parallel-collect", "steps": {}}
+    results = {"version": "2.10.14-scope-filter", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
