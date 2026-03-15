@@ -692,12 +692,15 @@ def pulse_collect_meetings(start_dt, end_dt):
             raw_date = t.get("date", "")
             if isinstance(raw_date, (int, float)) and raw_date > 0:
                 raw_date = datetime.fromtimestamp(raw_date / 1000, tz=timezone.utc).isoformat()
+            ff_id = t.get("id", "")
             meetings.append({
                 "title": t.get("title", ""),
                 "date": str(raw_date),
                 "duration_minutes": round(duration / 60) if duration else 0,
                 "summary": summary.get("overview") or summary.get("shorthand_bullet") or "",
                 "action_items": summary.get("action_items") or "",
+                "fireflies_id": ff_id,
+                "fireflies_url": f"https://app.fireflies.ai/view/{ff_id}" if ff_id else "",
             })
     except Exception as e:
         logger.warning(f"[pulse] Fireflies collection failed: {e}")
@@ -953,6 +956,7 @@ RULES:
 - Keep each bullet to 1-2 sentences. Crisp, not verbose.
 - Green: 3-7 items. Yellow: 3-7 items. Red: 0-5 items (empty is fine).
 - Add a "Recommended Focus" section: 2-3 specific actions for the week ahead based on the signals.
+- DEEP DIVE LINKS: When a bullet is sourced from or supported by a specific meeting, append a markdown link at the end of the bullet using the MEETING RECORDINGS reference below. Format: `[Recording](url)`. Only add links where a specific meeting directly supports the signal. Do not add links to every bullet -- only where there is a clear meeting source.
 - EVERY bullet MUST start with a confidence tag in brackets. Choose the appropriate tag for each section:
   - Green items: [CONFIRMED] for explicit, unambiguous evidence; [ADVANCING] for clear forward progress but not yet complete.
   - Yellow items: [MONITORING] for items needing attention but no action yet; [AT RISK] for items with identified risks or blockers.
@@ -987,6 +991,9 @@ OUTPUT FORMAT (use this exact markdown structure):
 
 ---
 
+MEETING RECORDINGS (use these for deep-dive links):
+{meeting_links}
+
 EMAIL SIGNALS:
 {email_json}
 
@@ -1018,16 +1025,29 @@ def _pulse_format_teams(teams_data):
 
 
 def _pulse_format_meetings(meeting_data):
-    """Format meeting data for Claude prompt."""
+    """Format meeting data for Claude prompt, including Fireflies links."""
     lines = []
     for i, m in enumerate(meeting_data, 1):
         date_str = str(m.get('date', ''))[:10] or 'unknown'
-        lines.append(f"{i}. [{date_str}] {m['title']} ({m['duration_minutes']}min)")
+        ff_url = m.get("fireflies_url", "")
+        link_part = f" | Recording: {ff_url}" if ff_url else ""
+        lines.append(f"{i}. [{date_str}] {m['title']} ({m['duration_minutes']}min){link_part}")
         if m.get("summary"):
             lines.append(f"   Summary: {m['summary']}")
         if m.get("action_items"):
             lines.append(f"   Action items: {m['action_items']}")
     return "\n".join(lines) if lines else "(No meetings collected)"
+
+
+def _pulse_build_meeting_links(meeting_data):
+    """Build a meeting title -> Fireflies URL reference for the synthesis prompt."""
+    links = []
+    for m in meeting_data:
+        ff_url = m.get("fireflies_url", "")
+        if ff_url:
+            date_str = str(m.get('date', ''))[:10] or 'unknown'
+            links.append(f"- [{m['title']}]({ff_url}) ({date_str})")
+    return "\n".join(links) if links else "(No meeting recordings available)"
 
 
 PULSE_MAX_INPUT_CHARS = 80000  # ~20K tokens at ~4 chars/token
@@ -1139,6 +1159,7 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
         .replace("{teams_count}", str(len(teams_data)))
         .replace("{meetings_count}", str(len(meeting_data)))
         .replace("{entities}", ", ".join(sorted(all_entities)) if all_entities else "none detected")
+        .replace("{meeting_links}", _pulse_build_meeting_links(meeting_data))
         .replace("{email_json}", json.dumps(email_signals, indent=2))
         .replace("{teams_json}", json.dumps(teams_signals, indent=2))
         .replace("{meetings_json}", json.dumps(meeting_signals, indent=2))
@@ -3413,7 +3434,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.11.0-briefing-book", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.11.1-meeting-links", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3445,7 +3466,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.11.0-briefing-book", "steps": {}}
+    results = {"version": "2.11.1-meeting-links", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
