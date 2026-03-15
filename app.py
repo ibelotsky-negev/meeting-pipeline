@@ -140,6 +140,8 @@ PULSE_SENDER = "sara@negevlabs.com"
 PULSE_DOMAINS = ["negevlabs.com", "ariadnebio.com"]
 PULSE_ARCHIVE_DIR = os.path.join(DATA_DIR, "pulse")
 PULSE_LOOKBACK_DAYS = 7
+BRIEFING_BOOK_PATH = os.path.join(DATA_DIR, "briefing-book.md")
+BRIEFING_BOOK_REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "briefing-book.md")
 
 # Email noise filters
 PULSE_SKIP_SENDERS = [
@@ -161,6 +163,27 @@ PULSE_SKIP_SUBJECTS = [
     # Excluded entities
     "click-ins", "clickins", "negev capital",
 ]
+
+
+def load_briefing_book():
+    """Load company context for Claude analysis calls.
+    On first run, copies the repo version to the data volume."""
+    import shutil
+    if not os.path.exists(BRIEFING_BOOK_PATH):
+        if os.path.exists(BRIEFING_BOOK_REPO):
+            shutil.copy2(BRIEFING_BOOK_REPO, BRIEFING_BOOK_PATH)
+            logger.info(f"[briefing] Initialized briefing book from repo ({os.path.getsize(BRIEFING_BOOK_PATH)} bytes)")
+        else:
+            logger.warning("[briefing] No briefing book found at repo or data volume")
+            return ""
+    try:
+        with open(BRIEFING_BOOK_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        logger.info(f"[briefing] Loaded briefing book ({len(content)} chars)")
+        return content
+    except Exception as e:
+        logger.warning(f"[briefing] Failed to load briefing book: {e}")
+        return ""
 
 
 def is_internal_email(email: str) -> bool:
@@ -694,17 +717,18 @@ def extract_meeting_intelligence(transcript: dict) -> dict:
         [f"{s.get('speaker_name', 'Unknown')}: {s.get('text', '')}" for s in sentences]
     )
 
- # Business context -> loaded from file if available, else env var, else default
-    business_context = ""
-    context_file = os.environ.get("BUSINESS_CONTEXT_FILE", "business_context.md")
-    if os.path.exists(context_file):
-        with open(context_file, "r") as f:
-            business_context = f.read()
-        logger.info(f"Loaded business context from {context_file} ({len(business_context)} chars)")
-    elif os.environ.get("BUSINESS_CONTEXT"):
-        business_context = os.environ["BUSINESS_CONTEXT"]
-    else:
-        business_context = "No specific business context provided. Extract general meeting intelligence."
+    # Business context: briefing book (preferred) -> file -> env var -> default
+    business_context = load_briefing_book()
+    if not business_context:
+        context_file = os.environ.get("BUSINESS_CONTEXT_FILE", "business_context.md")
+        if os.path.exists(context_file):
+            with open(context_file, "r") as f:
+                business_context = f.read()
+            logger.info(f"Loaded business context from {context_file} ({len(business_context)} chars)")
+        elif os.environ.get("BUSINESS_CONTEXT"):
+            business_context = os.environ["BUSINESS_CONTEXT"]
+        else:
+            business_context = "No specific business context provided. Extract general meeting intelligence."
 
     prompt = f"""You are an expert biotech venture capital analyst and chief of staff.
 
@@ -1021,17 +1045,30 @@ PULSE_MODEL_EXTRACT = "claude-sonnet-4-20250514"    # Passes 1-3: signal extract
 PULSE_MODEL_SYNTHESIZE = "claude-opus-4-20250514"   # Pass 4: synthesis (stronger reasoning)
 
 
-def _pulse_call_claude(prompt_text, model=None):
-    """Call Claude API for pulse analysis. Returns raw response text."""
+def _pulse_call_claude(prompt_text, model=None, use_briefing=True):
+    """Call Claude API for pulse analysis. Returns raw response text.
+    Injects briefing book as system prompt for company context."""
     prompt_text = _pulse_truncate_input(prompt_text)
     use_model = model or PULSE_MODEL_EXTRACT
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     logger.info(f"[pulse] Calling Claude model={use_model}, input_len={len(prompt_text)}")
-    response = client.messages.create(
-        model=use_model,
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt_text}],
-    )
+
+    # Build system prompt with briefing book context
+    system_parts = []
+    if use_briefing:
+        briefing = load_briefing_book()
+        if briefing:
+            system_parts.append(f"COMPANY CONTEXT:\n{briefing}")
+
+    kwargs = {
+        "model": use_model,
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt_text}],
+    }
+    if system_parts:
+        kwargs["system"] = "\n\n".join(system_parts)
+
+    response = client.messages.create(**kwargs)
     return response.content[0].text
 
 
@@ -1107,13 +1144,122 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
         .replace("{meetings_json}", json.dumps(meeting_signals, indent=2))
     )
     report = _pulse_call_claude(synthesis_prompt, model=PULSE_MODEL_SYNTHESIZE)
-    logger.info("[pulse] Analysis pipeline complete")
+    logger.info("[pulse] Synthesis complete")
 
-    return report, {
+    # Pass 5: Briefing book update proposals
+    all_signals = {
         "email_signals": email_signals,
         "teams_signals": teams_signals,
         "meeting_signals": meeting_signals,
     }
+    briefing_updates = []
+    try:
+        logger.info(f"[pulse] Waiting {rate_limit_delay}s for rate limit...")
+        time.sleep(rate_limit_delay)
+        logger.info("[pulse] Pass 5/5: Proposing briefing book updates")
+        briefing_updates = _pulse_propose_briefing_updates(all_signals)
+    except Exception as e:
+        logger.warning(f"[pulse] Briefing update pass failed (non-fatal): {e}")
+
+    logger.info("[pulse] Analysis pipeline complete")
+
+    return report, all_signals, briefing_updates
+
+
+PULSE_BRIEFING_UPDATE_PROMPT = """You are reviewing this week's pulse signals against the current company briefing book.
+
+CURRENT BRIEFING BOOK:
+{briefing_book}
+
+THIS WEEK'S SIGNALS:
+{all_signals_json}
+
+Identify any FACTUAL STATUS CHANGES that should update the briefing book. Only propose changes for:
+- Deal/funding status changes (e.g., investor moved from "PROSPECT" to "ACTIVE DILIGENCE")
+- Clinical milestone completions (e.g., study completed, report finalized)
+- New key relationships (new investor, new CRO, new advisor)
+- Team changes (new hires, departures, role changes)
+- Regulatory milestones (submission, approval, rejection)
+
+Do NOT propose changes for:
+- Routine weekly activity (meetings held, emails sent)
+- Speculative or uncertain developments
+- Personal information
+- Anything related to Click-Ins or Negev Capital (out of scope)
+
+OUTPUT (JSON):
+{
+  "proposed_updates": [
+    {
+      "section": "Which section of the briefing book",
+      "current": "Current text or status (must be EXACT text from briefing book)",
+      "proposed": "Proposed new text or status",
+      "evidence": "What signal supports this change",
+      "confidence": "high/medium/low"
+    }
+  ],
+  "no_changes_needed": true/false
+}
+
+Only include HIGH confidence changes. Medium = flag but don't auto-apply. Low = skip entirely."""
+
+
+def _pulse_propose_briefing_updates(all_signals):
+    """Pass 5: Propose briefing book updates based on this week's signals."""
+    briefing = load_briefing_book()
+    if not briefing:
+        logger.warning("[pulse] No briefing book to update")
+        return []
+
+    prompt = (PULSE_BRIEFING_UPDATE_PROMPT
+        .replace("{briefing_book}", briefing)
+        .replace("{all_signals_json}", json.dumps(all_signals, indent=2))
+    )
+    raw = _pulse_call_claude(prompt, use_briefing=False)  # don't inject briefing as system too
+    parsed = _pulse_parse_json(raw)
+    updates = parsed.get("proposed_updates") or []
+    logger.info(f"[pulse] Briefing update proposals: {len(updates)} "
+                f"({sum(1 for u in updates if u.get('confidence') == 'high')} high, "
+                f"{sum(1 for u in updates if u.get('confidence') == 'medium')} medium)")
+    return updates
+
+
+def pulse_update_briefing_book(proposed_updates):
+    """Apply high-confidence updates to the briefing book. Returns list of applied updates."""
+    import re as _re
+    if not os.path.exists(BRIEFING_BOOK_PATH):
+        logger.warning("[pulse] No briefing book file to update")
+        return []
+
+    with open(BRIEFING_BOOK_PATH, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    applied = []
+    for update in (proposed_updates or []):
+        if update.get("confidence") != "high":
+            continue
+        old = update.get("current", "")
+        new = update.get("proposed", "")
+        if old and old in content:
+            content = content.replace(old, new, 1)
+            applied.append(update)
+            logger.info(f"[pulse] Briefing book updated: {update.get('section', 'unknown section')}")
+        else:
+            logger.warning(f"[pulse] Briefing update skipped -- exact text not found: {old[:80]}...")
+
+    if applied:
+        # Update the "Last Updated" date
+        today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+        content = _re.sub(
+            r"## Last Updated:.*",
+            f"## Last Updated: {today}",
+            content
+        )
+        with open(BRIEFING_BOOK_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info(f"[pulse] Applied {len(applied)} briefing book updates")
+
+    return applied
 
 
 # ======================================================================
@@ -2581,11 +2727,41 @@ def _pulse_run_background(days, dry_run):
         }
         status["stats"] = stats
 
-        # Phase 2: analyze (4 Claude passes with rate-limit sleeps)
-        status["phase"] = "analyzing (4 Claude passes, ~4 min)"
+        # Phase 2: analyze (5 Claude passes with rate-limit sleeps)
+        status["phase"] = "analyzing (5 Claude passes, ~5 min)"
         _pulse_save_status(status)
-        report, raw_signals = pulse_analyze(emails, teams, meetings, start_dt, end_dt)
+        report, raw_signals, briefing_updates = pulse_analyze(emails, teams, meetings, start_dt, end_dt)
         status["report_preview"] = report[:1000] if report else ""
+        status["briefing_updates_proposed"] = len(briefing_updates)
+
+        # Phase 2b: apply briefing book updates (high confidence only)
+        applied_updates = []
+        if not dry_run and briefing_updates:
+            status["phase"] = "updating briefing book"
+            _pulse_save_status(status)
+            try:
+                applied_updates = pulse_update_briefing_book(briefing_updates)
+                status["briefing_updates_applied"] = len(applied_updates)
+            except Exception as e:
+                logger.warning(f"[pulse] Briefing book update failed (non-fatal): {e}")
+
+        # Append briefing update section to report if any updates were proposed
+        if briefing_updates:
+            report += "\n\n### Briefing Book Updates"
+            high = [u for u in briefing_updates if u.get("confidence") == "high"]
+            medium = [u for u in briefing_updates if u.get("confidence") == "medium"]
+            if applied_updates and not dry_run:
+                report += "\n**Applied this week:**"
+                for u in applied_updates:
+                    report += f"\n- {u.get('section', '?')}: {u.get('current', '')!r} -> {u.get('proposed', '')!r}"
+            elif high:
+                report += "\n**Proposed (dry run -- not applied):**"
+                for u in high:
+                    report += f"\n- {u.get('section', '?')}: {u.get('current', '')!r} -> {u.get('proposed', '')!r}"
+            if medium:
+                report += "\n**Flagged for review (medium confidence):**"
+                for u in medium:
+                    report += f"\n- {u.get('section', '?')}: {u.get('evidence', '')}"
 
         # Phase 3: deliver
         email_sent = False
@@ -2603,6 +2779,9 @@ def _pulse_run_background(days, dry_run):
             status["phase"] = "archiving"
             _pulse_save_status(status)
             try:
+                # Include briefing updates in archive
+                raw_signals["briefing_updates"] = briefing_updates
+                raw_signals["briefing_updates_applied"] = [u for u in applied_updates]
                 pulse_archive(report, raw_signals, start_dt, end_dt, stats)
                 archived = True
             except Exception as e:
@@ -2807,6 +2986,34 @@ def pulse_history():
             except (json.JSONDecodeError, KeyError):
                 continue
     return jsonify({"reports": reports, "count": len(reports)})
+
+
+@app.route("/briefing", methods=["GET"])
+def view_briefing():
+    """View current briefing book content."""
+    try:
+        content = load_briefing_book()
+        if not content:
+            return jsonify({"error": "No briefing book found"}), 404
+        return jsonify({"content": content, "length": len(content), "path": BRIEFING_BOOK_PATH})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/briefing", methods=["POST"])
+def update_briefing():
+    """Manually update briefing book content."""
+    data = request.get_json()
+    if not data or "content" not in data:
+        return jsonify({"error": "JSON body with 'content' field required"}), 400
+    content = data["content"]
+    try:
+        with open(BRIEFING_BOOK_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+        logger.info(f"[briefing] Manual update: {len(content)} chars written")
+        return jsonify({"status": "updated", "length": len(content)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ======================================================================
@@ -3206,7 +3413,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.10.14-scope-filter", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.11.0-briefing-book", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3238,7 +3445,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.10.14-scope-filter", "steps": {}}
+    results = {"version": "2.11.0-briefing-book", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
