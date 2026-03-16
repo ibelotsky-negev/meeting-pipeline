@@ -16,7 +16,7 @@ NL Founders & Management LLC (Ken Belotsky, Shlomi Raz, Kostia Adamsky) is the g
 | Name | Emails | Role |
 |------|--------|------|
 | Ken Belotsky | bk@negevlabs.com, bk@negevcap.com | Founding Partner -- fundraising, pharma BD, investor relations, board roles |
-| Shlomi Raz | shlomi@negevlabs.com, shlomi@ariadnebio.com | Co-Founder, CEO Ariadne Bio -- scientific strategy, clinical dev, investor pitches |
+| Shlomi Raz | shlomi@negevlabs.com, shlomi@ariadnebio.com | Co-Founder, CEO of Ariadne Bio -- scientific strategy, clinical dev, investor pitches |
 | Kostia Adamsky | ka@negevlabs.com, kostia@negevcap.com, ka@ariadnebio.com | Co-Founder -- budget, operations, preclinical, grants |
 | Dan Jeffries | dan@negevlabs.com, dan@ariadnebio.com | VP Development -- clinical/regulatory, investor materials, mechanistic research |
 | Robert Schuessler | rs@negevlabs.com | BD Europe -- Austrian trial sites, PI recruitment |
@@ -49,6 +49,7 @@ Internal domains: @negevlabs.com, @ariadnebio.com, @negevcap.com
 | QPS Austria/Taiwan | CRO -- toxicology studies |
 | Gerard Sanacora (Yale) | KOL -- clinical advisor, MJFF grant |
 | Frank Menniti | Scientific advisor -- NMDA pharmacology, mechanism validation |
+| Miri Halperin Wernli | Dual role: Chairperson at Reconnect Labs (portfolio co) AND Advisor to Ariadne Bio -- do NOT conflate these entities |
 
 ---
 
@@ -101,11 +102,9 @@ Internal domains: @negevlabs.com, @ariadnebio.com, @negevcap.com
 - AWS Grant -- being pursued (EUR 40K potentially to EUR 400K)
 - Click-Ins Austria GmbH -- financing with ERSTE Bank AWS guarantee
 
-### CEO Search
-- Active search for experienced clinical-stage biotech CEO
-- Shlomi to transition to supporting role post-trial
-- Candidates being interviewed: David McCullough, Kerrie Brady, Markus Goebel, others
-- Target: identify before Series A discussions
+### Leadership
+- Shlomi Raz is CEO of Ariadne Bio (confirmed, not interim)
+- No active CEO search -- explored in late 2025 but closed; Shlomi retained the role
 
 ---
 
@@ -129,9 +128,10 @@ Internal domains: @negevlabs.com, @ariadnebio.com, @negevcap.com
 - Grant application in progress
 - Status: PRECLINICAL
 
-### Bromantane Opportunity
+### Bromantane (Minor -- under review only)
 - IP challenges -- weak patents, method of use only
-- Status: EARLY EVALUATION
+- Status: EARLY EVALUATION -- not a core program, not critical to business
+- CLASSIFICATION: Do NOT classify Bromantane issues as Red/Critical. At most Yellow/MONITORING.
 
 ### HPL Compounds (Bernard Lerer / Hebrew University)
 - HBL217 shows anti-obsessional/antipsychotic effects
@@ -139,10 +139,12 @@ Internal domains: @negevlabs.com, @ariadnebio.com, @negevcap.com
 - New analogs (HBL222-226) being evaluated
 - Status: PRECLINICAL RESEARCH
 
-### Negev Capital Portfolio
-- ATAI/Beckley: BPL03 Phase 3 initiated, $220M cash, Miri Halperin appointed chairperson
-- Reset Pharma: Ken on board, RE01/RE03 trials ongoing, recruitment challenges
+### Negev Capital Portfolio (SEPARATE from Negev Labs core business)
+- ATAI/Beckley: BPL03 Phase 3 initiated, $220M cash position
+- Reconnect Labs: Miri Halperin Wernli is chairperson; RE01/RE03 trials ongoing
+- Reset Pharma: Ken on board
 - Filament Health: Ken on board
+- CLASSIFICATION: Portfolio company news goes in a SEPARATE "Portfolio Company Updates" section in the pulse output -- NEVER mixed into the main Green/Yellow/Red items
 
 ### HubSpot CRM Build
 - Working with Dan Katz (electricsage.com) on investor pipeline
@@ -174,3 +176,9 @@ Internal domains: @negevlabs.com, @ariadnebio.com, @negevcap.com
 10. **When in doubt, DOWNGRADE confidence.** A false negative (missing a win) is far less harmful than a false positive (reporting something achieved that hasn't happened).
 
 11. **TEMPORAL FILTERING (Weekly Pulse only).** Only report events that OCCURRED during the analysis period. Historical milestones referenced in this week's communications are CONTEXT, not standalone items. Example: "Ethics committee approved the protocol" mentioned in passing =/= a new approval this week. If unsure when something happened, do not list it as a Green item -- mention it parenthetically as context under the related current activity.
+
+12. **SEPARATE portfolio company news from core business.** Negev Capital portfolio companies are INVESTMENTS Ken monitors, not Negev Labs operations. Report portfolio updates in a separate "Portfolio Company Updates" section -- never mixed into Green/Yellow/Red. Exception: if a portfolio event directly impacts Negev Labs operations or fundraising.
+
+13. **SEVERITY CALIBRATION for Red items.** Red is reserved for threats to core operations: Ariadne Bio clinical program, fundraising, regulatory, key team. Early-stage programs (Bromantane, HPL, Amanita) NEVER produce Red items -- Yellow at most.
+
+14. **People and roles -- do not conflate across entities.** Miri Halperin Wernli is chairperson at Reconnect Labs AND advisor to Ariadne Bio. Shlomi Raz is CEO of Ariadne Bio. Always attribute roles to the correct entity. The CEO search from late 2025 is CLOSED -- do not report it as ongoing.

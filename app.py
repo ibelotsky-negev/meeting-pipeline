@@ -878,6 +878,16 @@ CRITICAL STATUS RULES -- never violate these:
 - For any financial claim (funding secured, deal closed, amount raised), you must find EXPLICIT confirmation language like "signed," "wired," "closed," "committed." Without that, classify as Yellow (in progress), not Green (achieved).
 - When in doubt about status, DOWNGRADE the confidence level. A false negative (missing a win) is far less harmful than a false positive (reporting something achieved that has not happened).
 
+CLASSIFICATION RULE -- core vs portfolio:
+- Negev Capital portfolio companies (ATAI/Beckley, Reconnect Labs, Reset Pharma, Filament Health, Cybin, Awakn, Small Pharma, Psyched Wellness, NanoPsy, Biomind, Mindset Pharma, Clairvoyant) are INVESTMENTS, not Negev Labs operations
+- Portfolio news goes in "Portfolio Company Updates" section -- never in Green/Yellow/Red
+- Exception: only if a portfolio event directly impacts Negev Labs fundraising or operations
+
+SEVERITY CALIBRATION:
+- Red/Critical is ONLY for threats to Negev Labs or Ariadne Bio CORE operations: blocked fundraising, clinical trial delays, regulatory rejections, key team departures, critical supplier failures
+- Early-stage evaluation programs (Bromantane, HPL compounds, Amanita research, Sonic Therapeutics) should NEVER produce Red items -- Yellow/MONITORING at most
+- Not every risk is critical. Ask: "Does this threaten Ariadne Bio's fundraise or clinical timeline?" If no, it is not Red.
+
 TEMPORAL RULE -- only report events that OCCURRED during the analysis period:
 - If a historical fact is referenced in this week's communications, it is CONTEXT for a current activity -- NOT a standalone Green/Yellow/Red item.
 - "Ethics committee approved the protocol" mentioned in passing this week =/= "Ethics committee approved the protocol THIS WEEK."
@@ -994,6 +1004,11 @@ OUTPUT FORMAT (use this exact markdown structure):
 ### Red -- Critical
 - [BLOCKED] Item that cannot proceed without intervention
 - [URGENT] Item requiring immediate action
+
+### Portfolio Company Updates
+- Brief updates on ATAI/Beckley, Reconnect Labs, Reset Pharma, Filament Health, etc.
+- These are Negev Capital investments Ken monitors -- not Negev Labs operations
+- Always specify which portfolio company
 
 ### Activity Summary
 - Emails scanned: {email_count}
@@ -3450,7 +3465,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.11.2-temporal-filter", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.11.3-classification-fix", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3482,7 +3497,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.11.2-temporal-filter", "steps": {}}
+    results = {"version": "2.11.3-classification-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
