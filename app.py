@@ -135,7 +135,7 @@ SUBSCRIPTION_FILE = os.path.join(DATA_DIR, "graph_subscription.json")
 # WEEKLY PULSE CONFIGURATION
 # ======================================================================
 
-PULSE_RECIPIENT = "bk@negevlabs.com"
+PULSE_RECIPIENTS = ["bk@negevlabs.com", "vu@negevcap.com"]
 PULSE_SENDER = "sara@negevlabs.com"
 PULSE_DOMAINS = ["negevlabs.com", "ariadnebio.com"]
 PULSE_ARCHIVE_DIR = os.path.join(DATA_DIR, "pulse")
@@ -1400,25 +1400,26 @@ def _pulse_markdown_to_html(md_text):
 
 
 def pulse_send_email(report_markdown, period_start, period_end):
-    """Send pulse report via Microsoft Graph (sara@negevlabs.com -> bk@negevlabs.com)."""
+    """Send pulse report via Microsoft Graph to all PULSE_RECIPIENTS."""
     subject = f"Weekly Pulse: {period_start.strftime('%b %d')} - {period_end.strftime('%b %d')}"
     html_body = _pulse_markdown_to_html(report_markdown)
     html_body = strip_emojis(html_body)
 
     token = get_ms_graph_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    to_list = [{"emailAddress": {"address": r}} for r in PULSE_RECIPIENTS]
     send_payload = {
         "message": {
             "subject": subject,
             "body": {"contentType": "HTML", "content": html_body},
-            "toRecipients": [{"emailAddress": {"address": PULSE_RECIPIENT}}],
+            "toRecipients": to_list,
             "from": {"emailAddress": {"name": BOT_SENDER_NAME, "address": PULSE_SENDER}},
         },
     }
     url = f"{MS_GRAPH_BASE}/users/{PULSE_SENDER}/sendMail"
     resp = requests.post(url, json=send_payload, headers=headers, timeout=30)
     resp.raise_for_status()
-    logger.info(f"[pulse] Email sent to {PULSE_RECIPIENT} from {PULSE_SENDER}")
+    logger.info(f"[pulse] Email sent to {PULSE_RECIPIENTS} from {PULSE_SENDER}")
 
 
 def pulse_archive(report_markdown, raw_signals, period_start, period_end, stats):
@@ -3465,7 +3466,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.11.3-classification-fix", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.11.4-monday-schedule", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3497,7 +3498,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.11.3-classification-fix", "steps": {}}
+    results = {"version": "2.11.4-monday-schedule", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4174,7 +4175,7 @@ def pulse_weekly_run():
                         "contentType": "Text",
                         "content": f"Weekly pulse generation failed.\n\nError: {str(e)}\n\nCheck Railway logs for details.",
                     },
-                    "toRecipients": [{"emailAddress": {"address": PULSE_RECIPIENT}}],
+                    "toRecipients": [{"emailAddress": {"address": r}} for r in PULSE_RECIPIENTS],
                     "from": {"emailAddress": {"name": BOT_SENDER_NAME, "address": PULSE_SENDER}},
                 },
             }
@@ -4191,15 +4192,15 @@ def start_scheduler():
     scheduler.add_job(
         pulse_weekly_run,
         trigger="cron",
-        day_of_week="sun",
-        hour=22,
+        day_of_week="mon",
+        hour=8,
         minute=0,
-        timezone="Asia/Jerusalem",
+        timezone="Europe/Berlin",
         id="weekly_pulse",
         replace_existing=True,
     )
     scheduler.start()
-    logger.info(f"Scheduler started: polling every {POLL_INTERVAL_MINUTES} minutes, weekly pulse Sunday 22:00 IST")
+    logger.info(f"Scheduler started: polling every {POLL_INTERVAL_MINUTES} minutes, weekly pulse Monday 08:00 CET")
 
 
 # Start background services for gunicorn (module-level, not just __main__)
