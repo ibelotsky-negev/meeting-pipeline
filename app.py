@@ -2739,8 +2739,26 @@ def _pulse_save_status(status_data):
         logger.error(f"[pulse] Failed to save status: {e}")
 
 
+_pulse_lock = _threading.Lock()
+
+
 def _pulse_run_background(days, dry_run):
-    """Run the full pulse pipeline in a background thread."""
+    """Run the full pulse pipeline in a background thread. Only one run at a time."""
+    import traceback as tb
+
+    # Atomic lock -- prevents duplicate runs from scheduler + manual trigger or 2 workers
+    if not _pulse_lock.acquire(blocking=False):
+        logger.warning("[pulse] Skipping -- another pulse run is already in progress")
+        return
+
+    try:
+        return _pulse_run_inner(days, dry_run)
+    finally:
+        _pulse_lock.release()
+
+
+def _pulse_run_inner(days, dry_run):
+    """Inner pulse runner (called with lock held)."""
     import traceback as tb
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     status = {"run_id": run_id, "phase": "starting", "dry_run": dry_run, "days": days,
@@ -2868,7 +2886,14 @@ def pulse_trigger():
     days = int(request.args.get("days", PULSE_LOOKBACK_DAYS))
     dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
 
-    # Check if already running
+    # Check if already running (thread lock + status file)
+    if _pulse_lock.locked():
+        try:
+            with open(PULSE_STATUS_FILE) as f:
+                current = json.load(f)
+        except Exception:
+            current = {"phase": "running"}
+        return jsonify({"status": "already_running", "current": current}), 409
     try:
         if os.path.exists(PULSE_STATUS_FILE):
             with open(PULSE_STATUS_FILE) as f:
@@ -3466,7 +3491,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.11.4-monday-schedule", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.11.5-fix-duplicate-email", "deployed": "2026-03-12"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3498,7 +3523,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.11.4-monday-schedule", "steps": {}}
+    results = {"version": "2.11.5-fix-duplicate-email", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4204,12 +4229,45 @@ def start_scheduler():
 
 
 # Start background services for gunicorn (module-level, not just __main__)
+# Use a file lock so only ONE gunicorn worker starts the scheduler,
+# preventing duplicate cron jobs (e.g., 2 pulse emails).
 _start_lock = _threading.Lock()
+_SCHEDULER_LOCK_FILE = os.path.join(DATA_DIR, ".scheduler.lock")
+
+
 def _start_background_services():
     with _start_lock:
+        # File-based lock: only first worker to grab this file starts scheduler
+        try:
+            fd = os.open(_SCHEDULER_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            logger.info(f"[scheduler] This worker (pid={os.getpid()}) owns the scheduler lock")
+        except FileExistsError:
+            # Another worker already owns the scheduler -- check if it is still alive
+            try:
+                with open(_SCHEDULER_LOCK_FILE) as f:
+                    old_pid = int(f.read().strip())
+                # On Linux/Railway, check if pid is alive
+                os.kill(old_pid, 0)
+                logger.info(f"[scheduler] Scheduler owned by pid={old_pid} (alive) -- skipping")
+                return
+            except (OSError, ValueError):
+                # Old pid is dead -- reclaim
+                logger.info(f"[scheduler] Reclaiming stale scheduler lock")
+                try:
+                    os.unlink(_SCHEDULER_LOCK_FILE)
+                    fd = os.open(_SCHEDULER_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.write(fd, str(os.getpid()).encode())
+                    os.close(fd)
+                except Exception:
+                    logger.warning("[scheduler] Failed to reclaim lock, skipping")
+                    return
+
         start_scheduler()
         if ASANA_PROJECT_GID and MS_GRAPH_CLIENT_ID:
             start_todo_poller()
+
 
 _start_background_services()
 
