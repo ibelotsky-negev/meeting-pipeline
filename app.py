@@ -106,6 +106,35 @@ if not TEAM_MEMBER_NAMES:
 TEAM_MEMBERS_LIST = [{"email": e, "name": n} for e, n in sorted(TEAM_MEMBER_NAMES.items(), key=lambda x: x[1])]
 logger.info(f"Team members for UI: {[m['name'] for m in TEAM_MEMBERS_LIST]}")
 
+# Email alias map: alternate emails -> canonical @negevlabs.com email
+# People use multiple emails across Ariadne Bio, Negev Cap, etc.
+# All lookups (Asana, HubSpot, dropdown) should resolve to the canonical email.
+EMAIL_ALIAS_MAP = {
+    "shlomi@ariadnebio.com": "shlomi@negevlabs.com",
+    "shlomi@negevcap.com": "shlomi@negevlabs.com",
+    "ka@ariadnebio.com": "ka@negevlabs.com",
+    "kostia@negevcap.com": "ka@negevlabs.com",
+    "dan@ariadnebio.com": "dan@negevlabs.com",
+    "bk@ariadnebio.com": "bk@negevlabs.com",
+}
+# Also load from env var for runtime updates without redeploy
+EMAIL_ALIAS_MAP_RAW = os.environ.get("EMAIL_ALIAS_MAP", "")
+if EMAIL_ALIAS_MAP_RAW:
+    try:
+        EMAIL_ALIAS_MAP.update(json.loads(EMAIL_ALIAS_MAP_RAW))
+    except (json.JSONDecodeError, TypeError):
+        pass
+logger.info(f"Email alias map: {len(EMAIL_ALIAS_MAP)} entries")
+
+
+def normalize_team_email(email: str) -> str:
+    """Resolve alternate emails to canonical @negevlabs.com email."""
+    if not email:
+        return email
+    email_lower = email.strip().lower()
+    return EMAIL_ALIAS_MAP.get(email_lower, email_lower)
+
+
 # Track processed transcripts and pending approvals
 # Railway volume mount: attach a volume at /data for persistence across deploys
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
@@ -1632,6 +1661,8 @@ def resolve_hubspot_owner(organizer_email: str) -> str:
     Priority: HUBSPOT_OWNER_MAP   HubSpot API lookup   HUBSPOT_OWNER_ID fallback."""
     if not organizer_email:
         return HUBSPOT_OWNER_ID
+    # Normalize alias emails to canonical @negevlabs.com
+    organizer_email = normalize_team_email(organizer_email)
 
     # Check static map first (fast, no API call)
     if organizer_email in HUBSPOT_OWNER_MAP:
@@ -2323,6 +2354,16 @@ def process_transcript_phase1(transcript: dict) -> str:
     if organizer_email != raw_organizer:
         logger.info(f"[phase1] Organizer resolved: {raw_organizer} -> {organizer_email}")
 
+    # Normalize owner emails in action items to canonical team emails
+    # e.g. shlomi@ariadnebio.com -> shlomi@negevlabs.com
+    for item in intelligence.get("action_items", []):
+        raw_email = item.get("owner_email", "")
+        if raw_email:
+            normalized = normalize_team_email(raw_email)
+            if normalized != raw_email:
+                logger.info(f"[phase1] Normalized owner_email: {raw_email} -> {normalized}")
+            item["owner_email"] = normalized
+
     # Create approval record
     approval_id = str(uuid.uuid4())[:8]
     approval = {
@@ -2402,6 +2443,9 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
         hubspot_due, asana_due, due_display = resolve_due_date(item, meeting_date)
         create_in = item.get("create_in", "both").lower()
         owner_email = item.get("owner_email", "") or organizer_email
+        # Normalize in case approve handler or manual edit reintroduced an alias
+        owner_email = normalize_team_email(owner_email)
+        logger.info(f"[execute] Task '{item.get('task', '')[:50]}' owner_email={owner_email}")
 
         # HubSpot task (for external/investor-facing tasks)
         if create_in in ("hubspot", "both"):
@@ -2421,8 +2465,13 @@ def execute_approved_actions(approval_id: str, approved_data: dict) -> dict:
                 assignee_gid = None
                 if owner_email:
                     assignee_gid = find_asana_user_by_email(owner_email)
+                    if not assignee_gid:
+                        logger.warning(f"[execute] Asana user lookup FAILED for '{owner_email}', falling back to organizer")
                 if not assignee_gid and organizer_email:
                     assignee_gid = find_asana_user_by_email(organizer_email)
+                    logger.info(f"[execute] Asana fallback to organizer: {organizer_email} -> gid={assignee_gid}")
+                else:
+                    logger.info(f"[execute] Asana assigned to owner: {owner_email} -> gid={assignee_gid}")
                 asana_task = create_asana_task(item["task"], notes, asana_due, assignee_gid)
                 results["actions"].append(f"[OK] Asana task: {item['task'][:60]} (due {due_display})")
                 # Sync new Asana task to Microsoft To-Do
@@ -2586,7 +2635,7 @@ REVIEW_TEMPLATE = """
                                         {% for member in team_members %}
                                         <option value="{{ member.email }}" {{ 'selected' if member.email == item.get('owner_email', '') or member.name == item.get('owner', '') }}>{{ member.name }}</option>
                                         {% endfor %}
-                                        {% if item.get('owner_email') and item.get('owner_email') not in team_members|map(attribute='email')|list %}
+                                        {% if item.get('owner_email') and item.get('owner_email') not in team_members|map(attribute='email')|list and item.get('owner', '') not in team_members|map(attribute='name')|list %}
                                         <option value="{{ item.get('owner_email', '') }}" selected>{{ item.get('owner', item.get('owner_email', 'Unknown')) }}</option>
                                         {% endif %}
                                     </select>
@@ -3491,7 +3540,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.11.5-fix-duplicate-email", "deployed": "2026-03-12"})
+    return jsonify({"version": "2.12.0-fix-owner-assignment", "deployed": "2026-03-19"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3523,7 +3572,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.11.5-fix-duplicate-email", "steps": {}}
+    results = {"version": "2.12.0-fix-owner-assignment", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -3559,6 +3608,24 @@ def test_pipeline():
                 results["steps"]["todo_api"] = {"status": "fail", "error": str(te)}
         else:
             results["steps"]["todo_api"] = {"status": "skip", "reason": "MS_GRAPH_CLIENT_ID not set"}
+
+        # Step 5: Email alias normalization
+        alias_tests = [
+            ("shlomi@ariadnebio.com", "shlomi@negevlabs.com"),
+            ("ka@ariadnebio.com", "ka@negevlabs.com"),
+            ("dan@ariadnebio.com", "dan@negevlabs.com"),
+            ("bk@negevlabs.com", "bk@negevlabs.com"),
+            ("unknown@external.com", "unknown@external.com"),
+        ]
+        alias_ok = True
+        for test_in, expected in alias_tests:
+            actual = normalize_team_email(test_in)
+            if actual != expected:
+                results["steps"]["email_aliases"] = {"status": "fail", "input": test_in, "expected": expected, "got": actual}
+                alias_ok = False
+                break
+        if alias_ok:
+            results["steps"]["email_aliases"] = {"status": "ok", "tested": len(alias_tests)}
 
         results["status"] = "pass"
         return jsonify(results), 200
