@@ -3540,7 +3540,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.12.0-fix-owner-assignment", "deployed": "2026-03-19"})
+    return jsonify({"version": "2.12.1-fix-pulse-scheduler", "deployed": "2026-03-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4284,22 +4284,31 @@ def start_scheduler():
     scheduler.add_job(
         pulse_weekly_run,
         trigger="cron",
-        day_of_week="mon",
-        hour=8,
+        day_of_week="sun",
+        hour=22,
         minute=0,
-        timezone="Europe/Berlin",
+        timezone="Asia/Jerusalem",
         id="weekly_pulse",
         replace_existing=True,
     )
     scheduler.start()
-    logger.info(f"Scheduler started: polling every {POLL_INTERVAL_MINUTES} minutes, weekly pulse Monday 08:00 CET")
+    logger.info(f"Scheduler started: polling every {POLL_INTERVAL_MINUTES} minutes, weekly pulse Sunday 22:00 IST")
 
 
 # Start background services for gunicorn (module-level, not just __main__)
-# Use a file lock so only ONE gunicorn worker starts the scheduler,
-# preventing duplicate cron jobs (e.g., 2 pulse emails).
+# With --workers 1 in Procfile, the file lock is a safety net against accidental
+# multi-worker deploys.  atexit removes the lock so redeploys start clean.
+import atexit as _atexit
+
 _start_lock = _threading.Lock()
 _SCHEDULER_LOCK_FILE = os.path.join(DATA_DIR, ".scheduler.lock")
+
+
+def _cleanup_scheduler_lock():
+    try:
+        os.unlink(_SCHEDULER_LOCK_FILE)
+    except OSError:
+        pass
 
 
 def _start_background_services():
@@ -4315,13 +4324,12 @@ def _start_background_services():
             try:
                 with open(_SCHEDULER_LOCK_FILE) as f:
                     old_pid = int(f.read().strip())
-                # On Linux/Railway, check if pid is alive
                 os.kill(old_pid, 0)
                 logger.info(f"[scheduler] Scheduler owned by pid={old_pid} (alive) -- skipping")
                 return
             except (OSError, ValueError):
                 # Old pid is dead -- reclaim
-                logger.info(f"[scheduler] Reclaiming stale scheduler lock")
+                logger.info("[scheduler] Reclaiming stale scheduler lock")
                 try:
                     os.unlink(_SCHEDULER_LOCK_FILE)
                     fd = os.open(_SCHEDULER_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -4331,6 +4339,7 @@ def _start_background_services():
                     logger.warning("[scheduler] Failed to reclaim lock, skipping")
                     return
 
+        _atexit.register(_cleanup_scheduler_lock)
         start_scheduler()
         if ASANA_PROJECT_GID and MS_GRAPH_CLIENT_ID:
             start_todo_poller()
