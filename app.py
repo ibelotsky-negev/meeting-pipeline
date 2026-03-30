@@ -4357,50 +4357,20 @@ def start_scheduler():
 
 
 # Start background services for gunicorn (module-level, not just __main__)
-# With --workers 1 in Procfile, the file lock is a safety net against accidental
-# multi-worker deploys.  atexit removes the lock so redeploys start clean.
-import atexit as _atexit
+# With --workers 1 in Procfile, a threading lock is sufficient to prevent
+# double-init.  The old file-based lock on /data/ caused failures because
+# Railway's persistent volume retained stale PIDs across container restarts.
 
 _start_lock = _threading.Lock()
-_SCHEDULER_LOCK_FILE = os.path.join(DATA_DIR, ".scheduler.lock")
-
-
-def _cleanup_scheduler_lock():
-    try:
-        os.unlink(_SCHEDULER_LOCK_FILE)
-    except OSError:
-        pass
+_started = False
 
 
 def _start_background_services():
+    global _started
     with _start_lock:
-        # File-based lock: only first worker to grab this file starts scheduler
-        try:
-            fd = os.open(_SCHEDULER_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            logger.info(f"[scheduler] This worker (pid={os.getpid()}) owns the scheduler lock")
-        except FileExistsError:
-            # Another worker already owns the scheduler -- check if it is still alive
-            try:
-                with open(_SCHEDULER_LOCK_FILE) as f:
-                    old_pid = int(f.read().strip())
-                os.kill(old_pid, 0)
-                logger.info(f"[scheduler] Scheduler owned by pid={old_pid} (alive) -- skipping")
-                return
-            except (OSError, ValueError):
-                # Old pid is dead -- reclaim
-                logger.info("[scheduler] Reclaiming stale scheduler lock")
-                try:
-                    os.unlink(_SCHEDULER_LOCK_FILE)
-                    fd = os.open(_SCHEDULER_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                    os.write(fd, str(os.getpid()).encode())
-                    os.close(fd)
-                except Exception:
-                    logger.warning("[scheduler] Failed to reclaim lock, skipping")
-                    return
-
-        _atexit.register(_cleanup_scheduler_lock)
+        if _started:
+            return
+        _started = True
         start_scheduler()
         if ASANA_PROJECT_GID and MS_GRAPH_CLIENT_ID:
             start_todo_poller()
