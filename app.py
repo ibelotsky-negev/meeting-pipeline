@@ -3115,6 +3115,60 @@ def pulse_history():
     return jsonify({"reports": reports, "count": len(reports)})
 
 
+@app.route("/pulse/scheduler", methods=["GET"])
+def pulse_scheduler_info():
+    """Diagnostic: show scheduler state and registered jobs."""
+    if _scheduler is None:
+        return jsonify({"error": "Scheduler not initialized"}), 503
+    jobs = _scheduler.get_jobs()
+    return jsonify({
+        "scheduler_running": _scheduler.running,
+        "jobs": [
+            {
+                "id": j.id,
+                "next_run": str(j.next_run_time),
+                "trigger": str(j.trigger),
+            }
+            for j in jobs
+        ],
+        "workers": os.environ.get("WEB_CONCURRENCY", "1"),
+        "pid": os.getpid(),
+    })
+
+
+@app.route("/pulse/heartbeat", methods=["GET"])
+def pulse_heartbeat():
+    """Self-healing check: verify weekly_pulse job exists, re-register if missing."""
+    if _scheduler is None or not _scheduler.running:
+        return jsonify({"status": "scheduler_down", "scheduler_running": False}), 503
+
+    job = _scheduler.get_job("weekly_pulse")
+    if job is None:
+        # Job disappeared — re-register
+        _scheduler.add_job(
+            pulse_weekly_run,
+            trigger="cron",
+            day_of_week="sun",
+            hour=19,
+            minute=0,
+            id="weekly_pulse",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        job = _scheduler.get_job("weekly_pulse")
+        status = "re-registered"
+        logger.warning("[scheduler] weekly_pulse job was missing — re-registered via heartbeat")
+    else:
+        status = "healthy"
+
+    return jsonify({
+        "status": status,
+        "scheduler_running": _scheduler.running,
+        "next_run": str(job.next_run_time) if job else None,
+        "now_utc": datetime.utcnow().isoformat(),
+    })
+
+
 @app.route("/briefing", methods=["GET"])
 def view_briefing():
     """View current briefing book content."""
@@ -3540,7 +3594,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.12.1-fix-pulse-scheduler", "deployed": "2026-03-23"})
+    return jsonify({"version": "2.12.2-fix-scheduler-persistent", "deployed": "2026-03-30"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3572,7 +3626,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.12.0-fix-owner-assignment", "steps": {}}
+    results = {"version": "2.12.2-fix-scheduler-persistent", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4278,21 +4332,28 @@ def pulse_weekly_run():
             logger.error("[pulse] Even the error notification email failed", exc_info=True)
 
 
+_scheduler = None  # module-level so diagnostic endpoints can inspect it
+
+
 def start_scheduler():
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(poll_and_process, "interval", minutes=POLL_INTERVAL_MINUTES)
-    scheduler.add_job(
+    global _scheduler
+    _scheduler = BackgroundScheduler()
+    _scheduler.add_job(poll_and_process, "interval", minutes=POLL_INTERVAL_MINUTES)
+    _scheduler.add_job(
         pulse_weekly_run,
         trigger="cron",
         day_of_week="sun",
-        hour=22,
+        hour=19,            # 19:00 UTC = 22:00 Israel
         minute=0,
-        timezone="Asia/Jerusalem",
         id="weekly_pulse",
         replace_existing=True,
+        misfire_grace_time=3600,  # 1-hour window to fire if exact time was missed
     )
-    scheduler.start()
-    logger.info(f"Scheduler started: polling every {POLL_INTERVAL_MINUTES} minutes, weekly pulse Sunday 22:00 IST")
+    _scheduler.start()
+    pulse_job = _scheduler.get_job("weekly_pulse")
+    next_run = pulse_job.next_run_time if pulse_job else "NOT REGISTERED"
+    logger.info(f"[scheduler] Started: polling every {POLL_INTERVAL_MINUTES}m, weekly pulse Sunday 19:00 UTC")
+    logger.info(f"[scheduler] Weekly pulse job registered: next run = {next_run}")
 
 
 # Start background services for gunicorn (module-level, not just __main__)
