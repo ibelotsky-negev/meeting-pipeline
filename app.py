@@ -2777,6 +2777,8 @@ RESULT_TEMPLATE = """
 # ======================================================================
 
 PULSE_STATUS_FILE = os.path.join(DATA_DIR, "pulse_status.json")
+PULSE_LOCK_FILE = os.path.join(DATA_DIR, "pulse_lock.json")
+PULSE_LOCK_DURATION = 6 * 3600  # 6 hours -- prevents a second run within 6h of a completed one
 
 
 def _pulse_save_status(status_data):
@@ -2786,6 +2788,47 @@ def _pulse_save_status(status_data):
             json.dump(status_data, f, indent=2, default=str)
     except Exception as e:
         logger.error(f"[pulse] Failed to save status: {e}")
+
+
+def _read_pulse_lock():
+    """Return the current pulse lock contents, or None if absent/corrupt."""
+    try:
+        with open(PULSE_LOCK_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def pulse_can_run():
+    """Check if enough time has passed since the last completed pulse run.
+
+    Persistent file-based guard (/data/pulse_lock.json survives container restarts).
+    Prevents duplicate runs caused by APScheduler misfire_grace_time + restart,
+    heartbeat re-registration, or stale browser tabs hitting /pulse/trigger.
+    """
+    lock_data = _read_pulse_lock()
+    if lock_data:
+        last_completed = lock_data.get("completed_at", 0)
+        elapsed = time.time() - last_completed
+        if elapsed < PULSE_LOCK_DURATION:
+            logger.info(
+                f"[pulse] Skipping -- last run completed {elapsed/60:.0f}min ago "
+                f"(lock: {PULSE_LOCK_DURATION/3600:.0f}h)"
+            )
+            return False
+    return True
+
+
+def pulse_set_lock():
+    """Record that a pulse run just completed, to block duplicates for PULSE_LOCK_DURATION."""
+    try:
+        with open(PULSE_LOCK_FILE, "w") as f:
+            json.dump({
+                "completed_at": time.time(),
+                "run_id": datetime.utcnow().strftime("%Y%m%d-%H%M%S"),
+            }, f)
+    except Exception as e:
+        logger.error(f"[pulse] Failed to write lock file: {e}")
 
 
 _pulse_lock = _threading.Lock()
@@ -2934,6 +2977,16 @@ def pulse_trigger():
     import threading
     days = int(request.args.get("days", PULSE_LOOKBACK_DAYS))
     dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    force = request.args.get("force", "").lower() in ("true", "1", "yes")
+
+    # Dedupe: refuse if a completed run is still within the lock window.
+    # dry_run bypasses the lock (no email sent, so no duplicate-email risk).
+    if not dry_run and not force and not pulse_can_run():
+        return jsonify({
+            "status": "skipped",
+            "reason": "Pulse already ran recently. Use ?force=true to override.",
+            "lock": _read_pulse_lock(),
+        }), 200
 
     # Check if already running (thread lock + status file)
     if _pulse_lock.locked():
@@ -3138,34 +3191,21 @@ def pulse_scheduler_info():
 
 @app.route("/pulse/heartbeat", methods=["GET"])
 def pulse_heartbeat():
-    """Self-healing check: verify weekly_pulse job exists, re-register if missing."""
+    """Report-only health check. Does NOT re-register the job -- that path
+    could cause double-fires by recreating a job that APScheduler then treats
+    as having a missed run within misfire_grace_time. If the job is genuinely
+    missing, restart the container; start_scheduler() re-registers on boot.
+    """
     if _scheduler is None or not _scheduler.running:
         return jsonify({"status": "scheduler_down", "scheduler_running": False}), 503
 
     job = _scheduler.get_job("weekly_pulse")
-    if job is None:
-        # Job disappeared — re-register
-        _scheduler.add_job(
-            pulse_weekly_run,
-            trigger="cron",
-            day_of_week="sun",
-            hour=19,
-            minute=0,
-            id="weekly_pulse",
-            replace_existing=True,
-            misfire_grace_time=3600,
-        )
-        job = _scheduler.get_job("weekly_pulse")
-        status = "re-registered"
-        logger.warning("[scheduler] weekly_pulse job was missing — re-registered via heartbeat")
-    else:
-        status = "healthy"
-
     return jsonify({
-        "status": status,
+        "status": "healthy" if job else "job_missing",
         "scheduler_running": _scheduler.running,
         "next_run": str(job.next_run_time) if job else None,
         "now_utc": datetime.utcnow().isoformat(),
+        "last_pulse_lock": _read_pulse_lock(),
     })
 
 
@@ -3594,7 +3634,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.12.2-fix-scheduler-persistent", "deployed": "2026-03-30"})
+    return jsonify({"version": "2.12.3-fix-duplicate-pulse", "deployed": "2026-03-30"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3626,7 +3666,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.12.2-fix-scheduler-persistent", "steps": {}}
+    results = {"version": "2.12.3-fix-duplicate-pulse", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4304,10 +4344,17 @@ def poll_and_process():
 
 def pulse_weekly_run():
     """Scheduled weekly pulse. Uses same background runner as /pulse/trigger."""
+    # Persistent dedupe guard -- survives container restarts (the in-memory
+    # _pulse_lock does not). This blocks double-fires from misfire_grace_time,
+    # heartbeat re-registration, or external health checks.
+    if not pulse_can_run():
+        return
     try:
         logger.info("[pulse] Starting scheduled weekly pulse")
         _pulse_run_background(days=PULSE_LOOKBACK_DAYS, dry_run=False)
-        logger.info("[pulse] Weekly pulse complete")
+        # Only set lock after a successful run so failures can be retried.
+        pulse_set_lock()
+        logger.info("[pulse] Weekly pulse complete -- lock set")
     except Exception as e:
         logger.error(f"[pulse] Failed: {e}", exc_info=True)
         # Send failure notification
