@@ -831,19 +831,31 @@ Return a JSON object with exactly this structure:
 
 RULES:
 - Use the BUSINESS CONTEXT above to understand what matters in this meeting and extract high-value action items
-- Distinguish internal team members (@negevlabs.com, @ariadnebio.com, etc.) from external contacts
+- Internal domains are: {', '.join(INTERNAL_DOMAINS)}. Treat any participant whose email domain is in this list as internal; everyone else is external.
 - For investor/BD meetings: capture interest signals, objections, and next steps that matter for deal flow
 - For portfolio company meetings: capture strategic decisions, blockers, and deliverables
 - Action items should be specific, actionable, and reflect what was actually committed to in the conversation   not generic tasks
-- The follow-up email is FROM the organizer TO the other meeting participants (NOT to the organizer themselves)
-- to_recipients must NEVER include the organizer ({transcript.get('organizer_email', '')}). The email is sent BY the organizer, not TO them.
-- to_recipients should include the key external participants identified from the transcript speakers and discussion
-- If participant emails are not known, use "unknown@placeholder.com" and include their name so the organizer can fix it in the review UI
-- The email greeting should address the recipient(s) by name (e.g., "Hi Sam"), NOT the organizer
-- from_email must be the meeting organizer's email
-- body_html should use simple HTML (<p>, <br>, <strong>) for Outlook rendering
-- Identify ALL external contacts (non-organizer attendees) from speaker names in the transcript
-- internal_lead_email: When the organizer is external (not @negevlabs.com, @ariadnebio.com, @negevcap.com), identify which internal team member was MOST ACTIVE on the call (spoke most, drove the discussion). Set their email as internal_lead_email. If organizer is internal, set to empty string ""
+
+FOLLOW-UP EMAIL RULES:
+- ALWAYS return a non-empty follow_up_email object. Never return an empty object or omit the key, regardless of whether the meeting is internal-only or has external contacts.
+- The follow-up email is FROM the organizer ({transcript.get('organizer_email', '')}) TO the other meeting participants (NEVER include the organizer in to_recipients).
+- from_email must be the meeting organizer's email.
+- body_html should use simple HTML (<p>, <br>, <strong>, <ul>, <li>) for Outlook rendering. body_text is the plain-text equivalent.
+- Choose ONE of the two modes below based on whether any external participant is present:
+
+  EXTERNAL MODE (at least one participant is external):
+    * to_recipients = the key external participant(s) identified from the transcript speakers and discussion.
+    * subject = professional follow-up subject, e.g. "Following up -- <topic>".
+    * body = warm, professional follow-up addressed to the external recipient(s) by name (e.g. "Hi Sam"). Recap what was discussed, restate next steps, and include a clear CTA.
+    * If a participant email is not known, use "unknown@placeholder.com" with their name so the organizer can fix it in the review UI.
+
+  INTERNAL MODE (all participants are internal):
+    * to_recipients = EVERY meeting participant whose email is not the organizer's. Include all internal teammates on the call.
+    * subject = "{transcript.get('title', 'Meeting')} -- recap and action items" (literal two-hyphen separator, ASCII only).
+    * body = terse, action-oriented recap for teammates. Open with the recap (no "Hi team" pleasantry). Format: one short paragraph summarizing key decisions, then a bulleted list of action items each prefixed with the owner's name (e.g. "- Shlomi: finalize DD memo by Fri"). Direct tone. Active voice. Banned-phrase list still applies.
+
+- Identify ALL contacts (non-organizer attendees) from speaker names in the transcript, internal or external.
+- internal_lead_email: When the organizer is external, identify which internal team member was MOST ACTIVE on the call (spoke most, drove the discussion). Set their email as internal_lead_email. If organizer is internal, set to empty string "".
 - Rate interest level based on language, engagement, and commitments made
 - Action items should be specific and assignable
 - For each action item, set owner_email to the person's email if known from participants or organizer info. If the owner is the organizer, use their email. If unknown, leave as empty string.
@@ -882,7 +894,70 @@ REQUIRED:
     if response_text.startswith("```"):
         response_text = response_text.split("\n", 1)[1]
         response_text = response_text.rsplit("```", 1)[0]
-    return json.loads(response_text)
+    intelligence = json.loads(response_text)
+
+    # Safety net: always ensure follow_up_email is populated so the review
+    # page has a draft to show. Fires when Claude returns empty/missing data.
+    organizer_email = transcript.get("organizer_email", "") or ""
+    title = transcript.get("title", "Meeting") or "Meeting"
+    participants = transcript.get("participants") or []
+    follow_up = intelligence.get("follow_up_email") or {}
+
+    others = [
+        p for p in participants
+        if p and "@" in p and p.lower() != organizer_email.lower()
+    ]
+
+    if not follow_up.get("to_recipients"):
+        follow_up["to_recipients"] = [
+            {"name": p.split("@")[0], "email": p} for p in others
+        ]
+    if not follow_up.get("from_email"):
+        follow_up["from_email"] = organizer_email
+    if not follow_up.get("subject"):
+        follow_up["subject"] = f"{title} -- recap and action items"
+    if not follow_up.get("body_text"):
+        short_summary = (transcript.get("summary") or {}).get("short_summary", "") or ""
+        action_items = intelligence.get("action_items") or []
+        bullet_lines = []
+        for item in action_items:
+            owner = item.get("owner") or item.get("owner_email") or "Unassigned"
+            task_text = item.get("task", "")
+            if task_text:
+                bullet_lines.append(f"- {owner}: {task_text}")
+        body_lines = []
+        if short_summary:
+            body_lines.append(short_summary.strip())
+        if bullet_lines:
+            if body_lines:
+                body_lines.append("")
+            body_lines.append("Action items:")
+            body_lines.extend(bullet_lines)
+        follow_up["body_text"] = "\n".join(body_lines) if body_lines else f"Recap of {title}."
+    if not follow_up.get("body_html"):
+        html_lines = []
+        text_lines = follow_up["body_text"].split("\n")
+        in_list = False
+        for line in text_lines:
+            if line.startswith("- "):
+                if not in_list:
+                    html_lines.append("<ul>")
+                    in_list = True
+                html_lines.append(f"<li>{line[2:]}</li>")
+            else:
+                if in_list:
+                    html_lines.append("</ul>")
+                    in_list = False
+                if line.strip():
+                    html_lines.append(f"<p>{line}</p>")
+                else:
+                    html_lines.append("<br>")
+        if in_list:
+            html_lines.append("</ul>")
+        follow_up["body_html"] = "".join(html_lines)
+
+    intelligence["follow_up_email"] = follow_up
+    return intelligence
 
 
 # ======================================================================
@@ -3634,7 +3709,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.12.3-fix-duplicate-pulse", "deployed": "2026-03-30"})
+    return jsonify({"version": "2.12.4-always-draft", "deployed": "2026-04-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3666,7 +3741,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.12.3-fix-duplicate-pulse", "steps": {}}
+    results = {"version": "2.12.4-always-draft", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
