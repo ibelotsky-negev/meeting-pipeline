@@ -58,6 +58,36 @@ def to_hubspot_ms(date_str):
         dt = dt.replace(tzinfo=timezone.utc)
     return str(int(dt.timestamp() * 1000))
 
+
+def to_graph_datetime(date_str):
+    """Convert date or ISO datetime string to Microsoft Graph dateTime
+    format (ISO 8601 with seconds, no timezone suffix -- Graph pairs it
+    with a separate timeZone field).
+
+    Handles: '2026-04-28', '2026-04-28T17:00:00Z',
+             '2026-04-28T17:00:00+00:00', None, empty strings.
+    Returns None if input is invalid or empty.
+
+    Output format: 'YYYY-MM-DDTHH:MM:SS' (no Z, no offset).
+    Date-only inputs default to T00:00:00.
+    """
+    if not date_str:
+        return None
+    s = str(date_str).strip()
+    if not s:
+        return None
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d")
+        except ValueError:
+            return None
+    # Graph wants naive ISO format paired with a timeZone field
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
 # API Keys (set via environment variables)
 FIREFLIES_API_KEY = os.environ["FIREFLIES_API_KEY"]
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
@@ -2053,7 +2083,12 @@ def create_todo_task(title: str, user_email: str, notes: str = None, due_date: s
     if body_parts:
         body["body"] = {"content": "\n\n".join(body_parts), "contentType": "text"}
     if due_date:
-        body["dueDateTime"] = {"dateTime": f"{due_date}T00:00:00", "timeZone": "UTC"}
+        graph_dt = to_graph_datetime(due_date)
+        logger.info(f"[todo_task] due_date input='{due_date}' graph_dt='{graph_dt}'")
+        if graph_dt:
+            body["dueDateTime"] = {"dateTime": graph_dt, "timeZone": "UTC"}
+        else:
+            logger.warning(f"[todo_task] invalid due_date='{due_date}', skipping date")
     body["status"] = "notStarted"
 
     url = f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks"
@@ -2104,7 +2139,12 @@ def update_todo_task(todo_task_id: str, asana_gid: str = None, title: str = None
     if notes:
         body["body"] = {"content": notes, "contentType": "text"}
     if due_date:
-        body["dueDateTime"] = {"dateTime": f"{due_date}T00:00:00", "timeZone": "UTC"}
+        graph_dt = to_graph_datetime(due_date)
+        logger.info(f"[todo_task] due_date input='{due_date}' graph_dt='{graph_dt}'")
+        if graph_dt:
+            body["dueDateTime"] = {"dateTime": graph_dt, "timeZone": "UTC"}
+        else:
+            logger.warning(f"[todo_task] invalid due_date='{due_date}', skipping date")
     if not body:
         return
     url = f"{MS_GRAPH_BASE}/users/{user_email}/todo/lists/{list_id}/tasks/{todo_task_id}"
@@ -3738,7 +3778,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.12.5-iso-date-fix", "deployed": "2026-04-27"})
+    return jsonify({"version": "2.12.6-todo-iso-fix", "deployed": "2026-04-27"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3770,7 +3810,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.12.5-iso-date-fix", "steps": {}}
+    results = {"version": "2.12.6-todo-iso-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
