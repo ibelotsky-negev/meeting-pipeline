@@ -31,6 +31,33 @@ from apscheduler.schedulers.background import BackgroundScheduler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+
+def to_hubspot_ms(date_str):
+    """Convert date or ISO datetime string to HubSpot Unix ms (as string).
+    Handles: '2026-04-28', '2026-04-28T17:00:00Z',
+             '2026-04-28T17:00:00+00:00', None, empty strings.
+    Returns None if input is invalid or empty.
+    HubSpot requires timestamps as Unix ms strings (e.g. '1772631000000').
+    """
+    if not date_str:
+        return None
+    s = str(date_str).strip()
+    if not s:
+        return None
+    # Normalize trailing Z to +00:00 for fromisoformat compatibility
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return str(int(dt.timestamp() * 1000))
+
 # API Keys (set via environment variables)
 FIREFLIES_API_KEY = os.environ["FIREFLIES_API_KEY"]
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
@@ -1883,11 +1910,13 @@ def log_hubspot_meeting(contact_id: str, meeting_body: str, meeting_date: str,
 
 
 def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str, organizer_email: str = "") -> dict:
+    ms = to_hubspot_ms(due_date) or str(int(datetime.now(timezone.utc).timestamp() * 1000))
+    logger.info(f"[hubspot_task] due_date input='{due_date}' converted='{ms}'")
     data = {
         "properties": {
             "hs_task_subject": subject, "hs_task_body": body,
             "hs_task_status": "NOT_STARTED", "hs_task_priority": "HIGH",
-            "hs_timestamp": int(datetime.strptime(due_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000) if due_date else int(datetime.now(timezone.utc).timestamp() * 1000),
+            "hs_timestamp": ms,
         },
         "associations": [{"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 204}]}],
     }
@@ -3709,7 +3738,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.12.4-always-draft", "deployed": "2026-04-23"})
+    return jsonify({"version": "2.12.5-iso-date-fix", "deployed": "2026-04-27"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3741,7 +3770,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.12.4-always-draft", "steps": {}}
+    results = {"version": "2.12.5-iso-date-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
