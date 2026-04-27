@@ -2922,7 +2922,9 @@ RESULT_TEMPLATE = """
 
 PULSE_STATUS_FILE = os.path.join(DATA_DIR, "pulse_status.json")
 PULSE_LOCK_FILE = os.path.join(DATA_DIR, "pulse_lock.json")
+PULSE_RUNNING_LOCK_FILE = os.path.join(DATA_DIR, "pulse_running.lock")
 PULSE_LOCK_DURATION = 6 * 3600  # 6 hours -- prevents a second run within 6h of a completed one
+PULSE_RUNNING_LOCK_MAX_AGE = 90 * 60  # treat running lock older than 90min as orphaned (max run ~5min)
 
 
 def _pulse_save_status(status_data):
@@ -2978,19 +2980,71 @@ def pulse_set_lock():
 _pulse_lock = _threading.Lock()
 
 
+def _acquire_running_lock():
+    """Atomically claim the cross-process running lock.
+
+    Uses O_CREAT|O_EXCL so only one process succeeds even if 2 gunicorn workers
+    fire pulse_weekly_run at the same instant. Stale locks (older than
+    PULSE_RUNNING_LOCK_MAX_AGE) are reclaimed automatically.
+
+    Returns True if acquired, False if another run is already in progress.
+    """
+    try:
+        existing_age = time.time() - os.path.getmtime(PULSE_RUNNING_LOCK_FILE)
+        if existing_age > PULSE_RUNNING_LOCK_MAX_AGE:
+            logger.warning(f"[pulse] Removing stale running lock (age {existing_age/60:.0f}min)")
+            try:
+                os.remove(PULSE_RUNNING_LOCK_FILE)
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        pass
+
+    try:
+        fd = os.open(PULSE_RUNNING_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        payload = json.dumps({
+            "pid": os.getpid(),
+            "started_at": time.time(),
+            "run_id": datetime.utcnow().strftime("%Y%m%d-%H%M%S"),
+        })
+        os.write(fd, payload.encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _release_running_lock():
+    try:
+        os.remove(PULSE_RUNNING_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.error(f"[pulse] Failed to release running lock: {e}")
+
+
 def _pulse_run_background(days, dry_run):
     """Run the full pulse pipeline in a background thread. Only one run at a time."""
     import traceback as tb
 
-    # Atomic lock -- prevents duplicate runs from scheduler + manual trigger or 2 workers
+    # Cross-process atomic lock -- prevents duplicate runs when 2 gunicorn workers
+    # fire pulse_weekly_run simultaneously. The in-process _pulse_lock alone is
+    # not enough because each worker process has its own.
+    if not _acquire_running_lock():
+        logger.warning("[pulse] Skipping -- another pulse run already in progress (cross-process)")
+        return
+
+    # In-process lock for manual trigger + scheduler in the same process.
     if not _pulse_lock.acquire(blocking=False):
-        logger.warning("[pulse] Skipping -- another pulse run is already in progress")
+        logger.warning("[pulse] Skipping -- another pulse run is already in progress (in-process)")
+        _release_running_lock()
         return
 
     try:
         return _pulse_run_inner(days, dry_run)
     finally:
         _pulse_lock.release()
+        _release_running_lock()
 
 
 def _pulse_run_inner(days, dry_run):
@@ -3076,12 +3130,15 @@ def _pulse_run_inner(days, dry_run):
         if not dry_run:
             status["phase"] = "sending email"
             _pulse_save_status(status)
-            try:
-                pulse_send_email(report, start_dt, end_dt)
-                email_sent = True
-            except Exception as e:
-                logger.error(f"[pulse] Email send failed: {e}", exc_info=True)
-                status["email_error"] = str(e)
+            # Guard: even within a single run, ensure pulse_send_email is reached
+            # exactly once. Belt-and-braces alongside the cross-process lock.
+            if not email_sent:
+                try:
+                    pulse_send_email(report, start_dt, end_dt)
+                    email_sent = True
+                except Exception as e:
+                    logger.error(f"[pulse] Email send failed: {e}", exc_info=True)
+                    status["email_error"] = str(e)
 
             status["phase"] = "archiving"
             _pulse_save_status(status)
@@ -3778,7 +3835,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.12.6-todo-iso-fix", "deployed": "2026-04-27"})
+    return jsonify({"version": "2.12.7-fix-double-email", "deployed": "2026-04-28"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3810,7 +3867,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.12.6-todo-iso-fix", "steps": {}}
+    results = {"version": "2.12.7-fix-double-email", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
