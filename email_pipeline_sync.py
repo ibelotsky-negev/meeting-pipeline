@@ -215,12 +215,25 @@ def ledger_connect() -> sqlite3.Connection:
     return conn
 
 
-def ledger_seen(conn: sqlite3.Connection, internet_message_id: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM processed_messages WHERE internet_message_id = ?",
+def ledger_get(conn: sqlite3.Connection, internet_message_id: str):
+    """(outcome, detail) for a processed message, or None if never processed."""
+    return conn.execute(
+        "SELECT outcome, detail FROM processed_messages WHERE internet_message_id = ?",
         (internet_message_id,),
     ).fetchone()
-    return row is not None
+
+
+def ledger_seen(conn: sqlite3.Connection, internet_message_id: str) -> bool:
+    return ledger_get(conn, internet_message_id) is not None
+
+
+def ledger_update_outcome(conn: sqlite3.Connection, internet_message_id: str,
+                          outcome: str, detail: str):
+    conn.execute(
+        "UPDATE processed_messages SET outcome = ?, detail = ? WHERE internet_message_id = ?",
+        (outcome, (detail or "")[:500], internet_message_id),
+    )
+    conn.commit()
 
 
 def ledger_record(conn: sqlite3.Connection, msg: dict, outcome: str, detail: str, run_id: str,
@@ -305,12 +318,26 @@ def batch_read_contacts(contact_ids: list) -> list:
     for i in range(0, len(contact_ids), 100):
         chunk = contact_ids[i:i + 100]
         body = {
-            "properties": ["email", "firstname", "lastname", "company"],
+            "properties": ["email", "hs_additional_emails", "firstname", "lastname", "company"],
             "inputs": [{"id": cid} for cid in chunk],
         }
         result = hubspot_request("POST", "/crm/v3/objects/contacts/batch/read", body)
         results.extend(result.get("results") or [])
     return results
+
+
+def contact_email_addresses(props: dict) -> list:
+    """Primary email plus hs_additional_emails (semicolon-separated).
+    Lowercased, deduped, order preserved (primary first)."""
+    addresses = []
+    primary = (props.get("email") or "").strip().lower()
+    if primary:
+        addresses.append(primary)
+    for extra in (props.get("hs_additional_emails") or "").split(";"):
+        extra = extra.strip().lower()
+        if extra and extra not in addresses:
+            addresses.append(extra)
+    return addresses
 
 
 def build_roster() -> dict:
@@ -333,23 +360,27 @@ def build_roster() -> dict:
             contact_to_deals.setdefault(cid, []).append(deal_id)
 
     roster = {}
+    contact_count = 0
     internal = set(INTERNAL_TEAM_EMAILS)
     for contact in batch_read_contacts(list(contact_to_deals.keys())):
         cid = str(contact.get("id", ""))
         props = contact.get("properties") or {}
-        email = (props.get("email") or "").strip().lower()
-        if not email:
+        # Internal team members associated to deals are not roster contacts
+        addresses = [a for a in contact_email_addresses(props) if a not in internal]
+        if not addresses:
             continue
-        if email in internal:
-            # Internal team members associated to deals are not roster contacts
-            continue
-        name = " ".join(p for p in [props.get("firstname"), props.get("lastname")] if p) or email
-        roster[email] = {
+        name = " ".join(p for p in [props.get("firstname"), props.get("lastname")] if p) or addresses[0]
+        entry = {
             "contact_id": cid,
             "name": name,
             "deals": [deal_info[d] for d in contact_to_deals.get(cid, []) if d in deal_info],
         }
-    logger.info(f"Roster: {len(roster)} contacts with email addresses")
+        contact_count += 1
+        # Aliases (hs_additional_emails) share the contact entry so mail from
+        # any of the contact's addresses is scanned and attributed correctly
+        for address in addresses:
+            roster[address] = entry
+    logger.info(f"Roster: {contact_count} contacts, {len(roster)} email addresses")
     return roster
 
 
@@ -471,6 +502,7 @@ def get_contact_email_engagements(contact_id: str) -> list:
                 except (ValueError, TypeError):
                     pass
             engagements.append({
+                "id": str(item.get("id", "")),
                 "message_id": (props.get("hs_email_message_id") or "").strip(),
                 "subject": (props.get("hs_email_subject") or "").strip().lower(),
                 "ts_ms": ts_ms,
@@ -480,25 +512,26 @@ def get_contact_email_engagements(contact_id: str) -> list:
     return engagements
 
 
-def is_already_logged(msg: dict, contact_id: str) -> bool:
-    """Primary: internetMessageId match. Fallback: subject + timestamp +-2 min + sender."""
+def find_logged_engagement(msg: dict, contact_id: str) -> str:
+    """Engagement id of an already-logged copy of this email, or empty string.
+    Primary: internetMessageId match. Fallback: subject + timestamp +-2 min + sender."""
     existing = get_contact_email_engagements(contact_id)
     imid = msg["internet_message_id"]
     for e in existing:
         if e["message_id"] and e["message_id"] == imid:
-            return True
+            return e["id"]
     try:
         msg_ts = int(datetime.fromisoformat(msg["received"].replace("Z", "+00:00")).timestamp() * 1000)
     except (ValueError, TypeError):
-        return False
+        return ""
     subject = (msg.get("subject") or "").strip().lower()
     for e in existing:
         if e["message_id"]:
             continue  # had a message id and it did not match
         if e["subject"] == subject and abs(e["ts_ms"] - msg_ts) <= 120_000:
             if not e["from"] or e["from"] == msg.get("from", ""):
-                return True
-    return False
+                return e["id"]
+    return ""
 
 
 # ======================================================================
@@ -576,9 +609,37 @@ def create_default_association(email_id: str, to_type: str, to_id: str):
     _request_with_retry("PUT", url, headers)
 
 
-def log_email_to_hubspot(msg: dict) -> str:
+def ensure_engagement_associations(email_id: str, msg: dict) -> list:
+    """Associate an engagement to matched contacts + their deals + companies.
+    PUT default association is idempotent, so this doubles as the repair path
+    for partial writes. Returns failed targets as 'type:id' strings."""
+    failed = []
+    associated_companies = set()
+    for entry in msg["matched_contacts"].values():
+        contact_id = entry["contact_id"]
+        targets = [("contacts", contact_id)]
+        targets += [("deals", deal["id"]) for deal in entry["deals"]]
+        try:
+            for company_id in get_associated_ids("contacts", contact_id, "companies")[:1]:
+                if company_id not in associated_companies:
+                    targets.append(("companies", company_id))
+                    associated_companies.add(company_id)
+        except Exception as e:
+            logger.warning(f"Company lookup failed for contact {contact_id}: {e}")
+            failed.append(f"companies:?contact={contact_id}")
+        for to_type, to_id in targets:
+            try:
+                create_default_association(email_id, to_type, to_id)
+            except Exception as e:
+                logger.warning(f"Association {to_type}:{to_id} failed for engagement {email_id}: {e}")
+                failed.append(f"{to_type}:{to_id}")
+    return failed
+
+
+def log_email_to_hubspot(msg: dict) -> tuple:
     """Create email engagement, associate to matched contacts + their deals + companies.
-    Returns created engagement id."""
+    Returns (engagement_id, failed_association_targets). Association failures do
+    not abort the write -- they are recorded for retry on the next run."""
     try:
         ts_ms = int(datetime.fromisoformat(msg["received"].replace("Z", "+00:00")).timestamp() * 1000)
     except (ValueError, TypeError):
@@ -604,18 +665,8 @@ def log_email_to_hubspot(msg: dict) -> str:
     }
     created = hubspot_request("POST", "/crm/v3/objects/emails", {"properties": properties})
     email_id = str(created.get("id", ""))
-
-    associated_companies = set()
-    for entry in msg["matched_contacts"].values():
-        contact_id = entry["contact_id"]
-        create_default_association(email_id, "contacts", contact_id)
-        for deal in entry["deals"]:
-            create_default_association(email_id, "deals", deal["id"])
-        for company_id in get_associated_ids("contacts", contact_id, "companies")[:1]:
-            if company_id not in associated_companies:
-                create_default_association(email_id, "companies", company_id)
-                associated_companies.add(company_id)
-    return email_id
+    failed = ensure_engagement_associations(email_id, msg)
+    return email_id, failed
 
 
 # ======================================================================
@@ -633,8 +684,11 @@ def build_report(stats: dict, uncertain: list, skipped_mailboxes: list, caps_hit
         f"Duplicates: {stats['duplicates']}",
         f"Irrelevant: {stats['irrelevant']}",
         f"Uncertain:  {stats['uncertain']}",
+        f"Repaired:   {stats.get('repaired', 0)}",
         f"Errors:     {stats['errors']}",
     ]
+    if stats.get("partial"):
+        lines.append(f"Partial:    {stats['partial']} (associations failed, auto-retry next run)")
     if skipped_mailboxes:
         lines += ["", "Mailboxes skipped (no access):"]
         lines += [f"  - {m}" for m in skipped_mailboxes]
@@ -706,7 +760,8 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
             else:
                 raise
 
-    stats = {"scanned": 0, "logged": 0, "duplicates": 0, "irrelevant": 0, "uncertain": 0, "errors": 0}
+    stats = {"scanned": 0, "logged": 0, "duplicates": 0, "irrelevant": 0,
+             "uncertain": 0, "repaired": 0, "partial": 0, "errors": 0}
     uncertain_msgs = []
     internal = set(INTERNAL_TEAM_EMAILS)
 
@@ -716,7 +771,24 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
         stats["scanned"] += 1
         imid = msg["internet_message_id"]
 
-        if ledger_seen(conn, imid):
+        prior = ledger_get(conn, imid)
+        if prior:
+            outcome, detail = prior
+            # Self-heal: engagement was created but some associations failed
+            # in a previous run -- retry them (PUT default assoc is idempotent)
+            if outcome == "logged-partial" and not dry_run:
+                m = re.search(r"engagement=(\d+)", detail or "")
+                if m:
+                    still_failed = ensure_engagement_associations(m.group(1), msg)
+                    if still_failed:
+                        stats["partial"] += 1
+                        ledger_update_outcome(conn, imid, "logged-partial",
+                                              f"engagement={m.group(1)}; failed={','.join(still_failed)}")
+                    else:
+                        stats["repaired"] += 1
+                        ledger_update_outcome(conn, imid, "logged",
+                                              f"engagement={m.group(1)}; associations repaired")
+                        logger.info(f"Repaired associations on engagement {m.group(1)}: \"{msg.get('subject', '')}\"")
             continue  # processed in a previous run; not counted as duplicate
 
         # Scope check: at least one internal party on the thread
@@ -727,13 +799,31 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
 
         try:
             # Dedupe against HubSpot: already logged on any matched contact
-            # means skip -- re-logging would duplicate it on that timeline
-            already = any(
-                is_already_logged(msg, entry["contact_id"])
-                for entry in msg["matched_contacts"].values()
-            )
-            if already:
-                ledger_record(conn, msg, "skipped-duplicate", "engagement already in HubSpot", run_id, dry_run)
+            # means skip -- re-logging would duplicate it on that timeline.
+            # But verify the deal associations first: a partial write of ours
+            # (or native HubSpot logging) may have linked the contact only.
+            existing_id = ""
+            for entry in msg["matched_contacts"].values():
+                existing_id = find_logged_engagement(msg, entry["contact_id"])
+                if existing_id:
+                    break
+            if existing_id:
+                expected_deals = {d["id"] for e in msg["matched_contacts"].values() for d in e["deals"]}
+                linked_deals = set(get_associated_ids("emails", existing_id, "deals"))
+                if expected_deals - linked_deals:
+                    label, reason = classify_email(msg)
+                    if label == "DEAL_RELEVANT":
+                        if dry_run:
+                            logger.info(f"[dry-run] would repair deal links on engagement {existing_id}: \"{msg.get('subject', '')}\"")
+                        else:
+                            ensure_engagement_associations(existing_id, msg)
+                            logger.info(f"Repaired deal links on engagement {existing_id}: \"{msg.get('subject', '')}\"")
+                        ledger_record(conn, msg, "repaired-associations",
+                                      f"engagement={existing_id}; {reason}", run_id, dry_run)
+                        stats["repaired"] += 1
+                        continue
+                ledger_record(conn, msg, "skipped-duplicate",
+                              f"engagement={existing_id} already in HubSpot", run_id, dry_run)
                 stats["duplicates"] += 1
                 continue
 
@@ -749,10 +839,19 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
             else:
                 if dry_run:
                     logger.info(f"[dry-run] would log: \"{msg.get('subject', '')}\" ({reason})")
+                    ledger_record(conn, msg, "logged", reason, run_id, dry_run)
                 else:
-                    engagement_id = log_email_to_hubspot(msg)
-                    logger.info(f"Logged engagement {engagement_id}: \"{msg.get('subject', '')}\"")
-                ledger_record(conn, msg, "logged", reason, run_id, dry_run)
+                    engagement_id, failed = log_email_to_hubspot(msg)
+                    if failed:
+                        # Engagement exists; failed associations retry next run
+                        logger.warning(f"Logged engagement {engagement_id} with failed associations {failed}: \"{msg.get('subject', '')}\"")
+                        ledger_record(conn, msg, "logged-partial",
+                                      f"engagement={engagement_id}; failed={','.join(failed)}", run_id, dry_run)
+                        stats["partial"] += 1
+                    else:
+                        logger.info(f"Logged engagement {engagement_id}: \"{msg.get('subject', '')}\"")
+                        ledger_record(conn, msg, "logged",
+                                      f"engagement={engagement_id}; {reason}", run_id, dry_run)
                 stats["logged"] += 1
         except Exception as e:
             logger.error(f"Error processing \"{msg.get('subject', '')}\": {e}")
