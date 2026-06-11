@@ -132,3 +132,12 @@ Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_AP
 - Shlomi's HUBSPOT_OWNER_MAP entry had wrong ID (was `241153250`, fixed to `31267643`) -- verify in Railway env vars
 - Teams live transcription requires separate enablement from Teams recording (MP4 to OneDrive != callTranscript object)
 - Weekly Pulse requires Azure AD permissions: `Mail.Read`, `Chat.Read.All`, `ChannelMessage.Read.All` (must be granted + admin consented before `/pulse/trigger` will work)
+
+## Loop protocol
+1. Write the change. 2. Checks run automatically on stop (syntax, ruff, pytest).
+3. On failure, read the error, fix the root cause. 4. Max 5 hook-enforced retries; same error twice in a row = invoke @fixer.
+- Never weaken, skip, or delete a test to pass it. Fix the code.
+- ASCII-only in comments and non-user-facing strings.
+- Version string lives in exactly 2 places in app.py (/version and /test). Bump both on any app.py change.
+- Passing local checks does NOT mean deployed. Deploy = commit app.py + fresh-timestamp CACHEBUST, push to main, poll /version every 20s up to 4 min. Never confirm via /test.
+- Tests are offline-only. Never add a test that calls a live API.

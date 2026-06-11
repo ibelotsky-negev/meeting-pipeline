@@ -19,11 +19,10 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import quote
 
 import anthropic
 import requests
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ======================================================================
@@ -1293,7 +1292,7 @@ def _pulse_parse_json(raw_text):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        logger.warning(f"[pulse] Failed to parse Claude JSON, returning raw text")
+        logger.warning("[pulse] Failed to parse Claude JSON, returning raw text")
         return {"green": [], "yellow": [], "red": [], "key_entities": [], "_raw": text}
 
 
@@ -2333,7 +2332,8 @@ def notify_organizer(recipients, approval_id: str, meeting_title: str, intellige
                 "text": (
                     f"*Meeting processed: {clean_title}*\n"
                     f"_{summary[:200]}_\n"
-                    f"{n_tasks} action items | {n_signals} key signals{email_note}\n"
+                    f"{n_tasks} action items | {n_contacts} contacts"
+                    f"{' | email draft ready' if has_email else ''}\n"
                     f"<{review_url}|Review & Approve>"
                 )
             }, timeout=10)
@@ -2971,7 +2971,7 @@ def pulse_set_lock():
         with open(PULSE_LOCK_FILE, "w") as f:
             json.dump({
                 "completed_at": time.time(),
-                "run_id": datetime.utcnow().strftime("%Y%m%d-%H%M%S"),
+                "run_id": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
             }, f)
     except Exception as e:
         logger.error(f"[pulse] Failed to write lock file: {e}")
@@ -3005,7 +3005,7 @@ def _acquire_running_lock():
         payload = json.dumps({
             "pid": os.getpid(),
             "started_at": time.time(),
-            "run_id": datetime.utcnow().strftime("%Y%m%d-%H%M%S"),
+            "run_id": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
         })
         os.write(fd, payload.encode())
         os.close(fd)
@@ -3024,24 +3024,24 @@ def _release_running_lock():
 
 
 def _pulse_run_background(days, dry_run):
-    """Run the full pulse pipeline in a background thread. Only one run at a time."""
-    import traceback as tb
-
+    """Run the full pulse pipeline in a background thread. Only one run at a time.
+    Returns True if the run executed, False if it was skipped."""
     # Cross-process atomic lock -- prevents duplicate runs when 2 gunicorn workers
     # fire pulse_weekly_run simultaneously. The in-process _pulse_lock alone is
     # not enough because each worker process has its own.
     if not _acquire_running_lock():
         logger.warning("[pulse] Skipping -- another pulse run already in progress (cross-process)")
-        return
+        return False
 
     # In-process lock for manual trigger + scheduler in the same process.
     if not _pulse_lock.acquire(blocking=False):
         logger.warning("[pulse] Skipping -- another pulse run is already in progress (in-process)")
         _release_running_lock()
-        return
+        return False
 
     try:
-        return _pulse_run_inner(days, dry_run)
+        _pulse_run_inner(days, dry_run)
+        return True
     finally:
         _pulse_lock.release()
         _release_running_lock()
@@ -3060,7 +3060,7 @@ def _pulse_run_inner(days, dry_run):
         start_dt = end_dt - timedelta(days=days)
 
         # Phase 1: collect ALL sources in parallel
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
         status["phase"] = "collecting (emails + Teams + meetings in parallel)"
         _pulse_save_status(status)
 
@@ -3590,11 +3590,11 @@ def process_teams_transcript_background(user_id, meeting_id, transcript_id):
         logger.info(f"[teams] '{subject}' | org={organizer_email} | {len(participant_names)} participants | {duration}min")
         vtt = get_teams_transcript_content(user_id, meeting_id, transcript_id)
         if not vtt:
-            logger.error(f"[teams] Empty transcript, aborting")
+            logger.error("[teams] Empty transcript, aborting")
             return
         sentences = parse_vtt_to_sentences(vtt)
         if not sentences:
-            logger.warning(f"[teams] No sentences parsed")
+            logger.warning("[teams] No sentences parsed")
             return
         transcript_dict = {
             "id": teams_tid,
@@ -3835,7 +3835,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.12.7-fix-double-email", "deployed": "2026-04-28"})
+    return jsonify({"version": "2.12.8-pulse-lock-tests", "deployed": "2026-06-11"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3867,7 +3867,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.12.7-fix-double-email", "steps": {}}
+    results = {"version": "2.12.8-pulse-lock-tests", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -3893,7 +3893,7 @@ def test_pipeline():
         if MS_GRAPH_CLIENT_ID:
             try:
                 t0 = _time.time()
-                token = get_ms_graph_token()
+                get_ms_graph_token()  # token acquisition probe
                 test_user = "bk@negevlabs.com"
                 url = f"{MS_GRAPH_BASE}/users/{test_user}/todo/lists"
                 todo_resp = _graph_request_with_retry("GET", url)
@@ -3974,7 +3974,7 @@ def asana_webhook():
     # Handshake: echo X-Hook-Secret back
     hook_secret = request.headers.get("X-Hook-Secret")
     if hook_secret:
-        logger.info(f"[todo-sync] Asana webhook handshake received, echoing X-Hook-Secret")
+        logger.info("[todo-sync] Asana webhook handshake received, echoing X-Hook-Secret")
         return jsonify({}), 200, {"X-Hook-Secret": hook_secret}
 
     payload = request.get_json(force=True, silent=True) or {}
@@ -4023,7 +4023,8 @@ def asana_webhook():
 
                 elif action == "changed":
                     field = change.get("field")
-                    new_val = change.get("new_value")
+                    # change.new_value is intentionally ignored -- Asana sends
+                    # None for most fields; actual state is fetched from the API
 
                     if field == "completed" and mapping:
                         # Asana sends new_value=None for completed field - must fetch actual status
@@ -4552,10 +4553,13 @@ def pulse_weekly_run():
         return
     try:
         logger.info("[pulse] Starting scheduled weekly pulse")
-        _pulse_run_background(days=PULSE_LOOKBACK_DAYS, dry_run=False)
-        # Only set lock after a successful run so failures can be retried.
-        pulse_set_lock()
-        logger.info("[pulse] Weekly pulse complete -- lock set")
+        ran = _pulse_run_background(days=PULSE_LOOKBACK_DAYS, dry_run=False)
+        # Only set the completion lock when this worker actually ran the
+        # pipeline -- a worker that lost the run-lock race must not extend
+        # the dedupe window for the winner.
+        if ran:
+            pulse_set_lock()
+            logger.info("[pulse] Weekly pulse complete -- lock set")
     except Exception as e:
         logger.error(f"[pulse] Failed: {e}", exc_info=True)
         # Send failure notification
@@ -4624,13 +4628,29 @@ def _start_background_services():
             start_todo_poller()
 
 
-_start_background_services()
+def _should_start_background_services():
+    """Decide whether to start the scheduler and pollers at import time.
+
+    RUN_SCHEDULER=1 forces on (set this in the Railway service variables).
+    RUN_SCHEDULER=0 forces off. When unset, autodetect gunicorn so that a
+    plain 'import app' (tests, scripts) never starts background threads.
+    """
+    flag = os.environ.get("RUN_SCHEDULER")
+    if flag is not None:
+        return flag == "1"
+    import sys as _sys
+    return "gunicorn" in os.path.basename(_sys.argv[0] or "").lower()
+
+
+if _should_start_background_services():
+    _start_background_services()
 
 # ======================================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Post-Meeting Intelligence Pipeline v2 on port {port}")
+    _start_background_services()
     app.run(host="0.0.0.0", port=port)
 
 

@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "python .claude/hooks/check.py", "timeout": 120 } ] }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [ { "type": "command", "command": "python -m py_compile app.py", "timeout": 30 } ]
+      }
+    ]
+  }
+}

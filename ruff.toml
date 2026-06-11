@@ -1,0 +1,19 @@
+# Lenient lint config -- this repo is a single 4000-line app.py and this
+# is not a refactor. Catch real bugs (F rules), skip style churn.
+line-length = 120
+
+[lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E402",  # module-level import not at top -- app.py interleaves config and imports
+    "E501",  # long lines -- template strings and prompts
+    "E701",  # multiple statements on one line -- existing compact style
+    "E702",  # semicolon-separated statements -- existing compact style
+    "E722",  # bare except -- existing defensive pattern
+    "E731",  # lambda assignment
+    "E741",  # ambiguous variable names
+]
+
+[lint.per-file-ignores]
+# Hook file content is fixed by the loop-protocol spec -- do not restyle
+".claude/hooks/check.py" = ["E401"]

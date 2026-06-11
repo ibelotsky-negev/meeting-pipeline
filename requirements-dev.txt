@@ -1,0 +1,5 @@
+# Dev-only dependencies. Do NOT merge into requirements.txt -- the Railway
+# image must stay lean. Install with: pip install -r requirements-dev.txt
+pytest>=8.0
+pytest-timeout>=2.3
+ruff>=0.6
