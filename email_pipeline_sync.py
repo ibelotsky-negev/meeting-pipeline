@@ -35,6 +35,14 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+# Local testing convenience: load credentials from .env in the project dir
+# (Railway injects real env vars in production; .env is gitignored)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("email-pipeline-sync")
 

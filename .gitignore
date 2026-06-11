@@ -7,3 +7,4 @@ __pycache__/
 .claude/settings.local.json
 teams_env.txt
 email_pipeline_sync.db
+.env
