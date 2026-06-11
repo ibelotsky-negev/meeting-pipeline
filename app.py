@@ -3458,7 +3458,29 @@ import re as _re
 import threading as _teams_threading
 
 _teams_subscription_id = None
+_teams_subscription_expiry = None   # ISO string from Graph, None if unknown
 _teams_subscription_lock = _teams_threading.Lock()
+
+TEAMS_SUBSCRIPTION_FILE = os.path.join(DATA_DIR, "teams_subscription.json")
+
+
+def _load_teams_subscription_state():
+    """Read persisted subscription id + expiry from disk. Returns (id, expiry_str) or (None, None)."""
+    try:
+        with open(TEAMS_SUBSCRIPTION_FILE) as f:
+            d = json.load(f)
+        return d.get("subscription_id"), d.get("expiry")
+    except (OSError, ValueError, KeyError):
+        return None, None
+
+
+def _save_teams_subscription_state(sub_id, expiry):
+    """Persist subscription id + expiry to disk so state survives restarts."""
+    try:
+        with open(TEAMS_SUBSCRIPTION_FILE, "w") as f:
+            json.dump({"subscription_id": sub_id, "expiry": expiry}, f)
+    except OSError as exc:
+        logger.warning(f"[teams] Could not save subscription state: {exc}")
 
 
 def get_graph_app_only_token() -> str:
@@ -3624,71 +3646,157 @@ def process_teams_transcript_background(user_id, meeting_id, transcript_id):
         logger.error(f"[teams] Error: {e}", exc_info=True)
 
 
-def create_teams_transcript_subscription():
-    global _teams_subscription_id
+def _teams_new_expiry_str(hours=72):
+    """Return an expirationDateTime 72h from now (Graph max for this resource type)."""
+    return (datetime.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+
+
+def _teams_create_subscription(token):
+    """POST to create a new subscription. Returns the Graph response object."""
+    expiry = _teams_new_expiry_str()
+    body = {
+        "changeType": "created",
+        "notificationUrl": f"{RAILWAY_PUBLIC_URL}/webhook/teams-transcript",
+        "resource": "communications/onlineMeetings/getAllTranscripts",
+        "expirationDateTime": expiry,
+        "clientState": TEAMS_WEBHOOK_SECRET,
+    }
+    logger.info(f"[teams] POST /subscriptions body={body}")
+    resp = requests.post(
+        "https://graph.microsoft.com/v1.0/subscriptions",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=body, timeout=30,
+    )
+    logger.info(f"[teams] POST /subscriptions -> {resp.status_code} {resp.text[:400]}")
+    return resp
+
+
+def ensure_teams_subscription():
+    """Idempotent: create or renew the Graph subscription as needed.
+
+    - No existing id in memory or file: create new.
+    - Existing id, expiry within 24h: PATCH to extend.
+    - PATCH returns 404 (Graph purged it): fall back to create.
+    - Expiry still >24h away: no-op.
+
+    Persists state to TEAMS_SUBSCRIPTION_FILE so restarts resume correctly.
+    """
+    global _teams_subscription_id, _teams_subscription_expiry
+
     if not TEAMS_TRANSCRIPT_ENABLED or not MS_GRAPH_CLIENT_ID or not MS_GRAPH_TENANT_ID:
         return
-    try:
-        token = get_graph_app_only_token()
-        expiry = (datetime.utcnow() + timedelta(minutes=55)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
-        body = {
-            "changeType": "created",
-            "notificationUrl": f"{RAILWAY_PUBLIC_URL}/webhook/teams-transcript",
-            "resource": "communications/onlineMeetings/getAllTranscripts",
-            "expirationDateTime": expiry,
-            "clientState": TEAMS_WEBHOOK_SECRET,
-        }
-        resp = requests.post("https://graph.microsoft.com/v1.0/subscriptions",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body, timeout=30)
-        if resp.status_code in (200, 201):
-            sub = resp.json()
-            with _teams_subscription_lock:
-                _teams_subscription_id = sub.get("id")
-            logger.info(f"[teams] Subscription created: {_teams_subscription_id}")
-        else:
-            logger.error(f"[teams] Subscription failed: {resp.status_code} {resp.text[:300]}")
-    except Exception as e:
-        logger.error(f"[teams] Subscription error: {e}", exc_info=True)
 
-
-def renew_teams_transcript_subscription():
-    global _teams_subscription_id
-    if not TEAMS_TRANSCRIPT_ENABLED:
-        return
     with _teams_subscription_lock:
         sub_id = _teams_subscription_id
+        sub_expiry = _teams_subscription_expiry
+
+    # If nothing in memory, try disk
     if not sub_id:
-        create_teams_transcript_subscription()
+        sub_id, sub_expiry = _load_teams_subscription_state()
+        if sub_id:
+            with _teams_subscription_lock:
+                _teams_subscription_id = sub_id
+                _teams_subscription_expiry = sub_expiry
+
+    # Determine whether renewal is needed
+    needs_renew = True
+    if sub_id and sub_expiry:
+        try:
+            exp_dt = datetime.fromisoformat(sub_expiry.replace("Z", "+00:00").replace(".0000000", ""))
+            now_utc = datetime.now(exp_dt.tzinfo)
+            hours_left = (exp_dt - now_utc).total_seconds() / 3600
+            if hours_left > 24:
+                logger.info(f"[teams] Subscription {sub_id} valid for {hours_left:.1f}h, no action needed")
+                needs_renew = False
+        except (ValueError, TypeError) as exc:
+            logger.warning(f"[teams] Could not parse expiry '{sub_expiry}': {exc}")
+
+    if not needs_renew:
         return
+
     try:
         token = get_graph_app_only_token()
-        expiry = (datetime.utcnow() + timedelta(minutes=55)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
-        resp = requests.patch(f"https://graph.microsoft.com/v1.0/subscriptions/{sub_id}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"expirationDateTime": expiry}, timeout=30)
-        if resp.status_code == 200:
-            logger.info(f"[teams] Subscription renewed: {sub_id}")
-        else:
-            logger.warning(f"[teams] Renewal failed ({resp.status_code}), recreating")
+
+        if sub_id:
+            # Try PATCH first
+            new_expiry = _teams_new_expiry_str()
+            logger.info(f"[teams] PATCH /subscriptions/{sub_id} expirationDateTime={new_expiry}")
+            resp = requests.patch(
+                f"https://graph.microsoft.com/v1.0/subscriptions/{sub_id}",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"expirationDateTime": new_expiry}, timeout=30,
+            )
+            logger.info(f"[teams] PATCH -> {resp.status_code} {resp.text[:400]}")
+            if resp.status_code == 200:
+                d = resp.json()
+                actual_expiry = d.get("expirationDateTime", new_expiry)
+                with _teams_subscription_lock:
+                    _teams_subscription_expiry = actual_expiry
+                _save_teams_subscription_state(sub_id, actual_expiry)
+                logger.info(f"[teams] Subscription renewed: {sub_id} expires {actual_expiry}")
+                return
+            if resp.status_code == 404:
+                logger.warning(f"[teams] Subscription {sub_id} gone (404), will recreate")
+                with _teams_subscription_lock:
+                    _teams_subscription_id = None
+                    _teams_subscription_expiry = None
+                sub_id = None
+            else:
+                logger.error(f"[teams] Renewal failed {resp.status_code}, will recreate")
+                with _teams_subscription_lock:
+                    _teams_subscription_id = None
+                    _teams_subscription_expiry = None
+                sub_id = None
+
+        # Create new subscription
+        resp = _teams_create_subscription(token)
+        if resp.status_code in (200, 201):
+            d = resp.json()
+            new_id = d.get("id")
+            new_expiry = d.get("expirationDateTime")
             with _teams_subscription_lock:
-                _teams_subscription_id = None
-            create_teams_transcript_subscription()
-    except Exception as e:
-        logger.error(f"[teams] Renewal error: {e}", exc_info=True)
-        with _teams_subscription_lock:
-            _teams_subscription_id = None
-        create_teams_transcript_subscription()
+                _teams_subscription_id = new_id
+                _teams_subscription_expiry = new_expiry
+            _save_teams_subscription_state(new_id, new_expiry)
+            logger.info(f"[teams] Subscription created: {new_id} expires {new_expiry}")
+        else:
+            logger.error(f"[teams] Subscription creation failed: {resp.status_code}")
+    except Exception as exc:
+        logger.error(f"[teams] ensure_teams_subscription error: {exc}", exc_info=True)
+
+
+# Keep for backwards compatibility (called by scheduler boot job)
+create_teams_transcript_subscription = ensure_teams_subscription
 
 
 @app.route("/teams/subscribe", methods=["POST", "GET"])
 def teams_subscribe_trigger():
-    """Manually trigger Teams transcript subscription creation."""
+    """Manually trigger Teams subscription creation. Returns status:ok + real id on success."""
+    if not TEAMS_TRANSCRIPT_ENABLED or not MS_GRAPH_CLIENT_ID or not MS_GRAPH_TENANT_ID:
+        return jsonify({"status": "error", "error": "Teams transcript not configured"}), 400
     try:
-        create_teams_transcript_subscription()
-        return jsonify({"status": "ok", "subscription_id": _teams_subscription_id})
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        token = get_graph_app_only_token()
+        resp = _teams_create_subscription(token)
+        if resp.status_code in (200, 201):
+            d = resp.json()
+            new_id = d.get("id")
+            new_expiry = d.get("expirationDateTime")
+            with _teams_subscription_lock:
+                global _teams_subscription_id, _teams_subscription_expiry
+                _teams_subscription_id = new_id
+                _teams_subscription_expiry = new_expiry
+            _save_teams_subscription_state(new_id, new_expiry)
+            return jsonify({"status": "ok", "subscription_id": new_id, "expires": new_expiry})
+        # Graph returned an error -- surface it honestly
+        try:
+            graph_error = resp.json()
+        except Exception:
+            graph_error = {"raw": resp.text[:500]}
+        logger.error(f"[teams] /teams/subscribe Graph error: {resp.status_code} {graph_error}")
+        return jsonify({"status": "error", "http_status": resp.status_code, "graph_error": graph_error}), 502
+    except Exception as exc:
+        logger.error(f"[teams] /teams/subscribe exception: {exc}", exc_info=True)
+        return jsonify({"status": "error", "error": str(exc)}), 500
 
 @app.route("/teams/debug", methods=["GET"])
 def teams_debug():
@@ -3835,7 +3943,7 @@ def teams_poll_now():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.12.8-pulse-lock-tests", "deployed": "2026-06-11"})
+    return jsonify({"version": "2.13.0-teams-subscription-repair", "deployed": "2026-06-11"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3849,6 +3957,8 @@ def config_check():
         "teams_transcript_enabled": TEAMS_TRANSCRIPT_ENABLED,
         "teams_organizer_user_id": TEAMS_ORGANIZER_USER_ID[:8] + "..." if TEAMS_ORGANIZER_USER_ID else "(not set)",
         "teams_subscription_active": bool(_teams_subscription_id),
+        "teams_subscription_expires": _teams_subscription_expiry,
+        "internal_domains_count": len(INTERNAL_DOMAINS),
         "hubspot_owner_map_raw": HUBSPOT_OWNER_MAP_RAW[:200] if HUBSPOT_OWNER_MAP_RAW else "(empty)",
         "hubspot_owner_map_entries": len(HUBSPOT_OWNER_MAP),
         "hubspot_owner_map_emails": list(HUBSPOT_OWNER_MAP.keys()),
@@ -3867,7 +3977,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.12.8-pulse-lock-tests", "steps": {}}
+    results = {"version": "2.13.0-teams-subscription-repair", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4601,11 +4711,30 @@ def start_scheduler():
         replace_existing=True,
         misfire_grace_time=3600,  # 1-hour window to fire if exact time was missed
     )
+    # Renewal job: every 12h, extends subscription if expiry < 24h away
+    _scheduler.add_job(
+        ensure_teams_subscription,
+        trigger="interval",
+        hours=12,
+        id="teams_subscription_renewal",
+        replace_existing=True,
+    )
+    # Boot job: ensure subscription ~60s after startup so web server is ready for Graph validation
+    from apscheduler.triggers.date import DateTrigger as _DateTrigger
+    import datetime as _datetime_mod
+    boot_run_time = _datetime_mod.datetime.now() + _datetime_mod.timedelta(seconds=60)
+    _scheduler.add_job(
+        ensure_teams_subscription,
+        trigger=_DateTrigger(run_date=boot_run_time),
+        id="teams_subscription_boot",
+        replace_existing=True,
+    )
     _scheduler.start()
     pulse_job = _scheduler.get_job("weekly_pulse")
     next_run = pulse_job.next_run_time if pulse_job else "NOT REGISTERED"
     logger.info(f"[scheduler] Started: polling every {POLL_INTERVAL_MINUTES}m, weekly pulse Sunday 19:00 UTC")
     logger.info(f"[scheduler] Weekly pulse job registered: next run = {next_run}")
+    logger.info(f"[scheduler] Teams subscription renewal every 12h; boot ensure at {boot_run_time}")
 
 
 # Start background services for gunicorn (module-level, not just __main__)

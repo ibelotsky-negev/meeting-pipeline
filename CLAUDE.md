@@ -20,6 +20,10 @@ Sara is a post-meeting intelligence pipeline for Negev Labs (biotech venture stu
 
 Internal domains: `negevlabs.com`, `negevcap.com`, `ariadnebio.com`, `zirmania.com`
 
+## Session Start (MANDATORY)
+
+Step 0 of every session: `git fetch && git rebase origin/main`. Origin is the source of truth.
+
 ## Deploy Rules (CRITICAL)
 
 ### Version String
@@ -51,9 +55,11 @@ Always update `CACHEBUST` with a timestamp on every deploy. This invalidates Doc
 ### Procfile
 The repo has a `Procfile` that must say:
 ```
-web: gunicorn --bind 0.0.0.0:8080 --workers 2 --timeout 120 app:app
+web: gunicorn --bind 0.0.0.0:8080 --workers 1 --worker-class gthread --threads 4 --timeout 120 app:app
 ```
 Railway uses nixpacks which defaults to `main:app` without this -- causing `ModuleNotFoundError`.
+
+**CRITICAL -- never increase workers above 1.** Single-process topology is load-bearing: one APScheduler instance, atomic `O_CREAT|O_EXCL` pulse lock, Teams subscription renewal job. Increasing workers to 2+ reintroduces duplicate Pulse emails (the 2.12.7 regression). Use `--threads` within the single process for concurrency instead.
 
 ## Code Rules
 
