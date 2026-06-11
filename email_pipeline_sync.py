@@ -401,6 +401,10 @@ def scan_mailbox(mailbox: str, roster: dict, since: str, until: str, caps_hit: l
                 imid = msg.get("internetMessageId") or ""
                 if not imid:
                     continue
+                # Calendar responses (Accepted/Declined/Tentative) are timeline
+                # noise -- excluded. Meeting invites themselves stay in scope.
+                if (msg.get("@odata.type") or "").endswith("eventMessageResponse"):
+                    continue
                 frm, participants = extract_addresses(msg)
                 # Graph $search can fuzzy-match; require the address literally present
                 if address not in participants:
