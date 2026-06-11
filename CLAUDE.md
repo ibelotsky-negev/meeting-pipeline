@@ -117,6 +117,23 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Teams transcripts** via Graph webhook subscription, renewed every 50 min via APScheduler
 - **To-Do sync** polls Asana tasks and creates matching Microsoft To-Do tasks for @negevlabs.com users
 
+## email-pipeline-sync Module
+
+Standalone module (`email_pipeline_sync.py`) -- scans team Outlook mailboxes for
+correspondence with NL 2026 Fundraise pipeline contacts, classifies deal relevance
+via Claude (haiku), logs relevant emails to HubSpot as email engagements. Full spec:
+`email-pipeline-sync-spec.md`.
+
+- Runs headless via CLI, NOT imported by app.py (no Flask coupling)
+- `python email_pipeline_sync.py --since 2026-05-01` -- backfill; no flags -- last 3 days
+- `--dry-run` -- no HubSpot writes, no report email, no ledger message rows
+- Reuses existing env vars: HUBSPOT_API_KEY, CLAUDE_API_KEY, MS_GRAPH_CLIENT_ID/SECRET/TENANT_ID, BOT_SENDER_EMAIL
+- Requires app-only Graph auth (Mail.Read application permission) for multi-mailbox scan; inaccessible mailboxes (e.g. shlomi@ariadnebio.com, separate tenant) are skipped and reported, not fatal
+- Ledger: SQLite at `/data/email_pipeline_sync.db` (Railway volume) or project dir locally
+- UNCERTAIN classifications are never auto-logged -- they go to the run report for human review
+- Run report emailed to bk@negevlabs.com from BOT_SENDER_EMAIL
+- Daily scheduling: wire into APScheduler only AFTER backfill validation
+
 ## Common Failure Modes
 
 | Symptom | Cause | Fix |
