@@ -77,9 +77,9 @@ class TestEnsureTeamsSubscriptionRenew:
         monkeypatch.setattr(app_module, "MS_GRAPH_CLIENT_ID", "cid")
         monkeypatch.setattr(app_module, "MS_GRAPH_TENANT_ID", "tid")
         monkeypatch.setattr(app_module, "TEAMS_SUBSCRIPTION_FILE", str(tmp_path / "sub.json"))
-        # Expiry is 10h from now -- within 24h window
+        # Expiry is 10min from now -- within 30min window
         import datetime
-        near_expiry = (datetime.datetime.utcnow() + datetime.timedelta(hours=10)).strftime(
+        near_expiry = (datetime.datetime.utcnow() + datetime.timedelta(minutes=10)).strftime(
             "%Y-%m-%dT%H:%M:%S.0000000Z"
         )
         monkeypatch.setattr(app_module, "_teams_subscription_id", "existing-sub")
@@ -101,9 +101,9 @@ class TestEnsureTeamsSubscriptionRenew:
         monkeypatch.setattr(app_module, "MS_GRAPH_CLIENT_ID", "cid")
         monkeypatch.setattr(app_module, "MS_GRAPH_TENANT_ID", "tid")
         monkeypatch.setattr(app_module, "TEAMS_SUBSCRIPTION_FILE", str(tmp_path / "sub.json"))
-        # Expiry is 48h from now -- well within valid window
+        # Expiry is 45min from now -- well beyond 30min threshold
         import datetime
-        fresh_expiry = (datetime.datetime.utcnow() + datetime.timedelta(hours=48)).strftime(
+        fresh_expiry = (datetime.datetime.utcnow() + datetime.timedelta(minutes=45)).strftime(
             "%Y-%m-%dT%H:%M:%S.0000000Z"
         )
         monkeypatch.setattr(app_module, "_teams_subscription_id", "fresh-sub")
@@ -128,7 +128,7 @@ class TestEnsureTeamsSubscriptionFallback:
         monkeypatch.setattr(app_module, "MS_GRAPH_TENANT_ID", "tid")
         monkeypatch.setattr(app_module, "TEAMS_SUBSCRIPTION_FILE", str(tmp_path / "sub.json"))
         import datetime
-        near_expiry = (datetime.datetime.utcnow() + datetime.timedelta(hours=5)).strftime(
+        near_expiry = (datetime.datetime.utcnow() + datetime.timedelta(minutes=5)).strftime(
             "%Y-%m-%dT%H:%M:%S.0000000Z"
         )
         monkeypatch.setattr(app_module, "_teams_subscription_id", "gone-sub")

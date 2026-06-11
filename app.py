@@ -3646,9 +3646,13 @@ def process_teams_transcript_background(user_id, meeting_id, transcript_id):
         logger.error(f"[teams] Error: {e}", exc_info=True)
 
 
-def _teams_new_expiry_str(hours=72):
-    """Return an expirationDateTime 72h from now (Graph max for this resource type)."""
-    return (datetime.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+def _teams_new_expiry_str(minutes=59):
+    """Return an expirationDateTime 59min from now.
+
+    Graph requires lifecycleNotificationUrl when expiry exceeds 1h for this resource type.
+    Keep expiry under 1h to avoid that requirement; the renewal job runs every 45min.
+    """
+    return (datetime.utcnow() + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
 
 
 def _teams_create_subscription(token):
@@ -3705,8 +3709,8 @@ def ensure_teams_subscription():
             exp_dt = datetime.fromisoformat(sub_expiry.replace("Z", "+00:00").replace(".0000000", ""))
             now_utc = datetime.now(exp_dt.tzinfo)
             hours_left = (exp_dt - now_utc).total_seconds() / 3600
-            if hours_left > 24:
-                logger.info(f"[teams] Subscription {sub_id} valid for {hours_left:.1f}h, no action needed")
+            if hours_left > 0.5:   # > 30 min remaining -- no-op
+                logger.info(f"[teams] Subscription {sub_id} valid for {hours_left*60:.0f}min, no action needed")
                 needs_renew = False
         except (ValueError, TypeError) as exc:
             logger.warning(f"[teams] Could not parse expiry '{sub_expiry}': {exc}")
@@ -4711,11 +4715,11 @@ def start_scheduler():
         replace_existing=True,
         misfire_grace_time=3600,  # 1-hour window to fire if exact time was missed
     )
-    # Renewal job: every 12h, extends subscription if expiry < 24h away
+    # Renewal job: every 45min, renews if expiry < 30min away (Graph max is 59min for this resource)
     _scheduler.add_job(
         ensure_teams_subscription,
         trigger="interval",
-        hours=12,
+        minutes=45,
         id="teams_subscription_renewal",
         replace_existing=True,
     )
