@@ -3945,9 +3945,36 @@ def teams_poll_now():
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
+_digest_lock = _threading.Lock()
+
+
+@app.route("/digest/trigger", methods=["GET"])
+def digest_trigger():
+    """Manually trigger the daily pipeline digest. ?dry_run=true composes but
+    sends no email and does not advance the digest window."""
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    if not _digest_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    def _run():
+        try:
+            import daily_pipeline_digest
+            daily_pipeline_digest.run_digest(dry_run=dry_run)
+            logger.info("[digest] Manual digest run complete")
+        except Exception as e:
+            logger.error(f"[digest] Manual digest run failed: {e}", exc_info=True)
+        finally:
+            _digest_lock.release()
+
+    logger.info(f"[digest] Trigger: dry_run={dry_run} -- launching background thread")
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({"status": "started", "dry_run": dry_run})
+
+
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.13.0-teams-subscription-repair", "deployed": "2026-06-11"})
+    return jsonify({"version": "2.14.0-daily-pipeline-digest", "deployed": "2026-06-11"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3981,7 +4008,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.13.0-teams-subscription-repair", "steps": {}}
+    results = {"version": "2.14.0-daily-pipeline-digest", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4698,6 +4725,25 @@ def pulse_weekly_run():
             logger.error("[pulse] Even the error notification email failed", exc_info=True)
 
 
+def daily_digest_run():
+    """Scheduled daily pipeline digest (daily_pipeline_digest module).
+
+    The module records its own run ledger; a failed run is covered by the
+    next run's resilient window, so no retry logic is needed here."""
+    if not _digest_lock.acquire(blocking=False):
+        logger.warning("[digest] Skipped scheduled run -- digest already running")
+        return
+    try:
+        logger.info("[digest] Starting scheduled daily pipeline digest")
+        import daily_pipeline_digest
+        daily_pipeline_digest.run_digest()
+        logger.info("[digest] Daily pipeline digest complete")
+    except Exception as e:
+        logger.error(f"[digest] Failed: {e}", exc_info=True)
+    finally:
+        _digest_lock.release()
+
+
 _scheduler = None  # module-level so diagnostic endpoints can inspect it
 
 
@@ -4712,6 +4758,15 @@ def start_scheduler():
         hour=19,            # 19:00 UTC = 22:00 Israel
         minute=0,
         id="weekly_pulse",
+        replace_existing=True,
+        misfire_grace_time=3600,  # 1-hour window to fire if exact time was missed
+    )
+    _scheduler.add_job(
+        daily_digest_run,
+        trigger="cron",
+        hour=3,             # 03:45 UTC = 06:45 Israel (IDT), after the overnight email sync
+        minute=45,
+        id="daily_pipeline_digest",
         replace_existing=True,
         misfire_grace_time=3600,  # 1-hour window to fire if exact time was missed
     )
