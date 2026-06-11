@@ -18,7 +18,7 @@ Sara is a post-meeting intelligence pipeline for Negev Labs (biotech venture stu
 | Dan Jeffries | dan@negevlabs.com | 31299775 | |
 | Kostia Adamsky | ka@negevlabs.com | N/A | No HubSpot seat |
 
-Internal domains: `negevlabs.com`, `negevcap.com`, `ariadnebio.com`, `zirmania.com`
+Internal domains: `negevlabs.com`, `negevcap.com`, `ariadnebio.com`, `adres.bio`, `zirmania.onmicrosoft.com` (must match INTERNAL_DOMAINS env var on Railway)
 
 ## Session Start (MANDATORY)
 
@@ -147,3 +147,18 @@ Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_AP
 - Version string lives in exactly 2 places in app.py (/version and /test). Bump both on any app.py change.
 - Passing local checks does NOT mean deployed. Deploy = commit app.py + fresh-timestamp CACHEBUST, push to main, poll /version every 20s up to 4 min. Never confirm via /test.
 - Tests are offline-only. Never add a test that calls a live API.
+
+## Test-with-code mandate
+Tests are required for SIGNIFICANTLY NEW functionality only -- not for every edit.
+
+Tests REQUIRED when adding or changing:
+- New functions with real logic: parsing, routing, date/time math, locks, auth, dedupe, retry/error handling
+- New endpoints or webhook handlers (minimum: success path + one failure path)
+- Behavior changes that existing tests do not already cover
+
+Tests NOT required for:
+- Log lines, comments, docstrings, user-facing copy, prompt text
+- Config/env plumbing, constant tweaks, version bumps
+- Small refactors fully covered by the existing suite (a green hook is the proof)
+
+When required, tests ship in the same commit as the code. If unsure whether a change is significant, write the test. Never weaken, skip, or delete an existing test to pass it (unchanged rule).
