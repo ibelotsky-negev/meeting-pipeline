@@ -578,7 +578,14 @@ Engaged), outreach from the team to the contact -- proposing an update call,
 scheduling time, re-engaging the relationship -- IS the deal activity and counts
 as DEAL_RELEVANT even when the round is not mentioned explicitly. Only treat
 team-to-contact outreach as NOT_RELEVANT when it is clearly about an unrelated
-matter (a different venture, a personal topic, logistics of another engagement).
+matter (a personal topic, the contact's own other business, logistics of another
+engagement).
+
+Negev Labs is a venture studio: updates to fundraise contacts about its portfolio
+companies (e.g., Ariadne Bio) are investor-relations content for this round and
+count as DEAL_RELEVANT. Introductions connecting prospective investors or their
+advisors with Negev Labs also count as DEAL_RELEVANT. Only ventures unrelated to
+Negev Labs (e.g., the contact's own separate deals) are NOT_RELEVANT.
 
 Respond with ONLY a JSON object: {{"classification": "DEAL_RELEVANT|NOT_RELEVANT|UNCERTAIN", "reason": "<one sentence>"}}"""
 
