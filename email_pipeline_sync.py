@@ -573,6 +573,13 @@ Classify the email:
 - NOT_RELEVANT: personal topics, other ventures or deals outside this pipeline, newsletters, unrelated business.
 - UNCERTAIN: genuinely ambiguous; a human should review.
 
+Stage matters: when the contact's deal is in an early stage (Outreach, Discovery,
+Engaged), outreach from the team to the contact -- proposing an update call,
+scheduling time, re-engaging the relationship -- IS the deal activity and counts
+as DEAL_RELEVANT even when the round is not mentioned explicitly. Only treat
+team-to-contact outreach as NOT_RELEVANT when it is clearly about an unrelated
+matter (a different venture, a personal topic, logistics of another engagement).
+
 Respond with ONLY a JSON object: {{"classification": "DEAL_RELEVANT|NOT_RELEVANT|UNCERTAIN", "reason": "<one sentence>"}}"""
 
     client = anthropic.Anthropic(api_key=api_key)
