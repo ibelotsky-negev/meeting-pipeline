@@ -47,6 +47,14 @@ DIGEST_CC = [r.strip() for r in os.environ.get("DIGEST_CC", "").split(",") if r.
 
 COMPOSER_MODEL = os.environ.get("DIGEST_MODEL", "claude-haiku-4-5-20251001")
 
+# Last-run status (phase, counts, error traceback). Lives on the Railway volume
+# when available so scheduled-run outcomes are inspectable via /digest/status.
+STATUS_PATH = (
+    "/data/daily_pipeline_digest_status.json"
+    if os.path.isdir("/data")
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_pipeline_digest_status.json")
+)
+
 # Negev operating rules (ops manual): 1+ week stuck -> flag; Closing 5+ days -> wire watch
 STALE_DAYS = int(os.environ.get("DIGEST_STALE_DAYS", "7"))
 CLOSING_WATCH_DAYS = int(os.environ.get("DIGEST_CLOSING_WATCH_DAYS", "5"))
@@ -665,7 +673,29 @@ def send_digest_email(subject: str, body: str):
 # ======================================================================
 
 
+def write_status(status: dict):
+    """Persist the last run outcome so scheduled runs are inspectable. Best
+    effort -- a status-write failure never breaks the run."""
+    try:
+        with open(STATUS_PATH, "w", encoding="utf-8") as f:
+            json.dump(status, f, default=str)
+    except Exception as e:
+        logger.warning(f"Could not write digest status: {e}")
+
+
+def read_status() -> dict:
+    try:
+        with open(STATUS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"status": "no_runs", "message": "No digest run has completed yet."}
+    except Exception as e:
+        return {"status": "error", "error": f"could not read status: {e}"}
+
+
 def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
+    import traceback as _traceback
+
     run_id = uuid.uuid4().hex[:12]
     now = datetime.now(timezone.utc)
     started_at = now.isoformat()
@@ -674,7 +704,7 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
     until = now
     logger.info(f"Digest run {run_id}: window {since.isoformat()} .. {until.isoformat()}, dry_run={dry_run}")
 
-    data, quiet, sent = None, False, False
+    data, quiet, sent, body, subject = None, False, False, "", ""
     try:
         stages = get_pipeline_stages()
         stage_labels = {s["id"]: s["label"] for s in stages}
@@ -727,9 +757,37 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
             sent = True
 
         record_run(conn, run_id, started_at, since, until, data, quiet, sent, dry_run, "ok")
-        return data
-    except Exception:
+        counts = _data_counts(data)
+        result = {
+            "status": "ok",
+            "run_id": run_id,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "window": {"since": since.isoformat(), "until": until.isoformat()},
+            "dry_run": dry_run,
+            "quiet": quiet,
+            "sent": sent,
+            "counts": counts,
+            "subject": subject,
+            "body": body,
+            "data": data,
+        }
+        write_status({k: result[k] for k in
+                      ("status", "run_id", "finished_at", "window", "dry_run",
+                       "quiet", "sent", "counts", "subject", "body")})
+        return result
+    except Exception as e:
         record_run(conn, run_id, started_at, since, until, data, quiet, sent, dry_run, "error")
+        tb = _traceback.format_exc()
+        logger.error(f"Digest run {run_id} failed: {tb}")
+        write_status({
+            "status": "error",
+            "run_id": run_id,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "window": {"since": since.isoformat(), "until": until.isoformat()},
+            "dry_run": dry_run,
+            "error": str(e),
+            "traceback": tb,
+        })
         raise
     finally:
         conn.close()

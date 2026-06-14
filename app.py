@@ -3950,11 +3950,29 @@ _digest_lock = _threading.Lock()
 
 @app.route("/digest/trigger", methods=["GET"])
 def digest_trigger():
-    """Manually trigger the daily pipeline digest. ?dry_run=true composes but
-    sends no email and does not advance the digest window."""
+    """Manually trigger the daily pipeline digest.
+    ?dry_run=true  -- compose but send no email; does not advance the window.
+    ?sync=true     -- run inline and return the result (or full traceback) as
+                      JSON. Diagnostic: surfaces collection/compose/send errors
+                      that a background run would only write to the logs."""
+    import traceback as _digest_tb
     dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
     if not _digest_lock.acquire(blocking=False):
         return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import daily_pipeline_digest
+            result = daily_pipeline_digest.run_digest(dry_run=dry_run)
+            logger.info("[digest] Sync digest run complete")
+            return jsonify(result)
+        except Exception as e:
+            logger.error(f"[digest] Sync digest run failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _digest_tb.format_exc()}), 500
+        finally:
+            _digest_lock.release()
 
     def _run():
         try:
@@ -3972,9 +3990,17 @@ def digest_trigger():
     return jsonify({"status": "started", "dry_run": dry_run})
 
 
+@app.route("/digest/status", methods=["GET"])
+def digest_status():
+    """Last digest run outcome (counts, sent/quiet flags, or error traceback).
+    Lets scheduled-run failures be inspected without Railway log access."""
+    import daily_pipeline_digest
+    return jsonify(daily_pipeline_digest.read_status())
+
+
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.14.0-daily-pipeline-digest", "deployed": "2026-06-11"})
+    return jsonify({"version": "2.14.1-digest-diagnostics", "deployed": "2026-06-14"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4008,7 +4034,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.14.0-daily-pipeline-digest", "steps": {}}
+    results = {"version": "2.14.1-digest-diagnostics", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

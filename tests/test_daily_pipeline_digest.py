@@ -285,3 +285,95 @@ def test_digest_trigger_refuses_concurrent_run(flask_client):
         assert resp.get_json() == {"status": "already_running"}
     finally:
         app_module._digest_lock.release()
+
+
+def test_digest_trigger_sync_returns_result(flask_client, monkeypatch):
+    def fake_run(dry_run=False, since_override=None):
+        return {"status": "ok", "dry_run": dry_run, "quiet": True, "sent": True}
+
+    monkeypatch.setattr(dpd, "run_digest", fake_run)
+    resp = flask_client.get("/digest/trigger?sync=true&dry_run=true")
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "ok"
+    # Lock released after a sync run
+    assert app_module._digest_lock.acquire(timeout=5)
+    app_module._digest_lock.release()
+
+
+def test_digest_trigger_sync_returns_traceback_on_error(flask_client, monkeypatch):
+    def boom(dry_run=False, since_override=None):
+        raise RuntimeError("HubSpot 400: property does not exist")
+
+    monkeypatch.setattr(dpd, "run_digest", boom)
+    resp = flask_client.get("/digest/trigger?sync=true")
+    assert resp.status_code == 500
+    payload = resp.get_json()
+    assert payload["status"] == "error"
+    assert "property does not exist" in payload["error"]
+    assert "RuntimeError" in payload["traceback"]
+    assert app_module._digest_lock.acquire(timeout=5)
+    app_module._digest_lock.release()
+
+
+def test_digest_status_endpoint_reads_persisted_status(flask_client, monkeypatch, tmp_path):
+    monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
+    resp = flask_client.get("/digest/status")
+    assert resp.get_json()["status"] == "no_runs"
+    dpd.write_status({"status": "ok", "sent": True, "quiet": False})
+    resp = flask_client.get("/digest/status")
+    body = resp.get_json()
+    assert body["status"] == "ok"
+    assert body["sent"] is True
+
+
+# ----------------------------------------------------------------------
+#  run_digest orchestration (status persistence + result contract)
+# ----------------------------------------------------------------------
+
+@pytest.fixture
+def stub_collectors(monkeypatch):
+    """Stub the HubSpot collectors so run_digest exercises orchestration,
+    rules, quiet detection, status persistence -- with no network."""
+    stage = {"id": "s2", "label": "Value Validation", "probability": 0.4,
+             "is_closed": False, "order": 0}
+    monkeypatch.setattr(dpd, "get_pipeline_stages", lambda: [stage])
+    monkeypatch.setattr(dpd, "get_owner_maps", lambda: ({}, {}))
+    monkeypatch.setattr(dpd, "get_pipeline_deals", lambda closing_stage_id="": [])
+    monkeypatch.setattr(dpd, "collect_activity", lambda *a, **k: [])
+    monkeypatch.setattr(dpd, "collect_open_tasks", lambda *a, **k: [])
+
+
+def test_run_digest_quiet_day_sends_one_liner(ledger, monkeypatch, tmp_path, stub_collectors):
+    monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
+    sent = {}
+    monkeypatch.setattr(dpd, "send_digest_email",
+                        lambda subject, body: sent.update(subject=subject, body=body))
+
+    result = dpd.run_digest(dry_run=False)
+    assert result["status"] == "ok"
+    assert result["quiet"] is True
+    assert result["sent"] is True
+    assert "No pipeline changes" in sent["body"]
+    # Status file persisted for /digest/status
+    assert dpd.read_status()["sent"] is True
+
+
+def test_run_digest_dry_run_does_not_send(ledger, monkeypatch, tmp_path, stub_collectors):
+    monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
+    calls = []
+    monkeypatch.setattr(dpd, "send_digest_email", lambda s, b: calls.append((s, b)))
+    result = dpd.run_digest(dry_run=True)
+    assert result["sent"] is False
+    assert calls == []
+
+
+def test_run_digest_records_error_with_traceback(ledger, monkeypatch, tmp_path):
+    monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
+    monkeypatch.setattr(dpd, "get_pipeline_stages",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom-400")))
+    with pytest.raises(RuntimeError):
+        dpd.run_digest(dry_run=False)
+    status = dpd.read_status()
+    assert status["status"] == "error"
+    assert "boom-400" in status["error"]
+    assert "RuntimeError" in status["traceback"]
