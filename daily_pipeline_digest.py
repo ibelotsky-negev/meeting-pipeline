@@ -244,26 +244,61 @@ def get_pipeline_deals(closing_stage_id: str = "") -> list:
     return search_objects("deals", filters, properties)
 
 
-def get_owner_maps() -> tuple:
+def get_owner_maps(skipped: list = None) -> tuple:
     """(owner_id -> name, user_id -> name). User ids attribute property-history
-    changes; owner ids attribute deals and engagements."""
+    changes; owner ids attribute deals and engagements.
+
+    Degrades gracefully: if the token lacks the crm.objects.owners.read scope
+    (403), falls back to the HUBSPOT_OWNER_MAP env var so the digest still
+    sends -- with reduced name coverage -- instead of failing outright."""
     by_owner, by_user = {}, {}
     after = None
-    while True:
-        params = {"limit": 100}
-        if after:
-            params["after"] = after
-        data = eps.hubspot_request("GET", "/crm/v3/owners", params=params)
-        for o in data.get("results") or []:
-            name = " ".join(p for p in [o.get("firstName"), o.get("lastName")] if p)
-            name = name or o.get("email") or str(o.get("id", ""))
-            by_owner[str(o.get("id", ""))] = name
-            if o.get("userId") is not None:
-                by_user[str(o.get("userId"))] = name
-        after = ((data.get("paging") or {}).get("next") or {}).get("after")
-        if not after:
-            break
+    try:
+        while True:
+            params = {"limit": 100}
+            if after:
+                params["after"] = after
+            data = eps.hubspot_request("GET", "/crm/v3/owners", params=params)
+            for o in data.get("results") or []:
+                name = " ".join(p for p in [o.get("firstName"), o.get("lastName")] if p)
+                name = name or o.get("email") or str(o.get("id", ""))
+                by_owner[str(o.get("id", ""))] = name
+                if o.get("userId") is not None:
+                    by_user[str(o.get("userId"))] = name
+            after = ((data.get("paging") or {}).get("next") or {}).get("after")
+            if not after:
+                break
+    except Exception as e:
+        logger.warning(f"Owners API unavailable ({e}); falling back to HUBSPOT_OWNER_MAP. "
+                       "Grant the HubSpot app 'crm.objects.owners.read' for full attribution.")
+        if skipped is not None:
+            skipped.append("owner names (needs crm.objects.owners.read)")
+        by_owner = _owner_map_from_env()
     return by_owner, by_user
+
+
+def _owner_map_from_env() -> dict:
+    """Reverse HUBSPOT_OWNER_MAP ({email: owner_id}) into {owner_id: email} so
+    at least the mapped team members are named when the owners API is denied."""
+    out = {}
+    raw = os.environ.get("HUBSPOT_OWNER_MAP", "")
+    if raw:
+        try:
+            for email, owner_id in json.loads(raw).items():
+                if owner_id:
+                    out[str(owner_id)] = email
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            logger.warning("HUBSPOT_OWNER_MAP is not valid JSON -- owner names unavailable")
+    return out
+
+
+def owner_name(by_owner: dict, owner_id) -> str:
+    """Display name for an owner id: mapped name, else 'Owner <id>', else
+    'Unassigned'. Keeps distinct unmapped owners distinct for grouping."""
+    oid = str(owner_id or "")
+    if not oid:
+        return "Unassigned"
+    return by_owner.get(oid) or f"Owner {oid}"
 
 
 def normalize_deal(raw: dict, stages: list, by_owner: dict, closing_stage_id: str) -> dict:
@@ -282,7 +317,7 @@ def normalize_deal(raw: dict, stages: list, by_owner: dict, closing_stage_id: st
         "is_closed": stage["is_closed"] if stage else False,
         "probability": stage["probability"] if stage else 0.0,
         "in_closing": bool(closing_stage_id) and stage_id == closing_stage_id,
-        "owner": by_owner.get(str(props.get("hubspot_owner_id") or ""), "Unassigned"),
+        "owner": owner_name(by_owner, props.get("hubspot_owner_id")),
         "amount": amount,
         "last_activity": _parse_ts(props.get("notes_last_updated")),
         "created": _parse_ts(props.get("createdate")),
@@ -390,20 +425,30 @@ def _window_filters(property_name: str, since: datetime, until: datetime) -> lis
     ]
 
 
-def collect_activity(since, until, deals_by_id, by_owner) -> list:
+def collect_activity(since, until, deals_by_id, by_owner, skipped: list = None) -> list:
     """Engagements created (and tasks completed) in the window, attributed to
-    pipeline deals. [{type, deal, owner, summary, author, at}]."""
+    pipeline deals. [{type, deal, owner, summary, author, at}].
+
+    Each engagement type degrades independently: if the token lacks that
+    object's read scope (403), it is logged, recorded in `skipped`, and the
+    rest of the digest still composes."""
     items = []
     for object_type, properties in ENGAGEMENT_SPECS.items():
         found = {}  # id -> (record, kind); completed wins over created for tasks
-        for r in search_objects(object_type, _window_filters("hs_createdate", since, until), properties):
-            kind = "task created" if object_type == "tasks" else object_type.rstrip("s") + " logged"
-            found[str(r.get("id", ""))] = (r, kind)
-        if object_type == "tasks":
-            completed = search_objects(
-                "tasks", _window_filters("hs_task_completion_date", since, until), properties)
-            for r in completed:
-                found[str(r.get("id", ""))] = (r, "task completed")
+        try:
+            for r in search_objects(object_type, _window_filters("hs_createdate", since, until), properties):
+                kind = "task created" if object_type == "tasks" else object_type.rstrip("s") + " logged"
+                found[str(r.get("id", ""))] = (r, kind)
+            if object_type == "tasks":
+                completed = search_objects(
+                    "tasks", _window_filters("hs_task_completion_date", since, until), properties)
+                for r in completed:
+                    found[str(r.get("id", ""))] = (r, "task completed")
+        except Exception as e:
+            logger.warning(f"{object_type} search failed ({e}); skipped this run")
+            if skipped is not None:
+                skipped.append(f"{object_type} activity")
+            continue
         for object_id, (r, kind) in found.items():
             try:
                 deal_ids = [d for d in eps.get_associated_ids(object_type, object_id, "deals")
@@ -429,14 +474,21 @@ def collect_activity(since, until, deals_by_id, by_owner) -> list:
     return items
 
 
-def collect_open_tasks(deals_by_id, by_owner, due_before: datetime) -> list:
-    """Open tasks due before due_before, attributed to pipeline deals."""
+def collect_open_tasks(deals_by_id, by_owner, due_before: datetime, skipped: list = None) -> list:
+    """Open tasks due before due_before, attributed to pipeline deals.
+    Degrades to [] if the tasks read scope is missing."""
     filters = [
         {"propertyName": "hs_task_status", "operator": "NEQ", "value": "COMPLETED"},
         {"propertyName": "hs_timestamp", "operator": "LT", "value": _ms(due_before)},
     ]
-    rows = search_objects("tasks", filters, ["hs_task_subject", "hs_task_status",
-                                             "hs_timestamp", "hubspot_owner_id"])
+    try:
+        rows = search_objects("tasks", filters, ["hs_task_subject", "hs_task_status",
+                                                 "hs_timestamp", "hubspot_owner_id"])
+    except Exception as e:
+        logger.warning(f"Open-tasks search failed ({e}); skipped this run")
+        if skipped is not None:
+            skipped.append("open tasks (overdue/due-today)")
+        return []
     tasks = []
     for r in rows:
         object_id = str(r.get("id", ""))
@@ -453,7 +505,7 @@ def collect_open_tasks(deals_by_id, by_owner, due_before: datetime) -> list:
             "id": object_id,
             "subject": props.get("hs_task_subject") or "(task)",
             "due": _parse_ts(props.get("hs_timestamp")),
-            "owner": by_owner.get(str(props.get("hubspot_owner_id") or ""), "Unassigned"),
+            "owner": owner_name(by_owner, props.get("hubspot_owner_id")),
             "deals": [deals_by_id[d]["name"] for d in deal_ids],
         })
     return tasks
@@ -705,6 +757,7 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
     logger.info(f"Digest run {run_id}: window {since.isoformat()} .. {until.isoformat()}, dry_run={dry_run}")
 
     data, quiet, sent, body, subject = None, False, False, "", ""
+    skipped = []
     try:
         stages = get_pipeline_stages()
         stage_labels = {s["id"]: s["label"] for s in stages}
@@ -713,7 +766,7 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
         if not closing:
             logger.warning("No Closing stage matched -- wire-watch flags disabled this run")
 
-        by_owner, by_user = get_owner_maps()
+        by_owner, by_user = get_owner_maps(skipped)
         deals = [normalize_deal(r, stages, by_owner, closing_id)
                  for r in get_pipeline_deals(closing_id)]
         deals_by_id = {d["id"]: d for d in deals}
@@ -723,10 +776,10 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
                        if d.get("modified") and since <= d["modified"] < until]
         stage_moves, property_changes = collect_deltas(
             changed_ids, deals_by_id, since, until, by_user, stage_labels)
-        activity = collect_activity(since, until, deals_by_id, by_owner)
+        activity = collect_activity(since, until, deals_by_id, by_owner, skipped)
 
         _, day_end = israel_day_bounds(now)
-        open_tasks = collect_open_tasks(deals_by_id, by_owner, day_end)
+        open_tasks = collect_open_tasks(deals_by_id, by_owner, day_end, skipped)
         overdue, due_today = split_overdue_and_due_today(open_tasks, now)
         flags = (flag_stale_deals(deals, now)
                  + flag_overdue_tasks(overdue)
@@ -767,13 +820,14 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
             "quiet": quiet,
             "sent": sent,
             "counts": counts,
+            "skipped": skipped,
             "subject": subject,
             "body": body,
             "data": data,
         }
         write_status({k: result[k] for k in
                       ("status", "run_id", "finished_at", "window", "dry_run",
-                       "quiet", "sent", "counts", "subject", "body")})
+                       "quiet", "sent", "counts", "skipped", "subject", "body")})
         return result
     except Exception as e:
         record_run(conn, run_id, started_at, since, until, data, quiet, sent, dry_run, "error")
@@ -785,6 +839,7 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "window": {"since": since.isoformat(), "until": until.isoformat()},
             "dry_run": dry_run,
+            "skipped": skipped,
             "error": str(e),
             "traceback": tb,
         })

@@ -136,6 +136,66 @@ def test_extract_changes_skips_no_op_rewrites():
 
 
 # ----------------------------------------------------------------------
+#  Owner resolution + graceful degradation
+# ----------------------------------------------------------------------
+
+def test_owner_map_from_env_reverses_mapping(monkeypatch):
+    monkeypatch.setenv("HUBSPOT_OWNER_MAP",
+                       '{"bk@negevlabs.com":"241153249","shlomi@negevlabs.com":"31267643"}')
+    out = dpd._owner_map_from_env()
+    assert out == {"241153249": "bk@negevlabs.com", "31267643": "shlomi@negevlabs.com"}
+
+
+def test_owner_map_from_env_handles_bad_json(monkeypatch):
+    monkeypatch.setenv("HUBSPOT_OWNER_MAP", "not-json")
+    assert dpd._owner_map_from_env() == {}
+
+
+def test_get_owner_maps_degrades_to_env_on_403(monkeypatch):
+    monkeypatch.setenv("HUBSPOT_OWNER_MAP", '{"bk@negevlabs.com":"241153249"}')
+
+    def forbidden(method, endpoint, data=None, params=None):
+        raise RuntimeError("403 Client Error: Forbidden")
+
+    monkeypatch.setattr(eps, "hubspot_request", forbidden)
+    skipped = []
+    by_owner, by_user = dpd.get_owner_maps(skipped)
+    assert by_owner == {"241153249": "bk@negevlabs.com"}
+    assert by_user == {}
+    assert any("owners.read" in s for s in skipped)
+
+
+def test_owner_name_fallbacks():
+    by_owner = {"241153249": "Ken Belotsky"}
+    assert dpd.owner_name(by_owner, "241153249") == "Ken Belotsky"
+    assert dpd.owner_name(by_owner, "999") == "Owner 999"   # present but unmapped
+    assert dpd.owner_name(by_owner, "") == "Unassigned"
+    assert dpd.owner_name(by_owner, None) == "Unassigned"
+
+
+def test_collect_activity_skips_object_type_on_search_failure(monkeypatch):
+    # notes search 403s; the type is recorded in skipped and the rest proceeds
+    def search(object_type, filters, properties):
+        if object_type == "notes":
+            raise RuntimeError("403 Forbidden")
+        return []
+
+    monkeypatch.setattr(dpd, "search_objects", search)
+    skipped = []
+    items = dpd.collect_activity(NOW - timedelta(hours=24), NOW, {}, {}, skipped)
+    assert items == []
+    assert any("notes" in s for s in skipped)
+
+
+def test_collect_open_tasks_degrades_to_empty(monkeypatch):
+    monkeypatch.setattr(dpd, "search_objects",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("403")))
+    skipped = []
+    assert dpd.collect_open_tasks({}, {}, NOW, skipped) == []
+    assert any("open tasks" in s for s in skipped)
+
+
+# ----------------------------------------------------------------------
 #  Rules engine
 # ----------------------------------------------------------------------
 
@@ -337,7 +397,7 @@ def stub_collectors(monkeypatch):
     stage = {"id": "s2", "label": "Value Validation", "probability": 0.4,
              "is_closed": False, "order": 0}
     monkeypatch.setattr(dpd, "get_pipeline_stages", lambda: [stage])
-    monkeypatch.setattr(dpd, "get_owner_maps", lambda: ({}, {}))
+    monkeypatch.setattr(dpd, "get_owner_maps", lambda skipped=None: ({}, {}))
     monkeypatch.setattr(dpd, "get_pipeline_deals", lambda closing_stage_id="": [])
     monkeypatch.setattr(dpd, "collect_activity", lambda *a, **k: [])
     monkeypatch.setattr(dpd, "collect_open_tasks", lambda *a, **k: [])
