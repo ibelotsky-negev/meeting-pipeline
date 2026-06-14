@@ -315,6 +315,70 @@ def test_group_by_owner_defaults_unassigned():
 
 
 # ----------------------------------------------------------------------
+#  HTML email rendering (the actual email body)
+# ----------------------------------------------------------------------
+
+def test_fmt_change_value():
+    assert dpd._fmt_change_value("close date", "2026-06-14T13:53:41.234Z") == "2026-06-14"
+    assert dpd._fmt_change_value("amount", "250000") == "$250,000"
+    assert dpd._fmt_change_value("amount", "250000.0") == "$250,000"
+    assert dpd._fmt_change_value("close date", None) == "(none)"
+    assert dpd._fmt_change_value("amount", "garbage") == "garbage"
+
+
+def test_render_html_suppresses_empty_sections():
+    html = dpd.render_html(_data())
+    assert "Stage moves" not in html
+    assert "New activity" not in html
+    assert "Flags" not in html
+    assert "Due today" not in html
+    # Footer totals always present
+    assert "Pipeline: 1 deals" in html
+    assert "$100,000" in html
+    # Well-formed wrapper
+    assert html.startswith("<div") and html.endswith("</div>")
+
+
+def test_render_html_includes_sections_with_structure():
+    move = {"deal": "Misha - NL 2026", "from": "Discovery", "to": "Value Validation",
+            "by": "Vadim Usov", "at": ""}
+    activity = dpd.group_by_owner([
+        {"owner": "Vadim Usov", "deal": "Misha - NL 2026", "type": "note logged",
+         "summary": "Call scheduled for 15 June", "author": "Alex K", "at": ""}])
+    flag = {"type": "stale", "deal": "Quiet Fund", "owner": "Shlomi",
+            "detail": "no activity for 9 days"}
+    data = _data(stage_moves=[move], activity=activity, flags=dpd.group_by_owner([flag]))
+    html = dpd.render_html(data)
+    assert "<h3" in html and "Stage moves" in html
+    assert "<ul" in html and "<li" in html
+    assert "Discovery &rarr; Value Validation" in html
+    assert "Vadim Usov" in html
+    assert "Call scheduled for 15 June" in html
+    assert "New activity" in html
+    assert "Flags" in html
+    assert "no activity for 9 days" in html
+
+
+def test_render_html_escapes_user_content():
+    # A deal name with markup must not break the email structure
+    move = {"deal": "<script>alert(1)</script> & Co", "from": "A", "to": "B",
+            "by": "X", "at": ""}
+    html = dpd.render_html(_data(stage_moves=[move]))
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+    assert "&amp; Co" in html
+
+
+def test_render_html_formats_property_changes():
+    change = {"deal": "Yan", "property": "close date", "from": None,
+              "to": "2026-06-14T13:53:41.234Z", "by": "Alex K", "at": ""}
+    html = dpd.render_html(_data(property_changes=[change]))
+    assert "close date" in html
+    assert "2026-06-14" in html
+    assert "2026-06-14T13:53:41" not in html  # raw timestamp must be prettified
+
+
+# ----------------------------------------------------------------------
 #  /digest/trigger endpoint
 # ----------------------------------------------------------------------
 

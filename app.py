@@ -4000,7 +4000,7 @@ def digest_status():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.14.2-digest-resilient-scopes", "deployed": "2026-06-14"})
+    return jsonify({"version": "2.14.3-digest-html-email", "deployed": "2026-06-14"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4034,7 +4034,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.14.2-digest-resilient-scopes", "steps": {}}
+    results = {"version": "2.14.3-digest-html-email", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

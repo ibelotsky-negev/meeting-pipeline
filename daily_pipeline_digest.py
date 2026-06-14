@@ -22,6 +22,7 @@ Author: Negev Labs
 
 import os
 import json
+import html
 import sqlite3
 import logging
 import argparse
@@ -661,9 +662,116 @@ def render_fallback(data: dict) -> str:
     return "\n".join(lines).strip()
 
 
+def _fmt_change_value(prop: str, value) -> str:
+    """Prettify a property-history value for display: close dates as YYYY-MM-DD,
+    amounts as $N,NNN, everything else verbatim."""
+    if value in (None, ""):
+        return "(none)"
+    if prop == "close date":
+        dt = _parse_ts(value)
+        return dt.date().isoformat() if dt else str(value)
+    if prop == "amount":
+        try:
+            return f"${int(float(value)):,}"
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def _esc(value) -> str:
+    return html.escape(str(value if value is not None else ""))
+
+
+# Inline styles only -- email clients strip <style> blocks and external CSS.
+_H3 = ('margin:18px 0 6px;font-size:15px;color:#1a1a1a;'
+       'border-bottom:1px solid #e2e2e2;padding-bottom:3px;')
+_OWNER = "margin:10px 0 2px;font-weight:600;color:#333;"
+_UL = "margin:2px 0 8px;padding-left:20px;"
+_LI = "margin:3px 0;color:#222;"
+_MUTED = "color:#888;"
+
+
+def render_html(data: dict) -> str:
+    """Deterministic HTML email body. Fixed section order, empty sections
+    suppressed, per-owner grouping. No LLM -- structure is reliable and the
+    raw note summaries are already short."""
+    parts = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;'
+             'line-height:1.5;color:#222;max-width:680px;">']
+
+    moves = data.get("stage_moves") or []
+    changes = data.get("property_changes") or []
+    if moves or changes:
+        parts.append(f'<h3 style="{_H3}">Stage moves</h3>')
+        parts.append(f'<ul style="{_UL}">')
+        for m in moves:
+            parts.append(
+                f'<li style="{_LI}"><b>{_esc(m["deal"])}</b>: '
+                f'{_esc(m["from"])} &rarr; {_esc(m["to"])} '
+                f'<span style="{_MUTED}">(by {_esc(m["by"])})</span></li>')
+        for c in changes:
+            parts.append(
+                f'<li style="{_LI}"><b>{_esc(c["deal"])}</b>: {_esc(c["property"])} '
+                f'{_esc(_fmt_change_value(c["property"], c["from"]))} &rarr; '
+                f'{_esc(_fmt_change_value(c["property"], c["to"]))} '
+                f'<span style="{_MUTED}">(by {_esc(c["by"])})</span></li>')
+        parts.append('</ul>')
+
+    activity = data.get("activity") or {}
+    if activity:
+        parts.append(f'<h3 style="{_H3}">New activity</h3>')
+        for owner, items in activity.items():
+            parts.append(f'<div style="{_OWNER}">{_esc(owner)}</div>')
+            parts.append(f'<ul style="{_UL}">')
+            for it in items:
+                author = (f' <span style="{_MUTED}">({_esc(it["author"])})</span>'
+                          if it.get("author") else "")
+                summary = _esc((it.get("summary") or "")[:300])
+                parts.append(
+                    f'<li style="{_LI}"><b>{_esc(it["deal"])}</b> &mdash; '
+                    f'{summary}{author}</li>')
+            parts.append('</ul>')
+
+    flags = data.get("flags") or {}
+    if flags:
+        parts.append(f'<h3 style="{_H3}">Flags</h3>')
+        for owner, items in flags.items():
+            parts.append(f'<div style="{_OWNER}">{_esc(owner)}</div>')
+            parts.append(f'<ul style="{_UL}">')
+            for f in items:
+                parts.append(
+                    f'<li style="{_LI}"><b>{_esc(f["type"])}</b> &mdash; '
+                    f'{_esc(f["deal"])}: {_esc(f["detail"])}</li>')
+            parts.append('</ul>')
+
+    due = data.get("due_today") or {}
+    if due:
+        parts.append(f'<h3 style="{_H3}">Due today</h3>')
+        for owner, items in due.items():
+            parts.append(f'<div style="{_OWNER}">{_esc(owner)}</div>')
+            parts.append(f'<ul style="{_UL}">')
+            for t in items:
+                deal = f' <span style="{_MUTED}">({_esc(t["deal"])})</span>' if t.get("deal") else ""
+                parts.append(f'<li style="{_LI}">{_esc(t["task"])}{deal}</li>')
+            parts.append('</ul>')
+
+    totals = data.get("totals") or {}
+    stage_summary = " &middot; ".join(
+        f"{_esc(label)} {count}" for label, count in (totals.get("by_stage") or {}).items())
+    parts.append(
+        '<p style="margin-top:18px;padding-top:8px;border-top:1px solid #e2e2e2;'
+        f'{_MUTED}font-size:13px;">Pipeline: {totals.get("deals", 0)} deals'
+        f'{" &middot; " + stage_summary if stage_summary else ""} &middot; '
+        f'weighted open value ${totals.get("weighted_open_value", 0):,}</p>')
+
+    parts.append('</div>')
+    return "".join(parts)
+
+
 def compose_digest(data: dict) -> str:
     """One LLM call turning collected deltas + flags into the morning brief.
-    Rules logic stays deterministic -- the LLM only composes prose."""
+    Rules logic stays deterministic -- the LLM only composes prose. Retained as
+    an optional text composer; the default email path is render_html (HTML is
+    far more readable in Outlook, which collapses plain-text newlines)."""
     import anthropic
 
     api_key = os.environ.get("CLAUDE_API_KEY", "")
@@ -704,13 +812,13 @@ Return ONLY the email body text."""
 # ======================================================================
 
 
-def send_digest_email(subject: str, body: str):
+def send_digest_email(subject: str, body: str, content_type: str = "HTML"):
     sender = os.environ.get("BOT_SENDER_EMAIL", "")
     if not sender:
         raise RuntimeError("BOT_SENDER_EMAIL not set -- digest not emailed")
     message = {
         "subject": subject,
-        "body": {"contentType": "text", "content": body},
+        "body": {"contentType": content_type, "content": body},
         "toRecipients": [{"emailAddress": {"address": r}} for r in DIGEST_RECIPIENTS],
     }
     if DIGEST_CC:
@@ -792,13 +900,10 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
         subject = f"[Sara] Pipeline digest -- {local_date}"
         quiet = is_quiet(data)
         if quiet:
-            body = "No pipeline changes yesterday. Nothing flagged, nothing due today."
+            body = ('<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;">'
+                    'No pipeline changes yesterday. Nothing flagged, nothing due today.</div>')
         else:
-            try:
-                body = compose_digest(data)
-            except Exception as e:
-                logger.error(f"Composer failed, sending fallback rendering: {e}")
-                body = render_fallback(data)
+            body = render_html(data)
 
         if dry_run:
             logger.info(f"[dry-run] digest body:\n{body}")
