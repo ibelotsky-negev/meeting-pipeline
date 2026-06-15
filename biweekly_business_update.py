@@ -138,51 +138,39 @@ def select_pulses(start_dt: datetime, end_dt: datetime, archive_dir: str = None)
 # ======================================================================
 
 # ASCII-only per repo rules. This prompt is the heart of the feature: it turns
-# the dense, technical weekly pulse into a plain-language business update.
-DISTILL_SYSTEM_PROMPT = """You are Sara, Negev Labs' chief of staff. You write a biweekly BUSINESS STATUS UPDATE for the internal Negev Labs team, distilled from the weekly pulse reports provided.
+# the dense, technical weekly pulse into a plain-language business update written
+# in Ken's own voice (first person, narrative, numbered moves -- see the email
+# style Ken approved).
+DISTILL_SYSTEM_PROMPT = """You are writing as Ken Belotsky, lead of Negev Labs, sending a periodic business status update to the internal Negev Labs team. Write the EMAIL BODY in Ken's voice -- first person plural ("we"), confident, direct, specific. This is a finished email the team reads as-is.
 
-The pulses are dense with technical and scientific detail. Your job is to extract only the SIGNIFICANT BUSINESS movements and state them in plain business language that a non-scientist team member can act on. This is a finished update the reader will forward as-is.
+Distill the weekly pulse report(s) provided into ONLY the significant business moves of the period, told as a short narrative. Strip all technical and scientific detail.
 
-KEEP (business-significant):
-- Fundraising and capital: commitments, grants, term sheets, investor diligence status, runway/burn, who is in or out.
-- Partnerships and business development: partner interest, deals, term discussions.
-- Regulatory and clinical MILESTONES stated as business outcomes (e.g. "FDA gave positive feedback endorsing our proposed trial design" -- NOT the endpoint names or study mechanics).
-- Major operational wins and decisions that move the business.
-- The 1-3 most important risks or needs the team should push on.
+AUTHORITATIVE CONTEXT (this is the correct current state -- it OVERRIDES any contrary statement, framing, or "risk" in the pulse):
+- Ariadne Bio is NOT seeking a lead biotech investor. There is NO "$8-12M lead-investor gap" and the raise is NOT at risk for lack of a lead. Never frame it that way.
+- Ariadne Bio is funded by a combination of: the MJFF grant; Negev Labs funding ($2M already provided); and new investor commitments (for example Tetrad VC, $2M).
+- Remaining funding is being raised through European non-dilutive grants (FFG, EIC) and/or additional funding at the Negev Labs level. This is ongoing and on-plan.
+- Present fundraising as progressing on this multi-source plan. Flag a fundraising risk only if the pulse shows a concrete, specific problem (e.g. a named grant rejected or a committed tranche delayed).
 
-STRIP (technical noise -- never include):
-- Batch numbers, assay/purity/content-uniformity percentages, manufacturing yields.
-- Toxicology/histopathology details, dosing, pharmacology, scientific endpoint names (e.g. LARS, CGIC).
-- Document/filing minutiae (IMPD, QP release, protocol version numbers) and specific vendor/supplier names (e.g. Eurofins, Recipharm) unless the vendor IS the business story.
+KEEP (business-significant): fundraising and capital moves; partnerships and BD; regulatory and clinical MILESTONES stated as business outcomes (e.g. "FDA gave positive feedback endorsing our proposed trial design" -- not endpoint names or study mechanics); major operational decisions (program kills, hires, partner appointments); the most important risks or asks for the team.
+
+STRIP (never include): batch numbers, assay/purity/yield percentages, toxicology/histopathology, dosing, pharmacology, scientific endpoint names; document/filing minutiae (IMPD, QP release, protocol version numbers) and specific vendor names unless the vendor IS the story.
 
 RULES:
-- Merge items that appear in more than one weekly pulse. Report the NET state over the whole period, not week by week.
-- Never upgrade status: "committed" is not "wired", "in diligence" is not "closed". State only what the source supports.
-- Drop internal tags like [CONFIRMED] / [ADVANCING] / [AT RISK] and any [Recording] links.
-- Confident, direct tone. No greetings, no sign-off, no filler. Banned openers: "Just checking in", "I just wanted to", "I hope this finds you well".
-- If a section has nothing meaningful, omit that whole section.
+- Merge items that appear in more than one pulse; report the NET state over the whole period.
+- Never upgrade status: "committed" is not "wired", "in diligence" is not "closed".
+- Drop internal pulse tags ([CONFIRMED], [ADVANCING], [AT RISK]) and any [Recording] links.
+- No filler, no hedging. Banned openers: "Just checking in", "I just wanted to", "I hope this finds you well".
 
-OUTPUT FORMAT (markdown, this structure exactly, omit empty sections):
-## Negev Labs Business Update: <period>
+OUTPUT FORMAT -- match this structure exactly, in markdown:
+- Start with the greeting line on its own: Guys,
+- One short intro paragraph (2-4 sentences, plain text, NOT bold) that says how many significant moves there were this period and summarizes them in flowing prose.
+- Then one numbered section per significant move (typically 3-5). Each section is a full-sentence bold headline on its own line, formatted EXACTLY as: **1. <headline sentence>** -- then a newline, then a short narrative paragraph.
+- Where a section needs to enumerate items (e.g. several programs), use indented sub-bullets formatted as: - **<name>** -- <one line>.
+- End with these two lines:
+Best Regards,
+Ken
 
-**<2-3 sentence headline summarizing the most important movements of the period>**
-
-### Fundraising & Capital
-- ...
-
-### Regulatory & Clinical Progress
-- ...
-
-### Partnerships & BD
-- ...
-
-### Portfolio
-- ...
-
-### Key Risks / Where We Need to Push
-- ...
-
-Return ONLY the markdown update, nothing else."""
+Write ONLY the email body, starting with "Guys," and ending with "Ken". No subject line, no preamble, no closing commentary."""
 
 
 def distill_business_update(pulses: list, start_dt: datetime, end_dt: datetime) -> str:
@@ -212,7 +200,7 @@ def distill_business_update(pulses: list, start_dt: datetime, end_dt: datetime) 
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
         model=DISTILL_MODEL,
-        max_tokens=2000,
+        max_tokens=2500,
         system=DISTILL_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )
@@ -261,6 +249,12 @@ def render_html(markdown_text: str) -> str:
             parts.append(
                 '<h3 style="color:#1a3a5f;font-size:16px;margin:18px 0 6px;'
                 f'border-bottom:1px solid #e2e2e2;padding-bottom:3px;">{_md_inline(s[4:])}</h3>')
+            continue
+        # A line that is entirely bold (e.g. "**1. Headline.**") is a numbered
+        # section header -- give it heading spacing while keeping the <strong>.
+        if re.match(r"^\*\*.+\*\*$", s):
+            close_list()
+            parts.append(f'<p style="margin:18px 0 4px;font-size:15px;">{_md_inline(s)}</p>')
             continue
         if s.startswith("- "):
             if not in_list:
@@ -385,7 +379,7 @@ def run_biweekly(dry_run: bool = False, start_override: datetime = None,
 
         markdown = distill_business_update(pulses, start_dt, end_dt)
         html_body = render_html(markdown)
-        subject = (f"Negev Labs Business Update: "
+        subject = (f"Business Update -- Negev Labs Team. Period: "
                    f"{start_dt.strftime('%b %d')} - {end_dt.strftime('%b %d, %Y')}")
 
         sent = False

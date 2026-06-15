@@ -4068,7 +4068,7 @@ def biweekly_status():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.15.0-biweekly-update", "deployed": "2026-06-15"})
+    return jsonify({"version": "2.15.1-biweekly-style", "deployed": "2026-06-15"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4102,7 +4102,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.15.0-biweekly-update", "steps": {}}
+    results = {"version": "2.15.1-biweekly-style", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

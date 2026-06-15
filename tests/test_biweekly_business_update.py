@@ -152,6 +152,26 @@ def test_render_html_structure_and_escaping():
     assert "Review before forwarding" in out  # footer present
 
 
+def test_render_html_narrative_style():
+    # Ken's approved style: greeting, intro, numbered bold section headers,
+    # sub-bullets, sign-off.
+    md = ("Guys,\n\n"
+          "Three significant moves this period.\n\n"
+          "**1. Dan is now a partner.**\n"
+          "Recognition of his work on the grant.\n\n"
+          "**2. We shut down three programs.**\n"
+          "- **Amanita** -- discontinued, off-strategy\n\n"
+          "Best Regards,\nKen")
+    out = bwu.render_html(md)
+    # Full-line bold headers keep <strong> and render as spaced paragraphs
+    assert "<strong>1. Dan is now a partner.</strong>" in out
+    assert "<strong>2. We shut down three programs.</strong>" in out
+    # Greeting, body, sub-bullet, and sign-off all present
+    assert "Guys," in out
+    assert "<li" in out and "<strong>Amanita</strong>" in out
+    assert "Best Regards," in out and ">Ken<" in out
+
+
 # ----------------------------------------------------------------------
 #  run_biweekly
 # ----------------------------------------------------------------------
@@ -195,7 +215,7 @@ def test_run_biweekly_success_sends_and_persists(monkeypatch, status_path):
     assert result["status"] == "ok"
     assert result["sent"] is True
     assert result["pulses_used"] == ["2026-W23.json", "2026-W24.json"]
-    assert "Negev Labs Business Update" in captured["subject"]
+    assert "Business Update" in captured["subject"]
     persisted = json.loads(status_path.read_text())
     assert persisted["sent"] is True
 
