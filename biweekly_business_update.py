@@ -145,11 +145,7 @@ DISTILL_SYSTEM_PROMPT = """You are writing as Ken Belotsky, lead of Negev Labs, 
 
 Distill the weekly pulse report(s) provided into ONLY the significant business moves of the period, told as a short narrative. Strip all technical and scientific detail.
 
-AUTHORITATIVE CONTEXT (this is the correct current state -- it OVERRIDES any contrary statement, framing, or "risk" in the pulse):
-- Ariadne Bio is NOT seeking a lead biotech investor. There is NO "$8-12M lead-investor gap" and the raise is NOT at risk for lack of a lead. Never frame it that way.
-- Ariadne Bio is funded by a combination of: the MJFF grant; Negev Labs funding ($2M already provided); and new investor commitments (for example Tetrad VC, $2M).
-- Remaining funding is being raised through European non-dilutive grants (FFG, EIC) and/or additional funding at the Negev Labs level. This is ongoing and on-plan.
-- Present fundraising as progressing on this multi-source plan. Flag a fundraising risk only if the pulse shows a concrete, specific problem (e.g. a named grant rejected or a committed tranche delayed).
+Honor the STANDING CORRECTIONS FROM KEN appended at the end of these instructions: they are authoritative and override anything in the pulse that conflicts with them.
 
 KEEP (business-significant): fundraising and capital moves; partnerships and BD; regulatory and clinical MILESTONES stated as business outcomes (e.g. "FDA gave positive feedback endorsing our proposed trial design" -- not endpoint names or study mechanics); major operational decisions (program kills, hires, partner appointments); the most important risks or asks for the team.
 
@@ -201,11 +197,20 @@ def distill_business_update(pulses: list, start_dt: datetime, end_dt: datetime) 
         f"Produce the biweekly business update for {period_label} now. Markdown only."
     )
 
+    # Append Ken's standing corrections (baseline + email-submitted) as
+    # authoritative overrides. Never fatal -- distill still runs without them.
+    system_prompt = DISTILL_SYSTEM_PROMPT
+    try:
+        import sara_corrections
+        system_prompt += "\n\n" + sara_corrections.corrections_block()
+    except Exception as e:
+        logger.warning(f"Could not load standing corrections (non-fatal): {e}")
+
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
         model=DISTILL_MODEL,
         max_tokens=2500,
-        system=DISTILL_SYSTEM_PROMPT,
+        system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     )
     text = "".join(b.text for b in response.content if hasattr(b, "text")).strip()

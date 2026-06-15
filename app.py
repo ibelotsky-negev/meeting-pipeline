@@ -1355,6 +1355,13 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
         .replace("{teams_json}", json.dumps(teams_signals, indent=2))
         .replace("{meetings_json}", json.dumps(meeting_signals, indent=2))
     )
+    # Append Ken's standing corrections (e.g. the Ariadne fundraising structure)
+    # as authoritative overrides so the synthesis does not repeat known mistakes.
+    try:
+        import sara_corrections
+        synthesis_prompt += "\n\n" + sara_corrections.corrections_block()
+    except Exception as e:
+        logger.warning(f"[pulse] Could not load standing corrections (non-fatal): {e}")
     report = _pulse_call_claude(synthesis_prompt, model=PULSE_MODEL_SYNTHESIZE)
     logger.info("[pulse] Synthesis complete")
 
@@ -4066,9 +4073,66 @@ def biweekly_status():
     return jsonify(biweekly_business_update.read_status())
 
 
+_corrections_lock = _threading.Lock()
+
+
+@app.route("/corrections", methods=["GET"])
+def corrections_list():
+    """Active standing corrections that Sara applies to the weekly pulse and the
+    biweekly business update. `?all=true` includes deactivated ones."""
+    import sara_corrections
+    include = request.args.get("all", "").lower() in ("true", "1", "yes")
+    items = sara_corrections.list_corrections(include_inactive=include)
+    return jsonify({"count": len(items), "corrections": items,
+                    "baseline_count": len(sara_corrections.BASELINE_CORRECTIONS)})
+
+
+@app.route("/corrections/ingest", methods=["GET"])
+def corrections_ingest():
+    """Scan Sara's mailbox now for reply-corrections and store them. Manual
+    counterpart to the scheduled poll."""
+    import traceback as _c_tb
+    import sara_corrections
+    if not _corrections_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+    try:
+        result = sara_corrections.ingest_replies()
+        return jsonify({"status": "ok", **result})
+    except Exception as e:
+        logger.error(f"[corrections] Ingest failed: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e),
+                        "traceback": _c_tb.format_exc()}), 500
+    finally:
+        _corrections_lock.release()
+
+
+@app.route("/corrections/add", methods=["GET", "POST"])
+def corrections_add():
+    """Add a standing correction directly (without an email reply)."""
+    import sara_corrections
+    text = request.args.get("text") or (request.get_json(silent=True) or {}).get("text", "")
+    try:
+        entry = sara_corrections.add_correction(text, source="endpoint")
+    except ValueError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+    return jsonify({"status": "ok", "correction": entry})
+
+
+@app.route("/corrections/delete", methods=["GET", "POST"])
+def corrections_delete():
+    """Deactivate a standing correction by id so Sara stops applying it."""
+    import sara_corrections
+    cid = request.args.get("id", "")
+    if not cid:
+        return jsonify({"status": "error", "error": "id required"}), 400
+    found = sara_corrections.deactivate_correction(cid)
+    return (jsonify({"status": "ok", "deactivated": cid}) if found
+            else (jsonify({"status": "error", "error": "no active correction with that id"}), 404))
+
+
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.15.2-biweekly-strip", "deployed": "2026-06-15"})
+    return jsonify({"version": "2.16.0-corrections", "deployed": "2026-06-15"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4102,7 +4166,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.15.2-biweekly-strip", "steps": {}}
+    results = {"version": "2.16.0-corrections", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4861,6 +4925,23 @@ def biweekly_update_run():
         _biweekly_lock.release()
 
 
+def corrections_ingest_run():
+    """Scheduled scan of Sara's mailbox for reply-corrections (sara_corrections
+    module). Stores any new corrections so future reports honor them."""
+    if not _corrections_lock.acquire(blocking=False):
+        logger.warning("[corrections] Skipped scheduled ingest -- already running")
+        return
+    try:
+        import sara_corrections
+        result = sara_corrections.ingest_replies()
+        if result.get("added_count"):
+            logger.info(f"[corrections] Ingested {result['added_count']} new correction(s)")
+    except Exception as e:
+        logger.error(f"[corrections] Scheduled ingest failed: {e}", exc_info=True)
+    finally:
+        _corrections_lock.release()
+
+
 _scheduler = None  # module-level so diagnostic endpoints can inspect it
 
 
@@ -4898,6 +4979,15 @@ def start_scheduler():
         id="biweekly_business_update",
         replace_existing=True,
         misfire_grace_time=3600,
+    )
+    # Corrections ingest: scan Sara's mailbox every 20min for reply-corrections
+    # so future pulse/biweekly reports honor Ken's feedback promptly.
+    _scheduler.add_job(
+        corrections_ingest_run,
+        trigger="interval",
+        minutes=20,
+        id="corrections_ingest",
+        replace_existing=True,
     )
     # Renewal job: every 45min, renews if expiry < 30min away (Graph max is 59min for this resource)
     _scheduler.add_job(

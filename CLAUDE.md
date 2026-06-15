@@ -107,6 +107,10 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/pulse/history` | Browse archived pulse reports |
 | `/biweekly/trigger` | Manual biweekly business update (`?dry_run=&sync=&force=&start=&end=`) |
 | `/biweekly/status` | Last biweekly update run outcome |
+| `/corrections` | List active standing corrections (`?all=true` incl. inactive) |
+| `/corrections/ingest` | Scan Sara's mailbox now for reply-corrections |
+| `/corrections/add` | Add a standing correction (`?text=`) |
+| `/corrections/delete` | Deactivate a correction (`?id=`) |
 
 ## Architecture Notes
 
@@ -114,6 +118,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Phase 2 (manual):** Organizer opens review page -> edits tasks/email -> clicks Approve -> HubSpot + Asana + Outlook actions created
 - **Weekly Pulse:** Sunday 22:00 IST, scans all team emails/Teams/meetings, 4-pass Claude analysis, Green/Yellow/Red report emailed to Ken
 - **Biweekly Business Update:** every other Monday 07:15 IST, distills the trailing ~2 weeks of pulse archives into a team-facing, technical-detail-free business update emailed to Ken to forward (`biweekly_business_update.py`; weekly Monday cron gated to every other week by `should_run_biweekly`)
+- **Standing Corrections:** Ken replies to a pulse/biweekly email with a correction; `sara_corrections.py` ingests it from Sara's mailbox (scheduled every 20 min) and injects it as an authoritative override into both the pulse synthesis and the biweekly distill. Baseline correction (Ariadne fundraising structure) is always applied. Store: `/data/sara_corrections.json`
 - **Pending approvals** stored in `/data/pending_approvals.json` (Railway persistent volume at `/data/`)
 - **Pulse archives** stored in `/data/pulse/{YYYY}-W{WW}.json`
 - **Microsoft Graph** uses app-only auth (team-wide), refresh token persisted at `/data/refresh_token.txt`
