@@ -105,12 +105,15 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/pulse/trigger` | Manual weekly pulse (supports `?dry_run=true&days=N`) |
 | `/pulse/check` | Verify Graph permissions for pulse |
 | `/pulse/history` | Browse archived pulse reports |
+| `/biweekly/trigger` | Manual biweekly business update (`?dry_run=&sync=&force=&start=&end=`) |
+| `/biweekly/status` | Last biweekly update run outcome |
 
 ## Architecture Notes
 
 - **Phase 1 (auto):** Fireflies/Teams triggers -> Claude extracts intelligence -> notification email sent with review link
 - **Phase 2 (manual):** Organizer opens review page -> edits tasks/email -> clicks Approve -> HubSpot + Asana + Outlook actions created
 - **Weekly Pulse:** Sunday 22:00 IST, scans all team emails/Teams/meetings, 4-pass Claude analysis, Green/Yellow/Red report emailed to Ken
+- **Biweekly Business Update:** every other Monday 07:15 IST, distills the trailing ~2 weeks of pulse archives into a team-facing, technical-detail-free business update emailed to Ken to forward (`biweekly_business_update.py`; weekly Monday cron gated to every other week by `should_run_biweekly`)
 - **Pending approvals** stored in `/data/pending_approvals.json` (Railway persistent volume at `/data/`)
 - **Pulse archives** stored in `/data/pulse/{YYYY}-W{WW}.json`
 - **Microsoft Graph** uses app-only auth (team-wide), refresh token persisted at `/data/refresh_token.txt`

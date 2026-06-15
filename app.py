@@ -3998,9 +3998,77 @@ def digest_status():
     return jsonify(daily_pipeline_digest.read_status())
 
 
+_biweekly_lock = _threading.Lock()
+
+
+@app.route("/biweekly/trigger", methods=["GET"])
+def biweekly_trigger():
+    """Manually trigger the biweekly business update (distilled from weekly pulse
+    archives, emailed to Ken to forward to the team).
+    ?dry_run=true                    -- compose but send no email.
+    ?sync=true                       -- run inline, return result/traceback JSON.
+    ?force=true                      -- ignore the every-other-week cadence gate.
+    ?start=YYYY-MM-DD&end=YYYY-MM-DD -- explicit window (e.g. a backfill)."""
+    import traceback as _bw_tb
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
+    force = request.args.get("force", "").lower() in ("true", "1", "yes")
+    start_arg = request.args.get("start", "")
+    end_arg = request.args.get("end", "")
+    try:
+        start_override = (datetime.fromisoformat(start_arg).replace(tzinfo=timezone.utc)
+                          if start_arg else None)
+        end_override = (datetime.fromisoformat(end_arg).replace(tzinfo=timezone.utc)
+                        if end_arg else None)
+    except ValueError:
+        return jsonify({"status": "error", "error": "start/end must be YYYY-MM-DD"}), 400
+
+    if not _biweekly_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import biweekly_business_update
+            result = biweekly_business_update.run_biweekly(
+                dry_run=dry_run, start_override=start_override,
+                end_override=end_override, force=force)
+            logger.info("[biweekly] Sync run complete")
+            return jsonify(result)
+        except Exception as e:
+            logger.error(f"[biweekly] Sync run failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _bw_tb.format_exc()}), 500
+        finally:
+            _biweekly_lock.release()
+
+    def _run():
+        try:
+            import biweekly_business_update
+            biweekly_business_update.run_biweekly(
+                dry_run=dry_run, start_override=start_override,
+                end_override=end_override, force=force)
+            logger.info("[biweekly] Manual run complete")
+        except Exception as e:
+            logger.error(f"[biweekly] Manual run failed: {e}", exc_info=True)
+        finally:
+            _biweekly_lock.release()
+
+    logger.info(f"[biweekly] Trigger: dry_run={dry_run} -- launching background thread")
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({"status": "started", "dry_run": dry_run})
+
+
+@app.route("/biweekly/status", methods=["GET"])
+def biweekly_status():
+    """Last biweekly business update run outcome (or error traceback)."""
+    import biweekly_business_update
+    return jsonify(biweekly_business_update.read_status())
+
+
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.14.3-digest-html-email", "deployed": "2026-06-14"})
+    return jsonify({"version": "2.15.0-biweekly-update", "deployed": "2026-06-15"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4034,7 +4102,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.14.3-digest-html-email", "steps": {}}
+    results = {"version": "2.15.0-biweekly-update", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4770,6 +4838,29 @@ def daily_digest_run():
         _digest_lock.release()
 
 
+def biweekly_update_run():
+    """Scheduled biweekly business update (biweekly_business_update module).
+
+    Registered as a weekly Monday cron; the module's cadence gate
+    (should_run_biweekly) no-ops on the in-between weeks so this fires every
+    other week without ISO-week parity edge cases."""
+    import biweekly_business_update
+    if not biweekly_business_update.should_run_biweekly():
+        logger.info("[biweekly] Off week -- skipping scheduled run")
+        return
+    if not _biweekly_lock.acquire(blocking=False):
+        logger.warning("[biweekly] Skipped scheduled run -- already running")
+        return
+    try:
+        logger.info("[biweekly] Starting scheduled biweekly business update")
+        biweekly_business_update.run_biweekly()
+        logger.info("[biweekly] Biweekly business update complete")
+    except Exception as e:
+        logger.error(f"[biweekly] Failed: {e}", exc_info=True)
+    finally:
+        _biweekly_lock.release()
+
+
 _scheduler = None  # module-level so diagnostic endpoints can inspect it
 
 
@@ -4795,6 +4886,18 @@ def start_scheduler():
         id="daily_pipeline_digest",
         replace_existing=True,
         misfire_grace_time=3600,  # 1-hour window to fire if exact time was missed
+    )
+    # Biweekly business update: weekly Monday cron, gated to every other week by
+    # should_run_biweekly(). 04:15 UTC = 07:15 Israel (IDT), after the daily digest.
+    _scheduler.add_job(
+        biweekly_update_run,
+        trigger="cron",
+        day_of_week="mon",
+        hour=4,
+        minute=15,
+        id="biweekly_business_update",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
     # Renewal job: every 45min, renews if expiry < 30min away (Graph max is 59min for this resource)
     _scheduler.add_job(
