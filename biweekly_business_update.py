@@ -153,7 +153,11 @@ AUTHORITATIVE CONTEXT (this is the correct current state -- it OVERRIDES any con
 
 KEEP (business-significant): fundraising and capital moves; partnerships and BD; regulatory and clinical MILESTONES stated as business outcomes (e.g. "FDA gave positive feedback endorsing our proposed trial design" -- not endpoint names or study mechanics); major operational decisions (program kills, hires, partner appointments); the most important risks or asks for the team.
 
-STRIP (never include): batch numbers, assay/purity/yield percentages, toxicology/histopathology, dosing, pharmacology, scientific endpoint names; document/filing minutiae (IMPD, QP release, protocol version numbers) and specific vendor names unless the vendor IS the story.
+STRIP (never include -- not even in passing, not even inside a narrative sentence). If tempted to include a scientific term, replace it with its plain business meaning or drop it:
+- Manufacturing / CMC entirely: GMP, batch production, capsule/tablet manufacturing, formulation, assay, purity, yield, stability. If drug supply matters, say only "clinical drug supply is on track" -- never mention batches or assay results.
+- Clinical/scientific endpoint or scale names and acronyms (e.g. LARS, CGIC) and primary/secondary endpoint mechanics. For FDA or regulatory feedback, state ONLY the business outcome ("FDA gave positive feedback endorsing our proposed trial design") -- never name the endpoints.
+- Toxicology/histopathology, dosing, pharmacology.
+- Document/filing minutiae (IMPD, QP release, protocol version numbers) and specific vendor/supplier names unless the vendor IS the business story.
 
 RULES:
 - Merge items that appear in more than one pulse; report the NET state over the whole period.
