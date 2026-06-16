@@ -379,6 +379,80 @@ def test_render_html_formats_property_changes():
 
 
 # ----------------------------------------------------------------------
+#  HubSpot deep links
+# ----------------------------------------------------------------------
+
+def test_record_url_builds_link():
+    url = dpd._record_url("12345", "deals", "999")
+    assert url == "https://app.hubspot.com/contacts/12345/record/0-3/999"
+    assert dpd._record_url("12345", "notes", "5") == \
+        "https://app.hubspot.com/contacts/12345/record/0-46/5"
+
+
+def test_record_url_empty_when_missing_pieces():
+    assert dpd._record_url("", "deals", "999") == ""        # no portal
+    assert dpd._record_url("12345", "deals", "") == ""       # no object id
+    assert dpd._record_url("12345", "unknown", "1") == ""    # unknown type
+
+
+def test_link_falls_back_to_escaped_text_without_url():
+    assert dpd._link("", "A & B") == "A &amp; B"
+    out = dpd._link("https://x/y?a=1&b=2", "Deal")
+    assert out.startswith('<a href="https://x/y?a=1&amp;b=2"')
+    assert ">Deal</a>" in out
+
+
+def test_render_html_links_deals_and_activities_with_portal():
+    move = {"deal": "Tetrad VC", "deal_id": "111", "from": "Discovery",
+            "to": "Value Validation", "by": "Alex K", "at": ""}
+    activity = dpd.group_by_owner([
+        {"owner": "Vadim", "deal": "Tetrad VC", "deal_id": "111", "type": "note logged",
+         "object_type": "notes", "object_id": "222",
+         "summary": "Call scheduled", "author": "Alex K", "at": ""}])
+    data = _data(stage_moves=[move], activity=activity)
+    data["hubspot_portal_id"] = "98765"
+    html = dpd.render_html(data)
+    assert "/contacts/98765/record/0-3/111" in html    # deal link
+    assert "/contacts/98765/record/0-46/222" in html    # note (activity) link
+
+
+def test_render_html_no_links_without_portal_id():
+    move = {"deal": "Tetrad VC", "deal_id": "111", "from": "A", "to": "B",
+            "by": "X", "at": ""}
+    data = _data(stage_moves=[move])  # _data has no portal id
+    html = dpd.render_html(data)
+    assert "<a href" not in html
+    assert "Tetrad VC" in html  # name still shown, just not linked
+
+
+def test_render_html_links_overdue_task_and_due_today():
+    overdue = {"type": "overdue task", "deal": "TKN", "deal_id": "111",
+               "task_id": "333", "owner": "Ken", "detail": "\"Follow up\" due 2026-05-11"}
+    due = [{"owner": "Ken", "task": "Send UPA", "deal": "Tetrad", "deal_id": "111",
+            "task_id": "444", "due": "2026-06-16T08:00:00+00:00"}]
+    data = _data(flags=dpd.group_by_owner([overdue]),
+                 due_today=dpd.group_by_owner(due))
+    data["hubspot_portal_id"] = "98765"
+    html = dpd.render_html(data)
+    assert "/record/0-27/333" in html   # overdue task -> task record
+    assert "open task" in html
+    assert "/record/0-27/444" in html   # due-today task -> task record
+
+
+def test_build_digest_data_threads_portal_and_task_ids():
+    stages = [{"id": "s2", "label": "Value Validation", "probability": 0.4,
+               "is_closed": False, "order": 0}]
+    due = [{"id": "444", "subject": "Send UPA", "due": NOW,
+            "owner": "Ken", "deals": ["Tetrad"], "deal_ids": ["111"]}]
+    data = dpd.build_digest_data(NOW - timedelta(hours=24), NOW, [], [], [], [],
+                                 due, [_deal()], stages, portal_id="98765")
+    assert data["hubspot_portal_id"] == "98765"
+    item = data["due_today"]["Ken"][0]
+    assert item["task_id"] == "444"
+    assert item["deal_id"] == "111"  # single deal -> linkable
+
+
+# ----------------------------------------------------------------------
 #  /digest/trigger endpoint
 # ----------------------------------------------------------------------
 

@@ -84,6 +84,36 @@ ENGAGEMENT_SPECS = {
               "hs_task_completion_date", "hs_createdate", "hubspot_owner_id"],
 }
 
+# HubSpot record deep links: {base}/contacts/{portalId}/record/{typeId}/{objectId}
+HUBSPOT_APP_BASE = os.environ.get("HUBSPOT_APP_BASE", "https://app.hubspot.com")
+OBJECT_TYPE_IDS = {
+    "deals": "0-3", "contacts": "0-1", "companies": "0-2",
+    "notes": "0-46", "emails": "0-49", "meetings": "0-47",
+    "calls": "0-48", "tasks": "0-27",
+}
+
+_portal_id_cache = {"value": None}
+
+
+def get_portal_id() -> str:
+    """HubSpot account (portal) id for building record deep links. Prefers the
+    HUBSPOT_PORTAL_ID env var; otherwise reads it from the account-info API.
+    Returns '' if neither is available -- the digest then renders without links
+    rather than failing."""
+    if _portal_id_cache["value"] is not None:
+        return _portal_id_cache["value"]
+    portal = os.environ.get("HUBSPOT_PORTAL_ID", "").strip()
+    if not portal:
+        try:
+            data = eps.hubspot_request("GET", "/account-info/v3/details")
+            portal = str(data.get("portalId") or "")
+        except Exception as e:
+            logger.warning(f"Could not resolve HubSpot portal id ({e}); digest links disabled. "
+                           "Set HUBSPOT_PORTAL_ID to enable them.")
+            portal = ""
+    _portal_id_cache["value"] = portal
+    return portal
+
 
 # ======================================================================
 #  TIME HELPERS
@@ -382,7 +412,7 @@ def collect_deltas(changed_deal_ids, deals_by_id, since, until, by_user, stage_l
         for prop in TRACKED_PROPERTIES:
             for ch in extract_property_changes(history.get(prop) or [], since, until):
                 actor = by_user.get(ch["by_user_id"], "") or "system"
-                entry = {"deal": deal["name"], "owner": deal["owner"],
+                entry = {"deal": deal["name"], "deal_id": deal["id"], "owner": deal["owner"],
                          "by": actor, "at": ch["at"]}
                 if prop == "dealstage":
                     entry["from"] = stage_labels.get(ch["from"], ch["from"]) if ch["from"] else "(new deal)"
@@ -466,6 +496,9 @@ def collect_activity(since, until, deals_by_id, by_owner, skipped: list = None) 
                 items.append({
                     "type": kind,
                     "deal": deal["name"],
+                    "deal_id": deal_id,
+                    "object_type": object_type,
+                    "object_id": object_id,
                     "owner": deal["owner"],
                     "summary": _summarize_engagement(object_type, props),
                     "author": author,
@@ -508,6 +541,7 @@ def collect_open_tasks(deals_by_id, by_owner, due_before: datetime, skipped: lis
             "due": _parse_ts(props.get("hs_timestamp")),
             "owner": owner_name(by_owner, props.get("hubspot_owner_id")),
             "deals": [deals_by_id[d]["name"] for d in deal_ids],
+            "deal_ids": deal_ids,
         })
     return tasks
 
@@ -528,11 +562,11 @@ def flag_stale_deals(deals: list, now: datetime, stale_days: int = None) -> list
             continue
         last = d.get("last_activity") or d.get("created")
         if last is None:
-            flags.append({"type": "stale", "deal": d["name"], "owner": d["owner"],
-                          "detail": "no activity ever logged"})
+            flags.append({"type": "stale", "deal": d["name"], "deal_id": d["id"],
+                          "owner": d["owner"], "detail": "no activity ever logged"})
         elif last < cutoff:
-            flags.append({"type": "stale", "deal": d["name"], "owner": d["owner"],
-                          "detail": f"no activity for {(now - last).days} days"})
+            flags.append({"type": "stale", "deal": d["name"], "deal_id": d["id"],
+                          "owner": d["owner"], "detail": f"no activity for {(now - last).days} days"})
     return flags
 
 
@@ -546,7 +580,8 @@ def flag_closing_watch(deals: list, now: datetime, watch_days: int = None) -> li
             continue
         entered = d.get("entered_closing")
         if entered and entered <= cutoff:
-            flags.append({"type": "wire-watch", "deal": d["name"], "owner": d["owner"],
+            flags.append({"type": "wire-watch", "deal": d["name"], "deal_id": d["id"],
+                          "owner": d["owner"],
                           "detail": f"in Closing for {(now - entered).days} days"})
     return flags
 
@@ -555,7 +590,10 @@ def flag_overdue_tasks(overdue_tasks: list) -> list:
     flags = []
     for t in overdue_tasks:
         due = t["due"].date().isoformat() if t.get("due") else "?"
+        deal_ids = t.get("deal_ids") or []
         flags.append({"type": "overdue task", "deal": ", ".join(t.get("deals") or []),
+                      "deal_id": deal_ids[0] if len(deal_ids) == 1 else "",
+                      "task_id": t.get("id", ""),
                       "owner": t["owner"],
                       "detail": f"\"{t['subject']}\" due {due}"})
     return flags
@@ -594,15 +632,18 @@ def pipeline_totals(deals: list, stages: list) -> dict:
 
 
 def build_digest_data(since, until, stage_moves, property_changes, activity,
-                      flags, due_today, deals, stages) -> dict:
+                      flags, due_today, deals, stages, portal_id="") -> dict:
     return {
         "window": {"since": since.isoformat(), "until": until.isoformat()},
+        "hubspot_portal_id": portal_id,
         "stage_moves": stage_moves,
         "property_changes": property_changes,
         "activity": group_by_owner(activity),
         "flags": group_by_owner(flags),
         "due_today": group_by_owner([
             {"owner": t["owner"], "task": t["subject"], "deal": ", ".join(t.get("deals") or []),
+             "deal_id": (t.get("deal_ids") or [""])[0] if len(t.get("deal_ids") or []) == 1 else "",
+             "task_id": t.get("id", ""),
              "due": t["due"].isoformat() if t.get("due") else ""}
             for t in due_today
         ]),
@@ -689,12 +730,34 @@ _OWNER = "margin:10px 0 2px;font-weight:600;color:#333;"
 _UL = "margin:2px 0 8px;padding-left:20px;"
 _LI = "margin:3px 0;color:#222;"
 _MUTED = "color:#888;"
+_LINK = "color:#0b6bcb;text-decoration:none;"
+
+
+def _record_url(portal_id: str, type_key: str, object_id) -> str:
+    """HubSpot record deep link, or '' if any piece is missing."""
+    type_id = OBJECT_TYPE_IDS.get(type_key or "")
+    if not (portal_id and type_id and object_id):
+        return ""
+    return f"{HUBSPOT_APP_BASE}/contacts/{portal_id}/record/{type_id}/{object_id}"
+
+
+def _link(url: str, text) -> str:
+    """Anchor when url is present, else the plain escaped text. Escapes both."""
+    if not url:
+        return _esc(text)
+    return f'<a href="{html.escape(url, quote=True)}" style="{_LINK}">{_esc(text)}</a>'
 
 
 def render_html(data: dict) -> str:
     """Deterministic HTML email body. Fixed section order, empty sections
     suppressed, per-owner grouping. No LLM -- structure is reliable and the
-    raw note summaries are already short."""
+    raw note summaries are already short. Deal names and activities link to
+    their HubSpot records when the portal id is known."""
+    portal = data.get("hubspot_portal_id") or ""
+
+    def deal_link(deal_id, name):
+        return _link(_record_url(portal, "deals", deal_id), name)
+
     parts = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;'
              'line-height:1.5;color:#222;max-width:680px;">']
 
@@ -705,12 +768,13 @@ def render_html(data: dict) -> str:
         parts.append(f'<ul style="{_UL}">')
         for m in moves:
             parts.append(
-                f'<li style="{_LI}"><b>{_esc(m["deal"])}</b>: '
+                f'<li style="{_LI}"><b>{deal_link(m.get("deal_id"), m["deal"])}</b>: '
                 f'{_esc(m["from"])} &rarr; {_esc(m["to"])} '
                 f'<span style="{_MUTED}">(by {_esc(m["by"])})</span></li>')
         for c in changes:
             parts.append(
-                f'<li style="{_LI}"><b>{_esc(c["deal"])}</b>: {_esc(c["property"])} '
+                f'<li style="{_LI}"><b>{deal_link(c.get("deal_id"), c["deal"])}</b>: '
+                f'{_esc(c["property"])} '
                 f'{_esc(_fmt_change_value(c["property"], c["from"]))} &rarr; '
                 f'{_esc(_fmt_change_value(c["property"], c["to"]))} '
                 f'<span style="{_MUTED}">(by {_esc(c["by"])})</span></li>')
@@ -725,9 +789,11 @@ def render_html(data: dict) -> str:
             for it in items:
                 author = (f' <span style="{_MUTED}">({_esc(it["author"])})</span>'
                           if it.get("author") else "")
-                summary = _esc((it.get("summary") or "")[:300])
+                # Deal name -> deal record; the activity text -> the engagement record
+                obj_url = _record_url(portal, it.get("object_type"), it.get("object_id"))
+                summary = _link(obj_url, (it.get("summary") or "")[:300])
                 parts.append(
-                    f'<li style="{_LI}"><b>{_esc(it["deal"])}</b> &mdash; '
+                    f'<li style="{_LI}"><b>{deal_link(it.get("deal_id"), it["deal"])}</b> &mdash; '
                     f'{summary}{author}</li>')
             parts.append('</ul>')
 
@@ -738,9 +804,13 @@ def render_html(data: dict) -> str:
             parts.append(f'<div style="{_OWNER}">{_esc(owner)}</div>')
             parts.append(f'<ul style="{_UL}">')
             for f in items:
+                deal_html = deal_link(f.get("deal_id"), f["deal"]) if f.get("deal") else ""
+                sep = ": " if deal_html else ""
+                task_url = _record_url(portal, "tasks", f.get("task_id"))
+                open_task = f' &middot; {_link(task_url, "open task")}' if task_url else ""
                 parts.append(
-                    f'<li style="{_LI}"><b>{_esc(f["type"])}</b> &mdash; '
-                    f'{_esc(f["deal"])}: {_esc(f["detail"])}</li>')
+                    f'<li style="{_LI}"><b>{_esc(f["type"])}</b> &mdash; {deal_html}{sep}'
+                    f'<span style="{_MUTED}">{_esc(f["detail"])}</span>{open_task}</li>')
             parts.append('</ul>')
 
     due = data.get("due_today") or {}
@@ -750,8 +820,10 @@ def render_html(data: dict) -> str:
             parts.append(f'<div style="{_OWNER}">{_esc(owner)}</div>')
             parts.append(f'<ul style="{_UL}">')
             for t in items:
-                deal = f' <span style="{_MUTED}">({_esc(t["deal"])})</span>' if t.get("deal") else ""
-                parts.append(f'<li style="{_LI}">{_esc(t["task"])}{deal}</li>')
+                task_html = _link(_record_url(portal, "tasks", t.get("task_id")), t["task"])
+                deal = (f' <span style="{_MUTED}">({deal_link(t.get("deal_id"), t["deal"])})</span>'
+                        if t.get("deal") else "")
+                parts.append(f'<li style="{_LI}">{task_html}{deal}</li>')
             parts.append('</ul>')
 
     totals = data.get("totals") or {}
@@ -894,7 +966,8 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
                  + flag_closing_watch(deals, now))
 
         data = build_digest_data(since, until, stage_moves, property_changes,
-                                 activity, flags, due_today, deals, stages)
+                                 activity, flags, due_today, deals, stages,
+                                 portal_id=get_portal_id())
 
         local_date = (now + timedelta(hours=ISRAEL_UTC_OFFSET_HOURS)).strftime("%a %d %b %Y")
         subject = f"[Sara] Pipeline digest -- {local_date}"
