@@ -921,7 +921,7 @@ FOLLOW-UP EMAIL RULES:
 """
 
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=8000,
         system="""You are drafting on behalf of a senior partner or team member at Negev Labs, a biotech venture studio. The sender communicates as a peer to investors, founders, and executives - never as someone asking for a favor. The tone is direct, warm, and authoritative regardless of who the sender is.
 
@@ -1252,8 +1252,8 @@ def _pulse_truncate_input(text, max_chars=PULSE_MAX_INPUT_CHARS):
     return text[:max_chars] + "\n\n[... TRUNCATED — input exceeded 20K token limit ...]"
 
 
-PULSE_MODEL_EXTRACT = "claude-sonnet-4-20250514"    # Passes 1-3: signal extraction
-PULSE_MODEL_SYNTHESIZE = "claude-opus-4-20250514"   # Pass 4: synthesis (stronger reasoning)
+PULSE_MODEL_EXTRACT = "claude-sonnet-4-6"    # Passes 1-3: signal extraction
+PULSE_MODEL_SYNTHESIZE = "claude-opus-4-8"   # Pass 4: synthesis (stronger reasoning)
 
 
 def _pulse_call_claude(prompt_text, model=None, use_briefing=True):
@@ -4132,7 +4132,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.16.1-digest-hubspot-links", "deployed": "2026-06-16"})
+    return jsonify({"version": "2.16.2-model-refresh", "deployed": "2026-06-16"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4166,7 +4166,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.16.1-digest-hubspot-links", "steps": {}}
+    results = {"version": "2.16.2-model-refresh", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

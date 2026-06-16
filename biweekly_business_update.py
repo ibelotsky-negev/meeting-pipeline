@@ -51,7 +51,7 @@ BIWEEKLY_RECIPIENTS = [
 
 # Distillation is a rewrite/translation pass -- quality matters more than cost,
 # so use the pulse extract tier (sonnet) rather than haiku.
-DISTILL_MODEL = os.environ.get("BIWEEKLY_MODEL", "claude-sonnet-4-20250514")
+DISTILL_MODEL = os.environ.get("BIWEEKLY_MODEL", "claude-sonnet-4-6")
 
 # Every-other-week cadence gate: a scheduled run is skipped unless at least this
 # many days have passed since the last successful send. 13 (not 14) absorbs
