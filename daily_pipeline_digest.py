@@ -77,7 +77,8 @@ TRACKED_PROPERTIES = ("dealstage", "amount", "closedate")
 
 ENGAGEMENT_SPECS = {
     "notes": ["hs_note_body", "hs_createdate", "hubspot_owner_id"],
-    "emails": ["hs_email_subject", "hs_email_direction", "hs_createdate", "hubspot_owner_id"],
+    "emails": ["hs_email_subject", "hs_email_direction", "hs_email_headers",
+               "hs_createdate", "hubspot_owner_id"],
     "meetings": ["hs_meeting_title", "hs_meeting_start_time", "hs_createdate", "hubspot_owner_id"],
     "calls": ["hs_call_title", "hs_call_body", "hs_createdate", "hubspot_owner_id"],
     "tasks": ["hs_task_subject", "hs_task_status", "hs_timestamp",
@@ -449,6 +450,25 @@ def _summarize_engagement(object_type: str, props: dict) -> str:
     return ""
 
 
+def _email_sender(props: dict) -> str:
+    """Sender address from an email engagement's stored headers. This is the
+    real author of the email; the engagement's hubspot_owner_id is only the
+    record owner (e.g. the deal owner), which is misleading for received mail."""
+    try:
+        headers = json.loads(props.get("hs_email_headers") or "{}")
+        return ((headers.get("from") or {}).get("email") or "").strip()
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return ""
+
+
+def _activity_author(object_type: str, props: dict, by_owner: dict) -> str:
+    """Who to attribute the activity to: the actual sender for emails, else the
+    engagement owner (who logged the note/call/meeting/task)."""
+    if object_type == "emails":
+        return _email_sender(props)
+    return by_owner.get(str(props.get("hubspot_owner_id") or ""), "")
+
+
 def _window_filters(property_name: str, since: datetime, until: datetime) -> list:
     return [
         {"propertyName": property_name, "operator": "GTE", "value": _ms(since)},
@@ -490,7 +510,7 @@ def collect_activity(since, until, deals_by_id, by_owner, skipped: list = None) 
             if not deal_ids:
                 continue
             props = r.get("properties") or {}
-            author = by_owner.get(str(props.get("hubspot_owner_id") or ""), "")
+            author = _activity_author(object_type, props, by_owner)
             for deal_id in deal_ids:
                 deal = deals_by_id[deal_id]
                 items.append({
@@ -789,9 +809,10 @@ def render_html(data: dict) -> str:
             for it in items:
                 author = (f' <span style="{_MUTED}">({_esc(it["author"])})</span>'
                           if it.get("author") else "")
-                # Deal name -> deal record; the activity text -> the engagement record
-                obj_url = _record_url(portal, it.get("object_type"), it.get("object_id"))
-                summary = _link(obj_url, (it.get("summary") or "")[:300])
+                # Both the deal name and the activity text link to the deal record
+                # -- engagements (emails/notes/calls/meetings) have no standalone
+                # page; they live on the deal timeline, so that is the valid target.
+                summary = deal_link(it.get("deal_id"), (it.get("summary") or "")[:300])
                 parts.append(
                     f'<li style="{_LI}"><b>{deal_link(it.get("deal_id"), it["deal"])}</b> &mdash; '
                     f'{summary}{author}</li>')
@@ -806,11 +827,9 @@ def render_html(data: dict) -> str:
             for f in items:
                 deal_html = deal_link(f.get("deal_id"), f["deal"]) if f.get("deal") else ""
                 sep = ": " if deal_html else ""
-                task_url = _record_url(portal, "tasks", f.get("task_id"))
-                open_task = f' &middot; {_link(task_url, "open task")}' if task_url else ""
                 parts.append(
                     f'<li style="{_LI}"><b>{_esc(f["type"])}</b> &mdash; {deal_html}{sep}'
-                    f'<span style="{_MUTED}">{_esc(f["detail"])}</span>{open_task}</li>')
+                    f'<span style="{_MUTED}">{_esc(f["detail"])}</span></li>')
             parts.append('</ul>')
 
     due = data.get("due_today") or {}
@@ -820,7 +839,8 @@ def render_html(data: dict) -> str:
             parts.append(f'<div style="{_OWNER}">{_esc(owner)}</div>')
             parts.append(f'<ul style="{_UL}">')
             for t in items:
-                task_html = _link(_record_url(portal, "tasks", t.get("task_id")), t["task"])
+                # Task links to its deal record (tasks have no standalone page)
+                task_html = deal_link(t.get("deal_id"), t["task"])
                 deal = (f' <span style="{_MUTED}">({deal_link(t.get("deal_id"), t["deal"])})</span>'
                         if t.get("deal") else "")
                 parts.append(f'<li style="{_LI}">{task_html}{deal}</li>')

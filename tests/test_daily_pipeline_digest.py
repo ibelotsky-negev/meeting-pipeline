@@ -402,7 +402,9 @@ def test_link_falls_back_to_escaped_text_without_url():
     assert ">Deal</a>" in out
 
 
-def test_render_html_links_deals_and_activities_with_portal():
+def test_render_html_links_deals_and_activities_to_deal_record():
+    # Engagements have no standalone page -- both the deal name and the activity
+    # text link to the parent deal record (its timeline), never to /0-46/etc.
     move = {"deal": "Tetrad VC", "deal_id": "111", "from": "Discovery",
             "to": "Value Validation", "by": "Alex K", "at": ""}
     activity = dpd.group_by_owner([
@@ -412,8 +414,9 @@ def test_render_html_links_deals_and_activities_with_portal():
     data = _data(stage_moves=[move], activity=activity)
     data["hubspot_portal_id"] = "98765"
     html = dpd.render_html(data)
-    assert "/contacts/98765/record/0-3/111" in html    # deal link
-    assert "/contacts/98765/record/0-46/222" in html    # note (activity) link
+    assert "/contacts/98765/record/0-3/111" in html    # deal + activity -> deal record
+    assert "/record/0-46/" not in html                  # never an engagement page
+    assert "Call scheduled" in html
 
 
 def test_render_html_no_links_without_portal_id():
@@ -425,18 +428,36 @@ def test_render_html_no_links_without_portal_id():
     assert "Tetrad VC" in html  # name still shown, just not linked
 
 
-def test_render_html_links_overdue_task_and_due_today():
+def test_render_html_links_tasks_to_deal_record():
+    # Tasks also have no reliable standalone page -> link to the deal record.
     overdue = {"type": "overdue task", "deal": "TKN", "deal_id": "111",
                "task_id": "333", "owner": "Ken", "detail": "\"Follow up\" due 2026-05-11"}
-    due = [{"owner": "Ken", "task": "Send UPA", "deal": "Tetrad", "deal_id": "111",
+    due = [{"owner": "Ken", "task": "Send UPA", "deal": "Tetrad", "deal_id": "222",
             "task_id": "444", "due": "2026-06-16T08:00:00+00:00"}]
     data = _data(flags=dpd.group_by_owner([overdue]),
                  due_today=dpd.group_by_owner(due))
     data["hubspot_portal_id"] = "98765"
     html = dpd.render_html(data)
-    assert "/record/0-27/333" in html   # overdue task -> task record
-    assert "open task" in html
-    assert "/record/0-27/444" in html   # due-today task -> task record
+    assert "/record/0-27/" not in html          # never a task page
+    assert "open task" not in html               # extra task link removed
+    assert "/record/0-3/111" in html             # overdue flag deal link
+    assert "/record/0-3/222" in html             # due-today task -> its deal record
+
+
+def test_email_author_is_sender_not_owner():
+    headers = '{"from":{"email":"anna@tetrad.vc"},"to":[{"email":"vu@negevcap.com"}]}'
+    props = {"hs_email_headers": headers, "hubspot_owner_id": "999"}
+    by_owner = {"999": "Ken Belotsky"}
+    # Email -> sender from headers, NOT the record owner
+    assert dpd._activity_author("emails", props, by_owner) == "anna@tetrad.vc"
+    # Non-email -> the engagement owner (who logged it)
+    assert dpd._activity_author("notes", {"hubspot_owner_id": "999"}, by_owner) == "Ken Belotsky"
+
+
+def test_email_sender_handles_missing_or_bad_headers():
+    assert dpd._email_sender({}) == ""
+    assert dpd._email_sender({"hs_email_headers": "not-json"}) == ""
+    assert dpd._email_sender({"hs_email_headers": '{"from":{}}'}) == ""
 
 
 def test_build_digest_data_threads_portal_and_task_ids():
