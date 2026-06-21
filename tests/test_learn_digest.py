@@ -395,3 +395,38 @@ class TestForceLock:
         # Lock released afterwards -- a later run can acquire again.
         assert ld._acquire_run_lock() is True
         ld._release_run_lock()
+
+
+# ----------------------------------------------------------------------
+#  13. Cluster/curate output-token budget (regression guard for the 2.18.2
+#      truncation bug: a 2000-token cap truncated the whole-batch cluster JSON
+#      and collapsed every item into its own singleton).
+# ----------------------------------------------------------------------
+
+class TestTokenBudgets:
+    def test_cluster_budget_is_large(self):
+        assert ld.CLUSTER_MAX_TOKENS >= 8000
+
+    def test_cluster_default_caller_uses_large_budget(self, monkeypatch):
+        captured = {}
+
+        def fake(prompt, model, max_tokens=2000, tools=None):
+            captured["max_tokens"] = max_tokens
+            return json.dumps({"clusters": [{"topic": "Cowork", "members": [0, 1]}]})
+
+        monkeypatch.setattr(ld, "_call_claude_text", fake)
+        ld.cluster_items(_cowork_summaries()[:2])  # no call_fn -> production default path
+        assert captured["max_tokens"] == ld.CLUSTER_MAX_TOKENS
+
+    def test_curate_default_caller_uses_curate_budget(self, monkeypatch):
+        captured = {}
+
+        def fake(prompt, model, max_tokens=2000, tools=None):
+            captured["max_tokens"] = max_tokens
+            return json.dumps({"keepers": [{"index": 0, "why": "w", "bucket": "General/Reference",
+                                            "has_action": False, "action": ""}],
+                               "superseded": [{"index": 1, "reason": "dup"}]})
+
+        monkeypatch.setattr(ld, "_call_claude_text", fake)
+        ld.curate_cluster({"topic": "Cowork", "items": _cowork_summaries()[:2]})
+        assert captured["max_tokens"] == ld.CURATE_MAX_TOKENS

@@ -76,6 +76,14 @@ DEFAULT_BUCKET = "General/Reference"
 SUMMARY_MODEL = os.environ.get("LEARN_SUMMARY_MODEL", "claude-sonnet-4-6")
 CURATE_MODEL = os.environ.get("LEARN_CURATE_MODEL", "claude-opus-4-8")
 
+# Output-token budgets per stage. The CLUSTER pass emits one JSON object covering
+# the WHOLE batch (every item's index at once), so it needs a large budget: too
+# small a cap truncates the JSON, parsing fails, and the batch wrongly collapses
+# to singletons (no consolidation -- the 2.18.2 dry-run bug). Kept under the ~16k
+# non-streaming ceiling. CURATE is per-cluster, so a smaller budget suffices.
+CLUSTER_MAX_TOKENS = int(os.environ.get("LEARN_CLUSTER_MAX_TOKENS", "12000"))
+CURATE_MAX_TOKENS = int(os.environ.get("LEARN_CURATE_MAX_TOKENS", "4000"))
+
 # fast-moving (default) | off | all -- which clusters get the live web check.
 LEARN_CURRENCY_CHECK = os.environ.get("LEARN_CURRENCY_CHECK", "fast-moving")
 
@@ -584,6 +592,17 @@ def _call_claude_web(prompt: str) -> str:
     return _call_claude_text(prompt, CURATE_MODEL, max_tokens=1500, tools=tools)
 
 
+def _cluster_call(prompt: str, model: str) -> str:
+    """Default cluster-pass caller: large output budget so the whole-batch JSON
+    is never truncated (a truncated response silently defeats consolidation)."""
+    return _call_claude_text(prompt, model, max_tokens=CLUSTER_MAX_TOKENS)
+
+
+def _curate_call(prompt: str, model: str) -> str:
+    """Default curate-pass caller (per-cluster, so a smaller budget is fine)."""
+    return _call_claude_text(prompt, model, max_tokens=CURATE_MAX_TOKENS)
+
+
 def _extract_json(text: str):
     """Tolerant JSON extraction from an LLM reply (handles ```json fences and
     surrounding prose). Returns the parsed object or None."""
@@ -667,7 +686,7 @@ def cluster_items(summaries: list, call_fn=None) -> list:
     once so near-duplicates collapse. Returns a list of
     {"topic": str, "items": [summary, ...]}. Any summary not placed by the model
     becomes its own singleton cluster."""
-    call_fn = call_fn or _call_claude_text
+    call_fn = call_fn or _cluster_call
     summaries = summaries or []
     if not summaries:
         return []
@@ -694,6 +713,11 @@ def cluster_items(summaries: list, call_fn=None) -> list:
     except Exception as e:
         logger.warning(f"[learn] clustering failed: {e}")
         parsed = {}
+
+    if not parsed.get("clusters"):
+        logger.warning(
+            f"[learn] clustering returned no parseable clusters for {len(summaries)} items -- "
+            f"falling back to singletons (raise LEARN_CLUSTER_MAX_TOKENS if the output truncated)")
 
     clusters = []
     placed = set()
@@ -763,7 +787,7 @@ def curate_cluster(cluster: dict, profile: str = KEN_PROFILE, call_fn=None) -> d
 
     Returns {"topic", "keepers": [item + meta], "superseded": [item + reason]}.
     Deterministic fallback (newest wins) if the model output is unusable."""
-    call_fn = call_fn or _call_claude_text
+    call_fn = call_fn or _curate_call
     items = cluster.get("items") or []
     topic = cluster.get("topic") or "Topic"
     if not items:
