@@ -333,3 +333,45 @@ class TestLearnRunEndpoint:
             assert resp.get_json()["status"] == "already_running"
         finally:
             app_module._learn_trigger_lock.release()
+
+
+# ----------------------------------------------------------------------
+#  11. Optional-key handling: read at call time, degrade (never raise) if absent
+# ----------------------------------------------------------------------
+
+class _FakeResp:
+    def __init__(self, payload):
+        self.status_code = 200
+        self.content = b"{}"
+        self.text = ""
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class TestResolverKeys:
+    def test_spoken_degrades_without_key(self, monkeypatch):
+        monkeypatch.delenv("SPOKEN_API_KEY", raising=False)
+        assert ld._fetch_spoken("https://open.spotify.com/episode/x") is None
+        result = ld.resolve_podcast("https://open.spotify.com/episode/x")
+        assert result["partial"] is True and result["text"] == ""
+
+    def test_grok_stt_degrades_without_key(self, monkeypatch):
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        assert ld._grok_stt("https://video.example/clip.mp4") is None
+
+    def test_spoken_resolves_when_key_present_and_http_mocked(self, monkeypatch):
+        monkeypatch.setenv("SPOKEN_API_KEY", "pt_test")
+        monkeypatch.setattr(ld.eps, "_request_with_retry",
+                            lambda *a, **k: _FakeResp({"transcript": "hello world transcript"}))
+        result = ld.resolve_podcast("https://open.spotify.com/episode/x")
+        assert result["partial"] is False
+        assert "hello world" in result["text"]
+
+    def test_keys_are_read_at_call_time_not_module_scope(self):
+        # The resolvers must not capture keys at import time -- no module-level
+        # XAI_API_KEY / SPOKEN_API_KEY / JINA_API_KEY constants.
+        assert not hasattr(ld, "XAI_API_KEY")
+        assert not hasattr(ld, "SPOKEN_API_KEY")
+        assert not hasattr(ld, "JINA_API_KEY")

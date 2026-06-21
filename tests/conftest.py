@@ -12,6 +12,10 @@ os.environ.setdefault("FIREFLIES_API_KEY", "test-fireflies-key")
 os.environ.setdefault("CLAUDE_API_KEY", "test-claude-key")
 os.environ.setdefault("HUBSPOT_API_KEY", "test-hubspot-key")
 os.environ.setdefault("ASANA_API_KEY", "test-asana-key")
+# Read/Learn optional resolver keys -- dummy values so tests never read a real
+# key; all x.ai / spoken.md HTTP is mocked and the no_network fixture blocks live calls.
+os.environ.setdefault("XAI_API_KEY", "xai-test")
+os.environ.setdefault("SPOKEN_API_KEY", "pt_test")
 os.environ["DATA_DIR"] = _TEST_DATA_DIR
 os.environ["RUN_SCHEDULER"] = "0"
 # Production-like domain config (Railway INTERNAL_DOMAINS includes these)

@@ -3132,7 +3132,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.0-learn-digest", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.18.1-learn-keys", "deployed": "2026-06-21"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3156,6 +3156,10 @@ def config_check():
         "todo_list_name": TODO_LIST_NAME,
         "todo_poll_interval": TODO_POLL_INTERVAL,
         "todo_poller_running": _todo_poller_running,
+        # Read/Learn optional resolver keys -- presence only, never the values.
+        "xai_key_loaded": bool(os.environ.get("XAI_API_KEY")),
+        "spoken_key_loaded": bool(os.environ.get("SPOKEN_API_KEY")),
+        "jina_key_loaded": bool(os.environ.get("JINA_API_KEY")),
     })
 
 
@@ -3166,7 +3170,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.0-learn-digest", "steps": {}}
+    results = {"version": "2.18.1-learn-keys", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

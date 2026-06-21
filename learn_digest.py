@@ -79,11 +79,13 @@ CURATE_MODEL = os.environ.get("LEARN_CURATE_MODEL", "claude-opus-4-8")
 # fast-moving (default) | off | all -- which clusters get the live web check.
 LEARN_CURRENCY_CHECK = os.environ.get("LEARN_CURRENCY_CHECK", "fast-moving")
 
-# Optional keys (read at runtime; absent -> the matching resolver degrades to
-# partial, never fabricates).
-XAI_API_KEY = os.environ.get("XAI_API_KEY", "")
-SPOKEN_API_KEY = os.environ.get("SPOKEN_API_KEY", "")
-JINA_API_KEY = os.environ.get("JINA_API_KEY", "")
+# Optional keys (XAI_API_KEY, SPOKEN_API_KEY, JINA_API_KEY) are read at CALL TIME
+# inside each resolver via os.environ.get -- never at module top level, never via
+# os.environ[...] indexing. An absent key logs a warning and degrades that item to
+# "content not retrieved"; it never raises and never fabricates. Articles (Jina)
+# and YouTube (youtube-transcript-api) resolve with no key. This keeps local runs
+# (no Railway env) and tests safe, and lets Railway-set keys take effect without a
+# re-import.
 
 LEARN_RECIPIENTS = [
     r.strip() for r in os.environ.get("LEARN_RECIPIENTS", "bk@negevlabs.com").split(",") if r.strip()
@@ -323,8 +325,9 @@ def _partial(kind, reason):
 def _fetch_jina(url: str):
     """Article reader: GET https://r.jina.ai/{url} -> clean markdown."""
     headers = {"Accept": "text/plain"}
-    if JINA_API_KEY:
-        headers["Authorization"] = f"Bearer {JINA_API_KEY}"
+    jina_key = os.environ.get("JINA_API_KEY", "")  # optional: only raises rate limits
+    if jina_key:
+        headers["Authorization"] = f"Bearer {jina_key}"
     resp = _http_get("https://r.jina.ai/" + url, headers=headers)
     if resp is None or resp.status_code >= 400 or not resp.text:
         logger.info(f"[learn] jina shape: status={getattr(resp, 'status_code', None)} url={url[:80]}")
@@ -393,9 +396,12 @@ def _fetch_spoken(url: str):
     NOTE: the exact spoken.md request shape is provisional pending the first
     live run (SPOKEN_API_KEY is not set yet). On any non-200 this returns None
     so the item degrades to partial -- it never fabricates content."""
-    if not SPOKEN_API_KEY:
+    spoken_key = os.environ.get("SPOKEN_API_KEY", "")
+    if not spoken_key:
+        logger.warning("[learn] SPOKEN_API_KEY not set -- podcast/transcript degraded to "
+                       "'content not retrieved' (never fabricated)")
         return None
-    headers = {"Authorization": f"Bearer {SPOKEN_API_KEY}", "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {spoken_key}", "Accept": "application/json"}
     try:
         resp = eps._request_with_retry(
             "GET", "https://api.spoken.md/v1/transcript",
@@ -468,9 +474,14 @@ def _fetch_x_tweet(tweet_id: str):
 def _grok_stt(mp4_url: str):
     """Transcribe an mp4 via Grok STT URL mode. Provisional payload shape
     pending the first live run (XAI_API_KEY not set yet); None on any failure."""
-    if not XAI_API_KEY or not mp4_url:
+    xai_key = os.environ.get("XAI_API_KEY", "")
+    if not xai_key:
+        logger.warning("[learn] XAI_API_KEY not set -- X video not transcribed; degraded to "
+                       "'content not retrieved' (never fabricated)")
         return None
-    headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
+    if not mp4_url:
+        return None
+    headers = {"Authorization": f"Bearer {xai_key}", "Content-Type": "application/json"}
     try:
         resp = eps._request_with_retry(
             "POST", "https://api.x.ai/v1/stt", headers,
