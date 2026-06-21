@@ -3084,6 +3084,61 @@ def learn_debug_cluster():
     })
 
 
+@app.route("/learn/debug-grok-x", methods=["GET"])
+def learn_debug_grok_x():
+    """THROWAWAY: test whether Grok (api.x.ai, XAI_API_KEY) can read + summarize an
+    X post DIRECTLY from its URL with no X API bearer token. Remove before the
+    final deploy.
+      ?action=models                               -> list available xAI models
+      ?url=<x post url>&model=grok-4-latest&search=1 -> read + summarize test"""
+    import requests as _rq
+    key = os.environ.get("XAI_API_KEY", "")
+    if not key:
+        return jsonify({"error": "XAI_API_KEY not set"}), 400
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if request.args.get("action", "") == "models":
+        try:
+            r = _rq.get("https://api.x.ai/v1/models", headers=headers, timeout=30)
+            return jsonify({"status": r.status_code, "body": r.json() if r.content else None})
+        except Exception as e:
+            return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    url = request.args.get("url", "")
+    if not url:
+        return jsonify({"error": "pass ?url=<x post url> or ?action=models"}), 400
+    model = request.args.get("model", "grok-4-latest")
+    use_search = request.args.get("search", "1").lower() in ("1", "true", "yes")
+    prompt = (
+        "Read the X (Twitter) post at this exact URL and summarize ONLY its actual content "
+        "in 3-4 sentences. Include one short verbatim quote (in quotation marks) from the post "
+        "to prove you actually read it, and state the author handle. If you cannot access or "
+        "find the specific post, reply with exactly: CANNOT_ACCESS -- do not guess or summarize "
+        "from general knowledge.\nURL: " + url
+    )
+    payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0}
+    if use_search:
+        payload["search_parameters"] = {"mode": "on", "sources": [{"type": "x"}, {"type": "web"}],
+                                         "return_citations": True}
+    try:
+        r = _rq.post("https://api.x.ai/v1/chat/completions", headers=headers, json=payload, timeout=120)
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}", "model": model}), 500
+    out = {"http_status": r.status_code, "model": model, "search_enabled": use_search, "url": url}
+    try:
+        data = r.json()
+    except Exception:
+        out["raw_text"] = r.text[:2000]
+        return jsonify(out)
+    if r.status_code >= 400:
+        out["error_body"] = data
+        return jsonify(out)
+    choices = data.get("choices") or []
+    msg = (choices[0].get("message") or {}) if choices else {}
+    out["content"] = msg.get("content")
+    out["citations"] = data.get("citations") or msg.get("citations")
+    out["usage"] = data.get("usage")
+    return jsonify(out)
+
+
 _biweekly_lock = _threading.Lock()
 
 
@@ -3211,7 +3266,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.6-cluster-retry", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.18.7-grok-x-test", "deployed": "2026-06-21"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3249,7 +3304,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.6-cluster-retry", "steps": {}}
+    results = {"version": "2.18.7-grok-x-test", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
