@@ -3105,7 +3105,7 @@ def learn_debug_grok_x():
     url = request.args.get("url", "")
     if not url:
         return jsonify({"error": "pass ?url=<x post url> or ?action=models"}), 400
-    model = request.args.get("model", "grok-4-latest")
+    model = request.args.get("model", "grok-4.3")
     use_search = request.args.get("search", "1").lower() in ("1", "true", "yes")
     prompt = (
         "Read the X (Twitter) post at this exact URL and summarize ONLY its actual content "
@@ -3114,6 +3114,25 @@ def learn_debug_grok_x():
         "find the specific post, reply with exactly: CANNOT_ACCESS -- do not guess or summarize "
         "from general knowledge.\nURL: " + url
     )
+    if request.args.get("mode", "chat") == "tools":
+        # Agent Tools API (Live Search replacement): server-side web_search + x_search.
+        ep = request.args.get("endpoint", "responses")
+        tbody = {"model": model, "tools": [{"type": "web_search"}, {"type": "x_search"}],
+                 "input": [{"role": "user", "content": prompt}]}
+        try:
+            tr = _rq.post(f"https://api.x.ai/v1/{ep}", headers=headers, json=tbody, timeout=180)
+        except Exception as e:
+            return jsonify({"error": f"{type(e).__name__}: {e}", "mode": "tools", "endpoint": ep}), 500
+        tout = {"http_status": tr.status_code, "model": model, "mode": "tools", "endpoint": ep, "url": url}
+        try:
+            tdata = tr.json()
+        except Exception:
+            tout["raw_text"] = tr.text[:3000]
+            return jsonify(tout)
+        tout["output_text"] = tdata.get("output_text")
+        tout["citations"] = tdata.get("citations")
+        tout["raw"] = json.dumps(tdata)[:6000]
+        return jsonify(tout)
     payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0}
     if use_search:
         payload["search_parameters"] = {"mode": "on", "sources": [{"type": "x"}, {"type": "web"}],
@@ -3266,7 +3285,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.7-grok-x-test", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.18.8-grok-tools", "deployed": "2026-06-21"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3304,7 +3323,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.7-grok-x-test", "steps": {}}
+    results = {"version": "2.18.8-grok-tools", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
