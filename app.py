@@ -3016,18 +3016,36 @@ def learn_debug_cluster():
     so an all-singletons fallback can be diagnosed in ~10s without a full
     backlog run. Remove before the final deploy."""
     import learn_digest as _ld
-    fixture = [
-        {"title": "Cowork setup guide", "type": "article", "url": "https://e/1", "subject": "Cowork",
-         "content_date": "2026-01-10", "summary": "How to set up Cowork.", "specifics": [], "partial": False},
-        {"title": "Cowork daily monitor", "type": "article", "url": "https://e/2", "subject": "Cowork",
-         "content_date": "2026-03-10", "summary": "Cowork agentic daily-monitor workflow.", "specifics": [], "partial": False},
-        {"title": "Cowork agents tips", "type": "x", "url": "https://e/3", "subject": "Cowork",
-         "content_date": "2026-05-10", "summary": "Using Cowork agents effectively.", "specifics": [], "partial": False},
-        {"title": "Gut health basics", "type": "article", "url": "https://e/4", "subject": "Gut",
-         "content_date": "2026-02-01", "summary": "Digestion and the microbiome.", "specifics": [], "partial": False},
-        {"title": "Huberman gut episode", "type": "podcast", "url": "https://e/5", "subject": "Gut",
-         "content_date": "2026-04-01", "summary": "Huberman on gut health.", "specifics": [], "partial": False},
-    ]
+    n = max(1, min(int(request.args.get("n", "5")), 200))
+    thin = request.args.get("thin", "").lower() in ("1", "true", "yes")
+    if n <= 5 and not thin:
+        fixture = [
+            {"title": "Cowork setup guide", "type": "article", "url": "https://e/1", "subject": "Cowork",
+             "content_date": "2026-01-10", "summary": "How to set up Cowork.", "specifics": [], "partial": False},
+            {"title": "Cowork daily monitor", "type": "article", "url": "https://e/2", "subject": "Cowork",
+             "content_date": "2026-03-10", "summary": "Cowork agentic daily-monitor workflow.", "specifics": [], "partial": False},
+            {"title": "Cowork agents tips", "type": "x", "url": "https://e/3", "subject": "Cowork",
+             "content_date": "2026-05-10", "summary": "Using Cowork agents effectively.", "specifics": [], "partial": False},
+            {"title": "Gut health basics", "type": "article", "url": "https://e/4", "subject": "Gut",
+             "content_date": "2026-02-01", "summary": "Digestion and the microbiome.", "specifics": [], "partial": False},
+            {"title": "Huberman gut episode", "type": "podcast", "url": "https://e/5", "subject": "Gut",
+             "content_date": "2026-04-01", "summary": "Huberman on gut health.", "specifics": [], "partial": False},
+        ]
+    else:
+        # Reproduce the real backlog shape: N items cycling a small subject set
+        # (so there ARE obvious duplicates), optionally with thin "content not
+        # retrieved" summaries like the unresolved X posts.
+        _subjects = ["Agents setup", "Loops", "Claude fable", "Psychedelic alpha", "Biotech rNPV",
+                     "Karpathy course", "Cowork setup", "MCP", "Investor data", "Gut health",
+                     "Second brain", "Design agent", "Wall Street repo", "Playwright MCP", "Negotiations"]
+        fixture = []
+        for i in range(n):
+            s = _subjects[i % len(_subjects)]
+            fixture.append({
+                "title": s, "type": "x", "url": f"https://e/{i}", "subject": s, "content_date": None,
+                "summary": ("content not retrieved -- from title/sender only" if thin else f"A saved post about {s}."),
+                "specifics": [], "partial": thin,
+            })
     captured = {}
 
     def cap(prompt, model):
@@ -3046,13 +3064,16 @@ def learn_debug_cluster():
     raw = captured.get("raw", "")
     parsed = _ld._extract_json(raw) if raw else None
     return jsonify({
+        "n": n,
+        "thin": thin,
         "model": _ld.CURATE_MODEL,
         "cluster_max_tokens": _ld.CLUSTER_MAX_TOKENS,
         "prompt_len": captured.get("prompt_len"),
         "call_error": captured.get("error"),
         "call_traceback": captured.get("traceback"),
         "raw_len": len(raw),
-        "raw_head": raw[:3000],
+        "raw_head": raw[:2000],
+        "raw_tail": raw[-600:],
         "parsed_ok": isinstance(parsed, dict),
         "parsed_keys": list(parsed.keys()) if isinstance(parsed, dict) else None,
         "model_cluster_count": len(parsed.get("clusters", [])) if isinstance(parsed, dict) else None,
@@ -3189,7 +3210,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.4-cluster-debug", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.18.5-cluster-debug2", "deployed": "2026-06-21"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3227,7 +3248,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.4-cluster-debug", "steps": {}}
+    results = {"version": "2.18.5-cluster-debug2", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
