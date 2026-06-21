@@ -2936,6 +2936,75 @@ def digest_status():
     return jsonify(daily_pipeline_digest.read_status())
 
 
+_learn_trigger_lock = _threading.Lock()
+
+
+@app.route("/learn/run", methods=["GET", "POST"])
+def learn_run():
+    """Manually trigger the Read/Learn digest (learn_digest module).
+    ?dry_run=true  -- resolve+cluster+curate, send no email, create no tasks, move nothing.
+    ?backlog=1     -- force the full-backlog first run (clustering sees the whole set).
+    ?sync=true     -- run inline and return the result/traceback as JSON (diagnostic)."""
+    import traceback as _learn_tb
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    backlog = request.args.get("backlog", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
+    if not _learn_trigger_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import learn_digest
+            result = learn_digest.run_learn(dry_run=dry_run, backlog=backlog)
+            return jsonify(result)
+        except Exception as e:
+            logger.error(f"[learn] Sync run failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _learn_tb.format_exc()}), 500
+        finally:
+            _learn_trigger_lock.release()
+
+    def _run():
+        try:
+            import learn_digest
+            learn_digest.run_learn(dry_run=dry_run, backlog=backlog)
+            logger.info("[learn] Manual run complete")
+        except Exception as e:
+            logger.error(f"[learn] Manual run failed: {e}", exc_info=True)
+        finally:
+            _learn_trigger_lock.release()
+
+    logger.info(f"[learn] Trigger: dry_run={dry_run} backlog={backlog} -- launching background thread")
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({"status": "started", "dry_run": dry_run, "backlog": backlog})
+
+
+@app.route("/learn/status", methods=["GET"])
+def learn_status():
+    """Last Read/Learn run outcome (counts, sent flag, or error traceback)."""
+    import learn_digest
+    return jsonify(learn_digest.read_status())
+
+
+@app.route("/egress-check", methods=["GET"])
+def egress_check():
+    """THROWAWAY: from inside the container, probe each outbound host the
+    learn-digest resolvers need. Remove before the final deploy."""
+    hosts = [
+        "graph.microsoft.com", "api.anthropic.com", "api.x.ai", "api.twitter.com",
+        "r.jina.ai", "www.youtube.com", "spoken.md",
+    ]
+    out = {}
+    for h in hosts:
+        try:
+            r = requests.get(f"https://{h}", timeout=8)
+            out[h] = {"reachable": True, "status": r.status_code}
+        except Exception as e:
+            out[h] = {"reachable": False, "status": f"{type(e).__name__}: {str(e)[:120]}"}
+    return jsonify(out)
+
+
 _biweekly_lock = _threading.Lock()
 
 
@@ -3063,7 +3132,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.17.2-leaf-clients", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.18.0-learn-digest", "deployed": "2026-06-21"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3097,7 +3166,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.17.2-leaf-clients", "steps": {}}
+    results = {"version": "2.18.0-learn-digest", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -3873,6 +3942,20 @@ def corrections_ingest_run():
         _corrections_lock.release()
 
 
+def learn_weekly_run():
+    """Scheduled weekly Read/Learn digest (learn_digest module).
+
+    Dedup + single-send is enforced inside learn_digest.run_learn via its atomic
+    O_CREAT|O_EXCL run lock, so no extra lock is needed here."""
+    try:
+        logger.info("[learn] Starting scheduled weekly Read/Learn digest")
+        import learn_digest
+        learn_digest.run_learn()
+        logger.info("[learn] Weekly Read/Learn digest complete")
+    except Exception as e:
+        logger.error(f"[learn] Failed: {e}", exc_info=True)
+
+
 _scheduler = None  # module-level so diagnostic endpoints can inspect it
 
 
@@ -3919,6 +4002,19 @@ def start_scheduler():
         minutes=20,
         id="corrections_ingest",
         replace_existing=True,
+    )
+    # Read/Learn digest: weekly Friday 06:00 Asia/Jerusalem. tz-aware cron so
+    # DST is handled automatically (06:00 Israel = 03:00 UTC summer / 04:00 winter).
+    _scheduler.add_job(
+        learn_weekly_run,
+        trigger="cron",
+        day_of_week="fri",
+        hour=6,
+        minute=0,
+        timezone="Asia/Jerusalem",
+        id="learn_digest_weekly",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
     # Renewal job: every 45min, renews if expiry < 30min away (Graph max is 59min for this resource)
     _scheduler.add_job(

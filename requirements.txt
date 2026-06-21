@@ -4,3 +4,5 @@ requests==2.32.3
 apscheduler==3.10.4
 gunicorn==23.0.0
 python-dotenv==1.0.1
+youtube-transcript-api==0.6.2
+trafilatura==1.12.2
