@@ -471,3 +471,64 @@ class TestFetchLimit:
         monkeypatch.setattr(ld.eps, "graph_get", lambda url, params=None: page)
         assert len(ld.fetch_unread(limit=2)) == 2
         assert len(ld.fetch_unread()) == 5
+
+
+# ----------------------------------------------------------------------
+#  15. X resolver via Grok Agent Tools API (x_search) -- parser + degrade
+# ----------------------------------------------------------------------
+
+# Mirrors the real xAI /v1/responses payload shape: reasoning + custom_tool_call
+# items, then the assistant message whose content carries output_text +
+# url_citation annotations. Top-level output_text is null (must walk output[]).
+GROK_RESPONSES_REAL = {
+    "output_text": None,
+    "output": [
+        {"type": "reasoning", "summary": [{"text": "thinking...", "type": "summary_text"}], "status": "completed"},
+        {"type": "custom_tool_call", "name": "x_thread_fetch", "input": '{"post_id":"123"}', "status": "completed"},
+        {"type": "message", "role": "assistant", "status": "completed", "content": [
+            {"type": "output_text",
+             "text": "Author @rubenhassid. A one-time Cowork setup. \"A folder beats a clever prompt\".",
+             "annotations": [{"type": "url_citation", "url": "https://x.com/i/status/123"}]},
+        ]},
+    ],
+}
+
+
+class TestGrokXResolver:
+    def test_parse_walks_output_array_when_output_text_null(self):
+        text, citations = ld._parse_grok_responses(GROK_RESPONSES_REAL)
+        assert "@rubenhassid" in text
+        assert "A folder beats a clever prompt" in text
+        assert citations == ["https://x.com/i/status/123"]
+
+    def test_parse_prefers_top_level_output_text(self):
+        text, _ = ld._parse_grok_responses({"output_text": "direct answer", "output": []})
+        assert text == "direct answer"
+
+    def test_parse_no_assistant_message_returns_empty(self):
+        text, citations = ld._parse_grok_responses(
+            {"output_text": None, "output": [{"type": "reasoning", "summary": []}]})
+        assert text == "" and citations == []
+
+    def test_resolve_x_returns_content_on_success(self, monkeypatch):
+        monkeypatch.setattr(ld, "_grok_responses_call", lambda prompt, model: GROK_RESPONSES_REAL)
+        r = ld.resolve_x("https://x.com/i/status/123")
+        assert r["partial"] is False and r["kind"] == "x"
+        assert "@rubenhassid" in r["text"]
+        assert r["citations"] == ["https://x.com/i/status/123"]
+
+    def test_resolve_x_partial_on_cannot_access(self, monkeypatch):
+        cannot = {"output_text": None, "output": [
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "CANNOT_ACCESS"}]}]}
+        monkeypatch.setattr(ld, "_grok_responses_call", lambda prompt, model: cannot)
+        r = ld.resolve_x("https://x.com/i/status/123")
+        assert r["partial"] is True and r["text"] == ""
+
+    def test_resolve_x_partial_on_call_error_never_raises(self, monkeypatch):
+        def boom(prompt, model):
+            raise RuntimeError("xAI 500")
+        monkeypatch.setattr(ld, "_grok_responses_call", boom)
+        r = ld.resolve_x("https://x.com/i/status/123")
+        assert r["partial"] is True
+        assert "xAI 500" in r["reason"]

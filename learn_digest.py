@@ -34,6 +34,7 @@ import time
 import uuid
 import logging
 import argparse
+import requests
 from datetime import datetime, timezone, timedelta
 
 # Shared Graph helpers (app-only token, retrying GET/POST, html_to_text).
@@ -453,41 +454,68 @@ def _tweet_id(url: str):
     return m.group(1) if m else None
 
 
-def _fetch_x_tweet(tweet_id: str):
-    """X API v2 read. Returns the parsed payload or None."""
-    bearer = os.environ.get("X_BEARER_TOKEN", "") or os.environ.get("XAI_BEARER_TOKEN", "")
-    if not bearer:
-        return None
-    headers = {"Authorization": f"Bearer {bearer}"}
-    params = {
-        "expansions": "author_id,attachments.media_keys",
-        "tweet.fields": "created_at,note_tweet",
-        "media.fields": "variants",
-    }
-    try:
-        resp = eps._request_with_retry(
-            "GET", f"https://api.twitter.com/2/tweets/{tweet_id}", headers, params=params)
-    except Exception as e:
-        logger.warning(f"[learn] X API failed {tweet_id}: {e}")
-        return None
-    if resp is None or resp.status_code >= 400:
-        logger.info(f"[learn] X API shape: status={getattr(resp, 'status_code', None)}")
-        return None
-    try:
-        return resp.json()
-    except Exception:
-        return None
+def _grok_responses_call(prompt: str, model: str, timeout: int = 90) -> dict:
+    """Call the xAI Agent Tools API (POST /v1/responses) with server-side
+    x_search + web_search so Grok reads an X post directly from its URL -- no X
+    API bearer token, just XAI_API_KEY. Returns the parsed JSON; raises on a
+    network/HTTP error after one transient retry. Uses requests directly (NOT
+    the shared 30s helper) -- x_search routinely takes longer than 30s."""
+    key = os.environ.get("XAI_API_KEY", "")
+    if not key:
+        raise RuntimeError("XAI_API_KEY not set")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    body = {"model": model, "tools": [{"type": "x_search"}, {"type": "web_search"}],
+            "input": [{"role": "user", "content": prompt}]}
+    last = None
+    for attempt in range(2):
+        try:
+            resp = requests.post("https://api.x.ai/v1/responses", headers=headers,
+                                 json=body, timeout=timeout)
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < 1:
+                last = f"status {resp.status_code}"
+                time.sleep(3)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+            if attempt < 1:
+                time.sleep(3)
+                continue
+            raise RuntimeError(last)
+    raise RuntimeError(last or "unknown")
+
+
+def _parse_grok_responses(data: dict):
+    """Extract the assistant text + url citations from an xAI /v1/responses
+    payload. Walks output[] for the assistant message because the top-level
+    output_text convenience is frequently null. Returns (text, citations)."""
+    data = data or {}
+    citations = []
+    txt = (data.get("output_text") or "").strip()
+    for item in (data.get("output") or []):
+        if not isinstance(item, dict):
+            continue
+        if not txt and item.get("type") == "message" and item.get("role") == "assistant":
+            parts = [c["text"] for c in (item.get("content") or [])
+                     if c.get("type") == "output_text" and c.get("text")]
+            if parts:
+                txt = "\n".join(parts).strip()
+        for c in (item.get("content") or []):
+            for a in (c.get("annotations") or []):
+                if a.get("type") == "url_citation" and a.get("url"):
+                    citations.append(a["url"])
+    return txt, citations
 
 
 def _grok_stt(mp4_url: str):
-    """Transcribe an mp4 via Grok STT URL mode. Provisional payload shape
-    pending the first live run (XAI_API_KEY not set yet); None on any failure."""
+    """DORMANT: transcribe an mp4's audio via Grok STT (api.x.ai/v1/stt). Kept
+    for a future X-video path but currently UNWIRED -- the Grok x_search
+    resolver does not surface mp4 URLs, so X-video AUDIO is not transcribed (the
+    post is text/context-summarized instead). Wiring real audio transcription
+    needs an mp4 source (X API media variants, or a video extractor)."""
     xai_key = os.environ.get("XAI_API_KEY", "")
-    if not xai_key:
-        logger.warning("[learn] XAI_API_KEY not set -- X video not transcribed; degraded to "
-                       "'content not retrieved' (never fabricated)")
-        return None
-    if not mp4_url:
+    if not xai_key or not mp4_url:
         return None
     headers = {"Authorization": f"Bearer {xai_key}", "Content-Type": "application/json"}
     try:
@@ -508,44 +536,31 @@ def _grok_stt(mp4_url: str):
     return data.get("text") or data.get("transcript") or None
 
 
-def _best_mp4_variant(media_obj: dict):
-    variants = (media_obj or {}).get("variants") or []
-    mp4s = [v for v in variants if (v or {}).get("content_type") == "video/mp4" and v.get("url")]
-    if not mp4s:
-        return None
-    mp4s.sort(key=lambda v: v.get("bit_rate", 0), reverse=True)
-    return mp4s[0]["url"]
-
-
 def resolve_x(url: str) -> dict:
-    tid = _tweet_id(url)
-    if not tid:
-        return _partial("x", "could not parse a tweet id from the URL")
-    payload = _fetch_x_tweet(tid)
-    if not payload:
-        return _partial("x", "X API returned nothing (token may be unset)")
-    data = payload.get("data") or {}
-    note = (data.get("note_tweet") or {}).get("text")
-    base_text = note or data.get("text") or ""
-    created = data.get("created_at")
-    # Detect a video media -> Grok STT.
-    media = ((payload.get("includes") or {}).get("media")) or []
-    video = next((m for m in media if (m or {}).get("type") in ("video", "animated_gif")), None)
-    if video:
-        mp4 = _best_mp4_variant(video)
-        transcript = _grok_stt(mp4) if mp4 else None
-        if transcript:
-            combined = (base_text + "\n\n[video transcript]\n" + transcript).strip()
-            logger.info(f"[learn] x-video resolved: tweet {tid}, {len(transcript)} transcript chars")
-            return {"text": combined[:20000], "kind": "x-video", "partial": False,
-                    "reason": "", "content_date": created}
-        # Video present but not transcribable -> partial, keep the tweet text.
-        return {"text": base_text[:20000], "kind": "x-video", "partial": True,
-                "reason": "video not transcribed (Grok STT unavailable)", "content_date": created}
-    if not base_text:
-        return _partial("x", "tweet had no text and no transcribable media")
-    logger.info(f"[learn] x resolved: tweet {tid}, {len(base_text)} chars")
-    return {"text": base_text[:20000], "kind": "x", "partial": False, "reason": "", "content_date": created}
+    """Resolve an X post's CONTENT via Grok's Agent Tools API (x_search), using
+    only XAI_API_KEY -- no X API bearer token. Returns the post's faithful
+    content for the Sonnet summarizer; null-safe graceful degrade to partial on
+    any failure (never fabricated). NOTE: this path text/context-summarizes the
+    post; it does NOT transcribe X-video audio (see _grok_stt, dormant)."""
+    model = os.environ.get("LEARN_X_MODEL", "grok-4.20-non-reasoning")
+    prompt = (
+        "Fetch the X (Twitter) post at this exact URL and report its FULL actual content "
+        "faithfully: the author handle, the complete post text, any thread context, a brief "
+        "description of any image or video media present, and the post date if shown. Do NOT "
+        "editorialize or add outside information. If you cannot access or find the specific "
+        "post, reply with exactly CANNOT_ACCESS.\nURL: " + url
+    )
+    try:
+        data = _grok_responses_call(prompt, model)
+    except Exception as e:
+        logger.warning(f"[learn] Grok x_search failed {url[:60]}: {e}")
+        return _partial("x", f"Grok x_search error: {e}")
+    text, citations = _parse_grok_responses(data)
+    if not text or text.strip().upper().startswith("CANNOT_ACCESS"):
+        return _partial("x", "Grok could not access the post (CANNOT_ACCESS)")
+    logger.info(f"[learn] x resolved via Grok x_search ({model}): {len(text)} chars {url[:60]}")
+    return {"text": text[:20000], "kind": "x", "partial": False, "reason": "",
+            "content_date": None, "citations": citations}
 
 
 def resolve_item(item: dict) -> dict:
