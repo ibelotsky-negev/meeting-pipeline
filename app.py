@@ -2952,13 +2952,14 @@ def learn_run():
     backlog = request.args.get("backlog", "").lower() in ("true", "1", "yes")
     sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
     force = request.args.get("force", "").lower() in ("true", "1", "yes")
+    limit = request.args.get("limit", type=int)  # diagnostic: process only the first N unread
     if not _learn_trigger_lock.acquire(blocking=False):
         return jsonify({"status": "already_running"}), 409
 
     if sync:
         try:
             import learn_digest
-            result = learn_digest.run_learn(dry_run=dry_run, backlog=backlog, force=force)
+            result = learn_digest.run_learn(dry_run=dry_run, backlog=backlog, force=force, limit=limit)
             return jsonify(result)
         except Exception as e:
             logger.error(f"[learn] Sync run failed: {e}", exc_info=True)
@@ -2970,7 +2971,7 @@ def learn_run():
     def _run():
         try:
             import learn_digest
-            learn_digest.run_learn(dry_run=dry_run, backlog=backlog, force=force)
+            learn_digest.run_learn(dry_run=dry_run, backlog=backlog, force=force, limit=limit)
             logger.info("[learn] Manual run complete")
         except Exception as e:
             logger.error(f"[learn] Manual run failed: {e}", exc_info=True)
@@ -2980,7 +2981,7 @@ def learn_run():
     logger.info(f"[learn] Trigger: dry_run={dry_run} backlog={backlog} force={force} -- launching background thread")
     t = _threading.Thread(target=_run, daemon=True)
     t.start()
-    return jsonify({"status": "started", "dry_run": dry_run, "backlog": backlog, "force": force})
+    return jsonify({"status": "started", "dry_run": dry_run, "backlog": backlog, "force": force, "limit": limit})
 
 
 @app.route("/learn/status", methods=["GET"])
@@ -3210,7 +3211,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.5-cluster-debug2", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.18.6-cluster-retry", "deployed": "2026-06-21"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3248,7 +3249,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.5-cluster-debug2", "steps": {}}
+    results = {"version": "2.18.6-cluster-retry", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

@@ -316,7 +316,7 @@ class TestHelpers:
 class TestLearnRunEndpoint:
     def test_sync_run_returns_result(self, flask_client, monkeypatch):
         monkeypatch.setattr(ld, "run_learn",
-                            lambda dry_run=False, backlog=False, force=False: {
+                            lambda dry_run=False, backlog=False, force=False, limit=None: {
                                 "status": "ok", "keepers": 3, "dry_run": dry_run, "backlog": backlog})
         resp = flask_client.get("/learn/run?sync=true&dry_run=true&backlog=1")
         assert resp.status_code == 200
@@ -430,3 +430,44 @@ class TestTokenBudgets:
         monkeypatch.setattr(ld, "_call_claude_text", fake)
         ld.curate_cluster({"topic": "Cowork", "items": _cowork_summaries()[:2]})
         assert captured["max_tokens"] == ld.CURATE_MAX_TOKENS
+
+
+# ----------------------------------------------------------------------
+#  14. Cluster-call resilience: retry transient failures instead of nuking
+#      the whole batch to singletons; record a diagnostic either way.
+# ----------------------------------------------------------------------
+
+class TestClusterResilience:
+    def test_retries_transient_failure_then_succeeds(self, monkeypatch):
+        monkeypatch.setattr(ld.time, "sleep", lambda *a, **k: None)
+        calls = {"n": 0}
+
+        def flaky(prompt, model):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient 529 overloaded")
+            return json.dumps({"clusters": [{"topic": "Cowork", "members": [0, 1, 2, 3, 4]}]})
+
+        clusters = ld.cluster_items(_cowork_summaries(), call_fn=flaky)
+        assert calls["n"] >= 2  # it retried rather than falling back on the first failure
+        assert len(clusters) == 1 and len(clusters[0]["items"]) == 5
+        assert ld._LAST_CLUSTER_DIAG.get("fell_back_to_singletons") is False
+
+    def test_persistent_failure_falls_back_and_records_error(self, monkeypatch):
+        monkeypatch.setattr(ld.time, "sleep", lambda *a, **k: None)
+
+        def always_fail(prompt, model):
+            raise RuntimeError("529 overloaded")
+
+        clusters = ld.cluster_items(_cowork_summaries(), call_fn=always_fail)
+        assert len(clusters) == 5  # singleton fallback only after retries exhausted
+        assert ld._LAST_CLUSTER_DIAG.get("fell_back_to_singletons") is True
+        assert "529" in (ld._LAST_CLUSTER_DIAG.get("error") or "")
+
+
+class TestFetchLimit:
+    def test_fetch_unread_respects_limit(self, monkeypatch):
+        page = {"value": [{"id": f"m{i}", "subject": str(i)} for i in range(5)]}
+        monkeypatch.setattr(ld.eps, "graph_get", lambda url, params=None: page)
+        assert len(ld.fetch_unread(limit=2)) == 2
+        assert len(ld.fetch_unread()) == 5

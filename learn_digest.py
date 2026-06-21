@@ -680,6 +680,10 @@ def summarize_item(item: dict, resolved: dict, call_fn=None) -> dict:
 #  CLUSTER (Opus) -- group the whole batch by topic
 # ======================================================================
 
+# Diagnostics from the most recent cluster_items call (surfaced in run status so
+# a real-run failure -- e.g. a swallowed API error -- is visible without logs).
+_LAST_CLUSTER_DIAG = {}
+
 
 def cluster_items(summaries: list, call_fn=None) -> list:
     """Group all item summaries into topic clusters. The whole batch is seen at
@@ -707,17 +711,34 @@ def cluster_items(summaries: list, call_fn=None) -> list:
         "Every index 0.." + str(len(summaries) - 1) + " must appear in exactly one cluster.\n\n"
         "Items:\n" + "\n".join(lines)
     )
-    try:
-        raw = call_fn(instructions, CURATE_MODEL)
-        parsed = _extract_json(raw) or {}
-    except Exception as e:
-        logger.warning(f"[learn] clustering failed: {e}")
-        parsed = {}
+    # Retry the whole-batch call: a transient overload/rate-limit (429/529) or a
+    # truncated/unparseable response must NOT nuke consolidation into singletons.
+    raw, last_err, attempts, parsed = "", None, 0, {}
+    for attempt in range(3):
+        attempts = attempt + 1
+        try:
+            raw = call_fn(instructions, CURATE_MODEL) or ""
+            parsed = _extract_json(raw) or {}
+            if parsed.get("clusters"):
+                last_err = None
+                break
+            last_err = f"unparseable or empty response (raw_len={len(raw)})"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+        logger.warning(f"[learn] clustering attempt {attempts} unsuccessful: {last_err}")
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
 
+    _LAST_CLUSTER_DIAG.clear()
+    _LAST_CLUSTER_DIAG.update({
+        "items": len(summaries), "attempts": attempts, "raw_len": len(raw or ""),
+        "error": last_err, "model_clusters": len(parsed.get("clusters") or []),
+        "fell_back_to_singletons": not bool(parsed.get("clusters")),
+    })
     if not parsed.get("clusters"):
         logger.warning(
-            f"[learn] clustering returned no parseable clusters for {len(summaries)} items -- "
-            f"falling back to singletons (raise LEARN_CLUSTER_MAX_TOKENS if the output truncated)")
+            f"[learn] clustering produced no clusters after {attempts} attempts ({last_err}) -- "
+            f"falling back to singletons for {len(summaries)} items")
 
     clusters = []
     placed = set()
@@ -1054,10 +1075,12 @@ def create_triage_task(keeper: dict) -> str:
 # ======================================================================
 
 
-def fetch_unread(folder_id: str = LEARN_FOLDER_ID, processed_ids: set = None, backlog: bool = False) -> list:
+def fetch_unread(folder_id: str = LEARN_FOLDER_ID, processed_ids: set = None, backlog: bool = False,
+                 limit: int = None) -> list:
     """Fetch unread messages from the read/learn folder by ID, skipping any IDs
     already in learn_processed.json. First run fetches the full backlog; we do
-    NOT chunk -- the clustering pass must see the whole set at once."""
+    NOT chunk -- the clustering pass must see the whole set at once. limit (if
+    set) caps the number returned -- a diagnostic knob for fast partial runs."""
     processed_ids = processed_ids or set()
     base = f"{eps.MS_GRAPH_BASE}/users/{MAILBOX}/mailFolders/{folder_id}/messages"
     params = {
@@ -1075,7 +1098,11 @@ def fetch_unread(folder_id: str = LEARN_FOLDER_ID, processed_ids: set = None, ba
             messages.append(m)
         url = data.get("@odata.nextLink")
         pages += 1
-    logger.info(f"[learn] Fetched {len(messages)} unread (backlog={backlog}, pages={pages})")
+        if limit and len(messages) >= limit:
+            break
+    if limit:
+        messages = messages[:limit]
+    logger.info(f"[learn] Fetched {len(messages)} unread (backlog={backlog}, pages={pages}, limit={limit})")
     return messages
 
 
@@ -1169,13 +1196,13 @@ def read_status() -> dict:
 # ======================================================================
 
 
-def _learn_run_inner(dry_run: bool, backlog: bool) -> dict:
+def _learn_run_inner(dry_run: bool, backlog: bool, limit: int = None) -> dict:
     """The pipeline, run with the lock held. Mirrors the spec's 11-step flow."""
     run_id = uuid.uuid4().hex[:12]
     started = datetime.now(timezone.utc)
     processed_ids = _load_processed_ids()
 
-    messages = fetch_unread(LEARN_FOLDER_ID, processed_ids, backlog)
+    messages = fetch_unread(LEARN_FOLDER_ID, processed_ids, backlog, limit=limit)
     if not messages:
         result = {"status": "ok", "run_id": run_id, "sent": False, "reason": "no unread items",
                   "clusters": 0, "keepers": 0, "skipped": 0, "dry_run": dry_run}
@@ -1236,6 +1263,7 @@ def _learn_run_inner(dry_run: bool, backlog: bool) -> dict:
         "items": len(messages), "clusters": len(clusters),
         "keepers": total_keepers, "skipped": total_skipped,
         "tasks_created": tasks_created, "subject": subject,
+        "cluster_diag": dict(_LAST_CLUSTER_DIAG),
         # Body is persisted so a dry-run can be sanity-checked via /learn/status
         # without sending the email or mutating the mailbox.
         "body": body,
@@ -1245,7 +1273,7 @@ def _learn_run_inner(dry_run: bool, backlog: bool) -> dict:
     return result
 
 
-def run_learn(dry_run: bool = False, backlog: bool = False, force: bool = False) -> dict:
+def run_learn(dry_run: bool = False, backlog: bool = False, force: bool = False, limit: int = None) -> dict:
     """Public entry. Acquires the cross-process file lock + the in-process lock,
     runs the pipeline, releases both. Guarantees exactly one run (and exactly
     one digest send) even under a two-worker race.
@@ -1264,7 +1292,7 @@ def run_learn(dry_run: bool = False, backlog: bool = False, force: bool = False)
         _release_run_lock()
         return {"status": "skipped", "reason": "run already in progress"}
     try:
-        return _learn_run_inner(dry_run, backlog)
+        return _learn_run_inner(dry_run, backlog, limit=limit)
     except Exception as e:
         import traceback as _tb
         tb = _tb.format_exc()
