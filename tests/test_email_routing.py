@@ -1,6 +1,7 @@
 # Tests for email alias normalization, internal-domain detection, and
 # HubSpot owner routing (HUBSPOT_OWNER_MAP -> API lookup -> fallback).
 import app as app_module
+import hubspot_client as hc
 
 
 class TestNormalizeTeamEmail:
@@ -56,7 +57,7 @@ class TestResolveHubspotOwner:
             api_calls.append((method, endpoint, params))
             return {"results": []}  # no HubSpot seat for this email
 
-        monkeypatch.setattr(app_module, "hubspot_request", fake_hubspot_request)
+        monkeypatch.setattr(hc, "hubspot_request", fake_hubspot_request)
         result = app_module.resolve_hubspot_owner("ka@negevlabs.com")
         assert result == "241153249"
         # The API lookup chain was attempted before falling back
@@ -72,7 +73,7 @@ class TestResolveHubspotOwner:
             call_count["n"] += 1
             return {"results": [{"id": 99001}]}
 
-        monkeypatch.setattr(app_module, "hubspot_request", fake_hubspot_request)
+        monkeypatch.setattr(hc, "hubspot_request", fake_hubspot_request)
         first = app_module.resolve_hubspot_owner("new.hire@negevlabs.com")
         second = app_module.resolve_hubspot_owner("new.hire@negevlabs.com")
         assert first == second == "99001"

@@ -3,6 +3,7 @@
 import json
 
 import app as app_module
+import hubspot_client as hc
 
 
 class _FakeMessage:
@@ -69,13 +70,13 @@ class TestExtractMeetingIntelligenceNullSafety:
 class TestHubspotNullSafety:
     def test_find_contact_with_null_results(self, monkeypatch):
         monkeypatch.setattr(
-            app_module, "hubspot_request",
+            hc, "hubspot_request",
             lambda method, endpoint, data=None, params=None: {"results": None})
         assert app_module.find_hubspot_contact("x@y.com") is None
 
     def test_get_contact_associations_with_null_results(self, monkeypatch):
         monkeypatch.setattr(
-            app_module, "hubspot_request",
+            hc, "hubspot_request",
             lambda method, endpoint, data=None, params=None: {"results": None})
         assoc = app_module.get_contact_associations("123")
         assert assoc == {"companies": [], "deals": []}

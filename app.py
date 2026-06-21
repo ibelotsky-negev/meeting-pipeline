@@ -18,7 +18,6 @@ import uuid
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 import anthropic
 import requests
@@ -36,63 +35,11 @@ logger = logging.getLogger(__name__)
 from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_API_KEY, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_REFRESH_TOKEN, MS_GRAPH_AUTH_MODE, ASANA_WORKSPACE_GID, ASANA_PROJECT_GID, HUBSPOT_OWNER_ID, POLL_INTERVAL_MINUTES, APP_BASE_URL, NOTIFY_VIA, SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, BOT_SENDER_EMAIL, BOT_SENDER_NAME, INTERNAL_DOMAINS, HUBSPOT_OWNER_MAP_RAW, HUBSPOT_OWNER_MAP, TEAM_MEMBER_NAMES_RAW, TEAM_MEMBER_NAMES, TEAM_MEMBERS_LIST, EMAIL_ALIAS_MAP, EMAIL_ALIAS_MAP_RAW, DATA_DIR, PROCESSED_FILE, PENDING_FILE, SYNC_MAP_FILE, TODO_LIST_NAME, TODO_POLL_INTERVAL, RAILWAY_PUBLIC_URL, TEAMS_WEBHOOK_SECRET, TEAMS_TRANSCRIPT_ENABLED, TEAMS_ORGANIZER_USER_ID, TEAMS_POLL_USER_IDS, TEAMS_POLL_INTERVAL, SUBSCRIPTION_FILE, PULSE_RECIPIENTS, PULSE_SENDER, PULSE_DOMAINS, PULSE_ARCHIVE_DIR, PULSE_LOOKBACK_DAYS, BRIEFING_BOOK_PATH, BRIEFING_BOOK_REPO, PULSE_SKIP_SENDERS, PULSE_SKIP_DOMAINS, PULSE_SKIP_SUBJECTS, normalize_team_email, load_briefing_book, is_internal_email, resolve_internal_organizer)  # noqa: F401
 from prompts import (PULSE_SCOPE, PULSE_ANTI_HALLUCINATION, PULSE_EMAIL_PROMPT, PULSE_TEAMS_PROMPT, PULSE_MEETINGS_PROMPT, PULSE_SYNTHESIS_PROMPT, PULSE_BRIEFING_UPDATE_PROMPT)  # noqa: F401
 from templates import REVIEW_TEMPLATE, RESULT_TEMPLATE  # noqa: F401
-
-
-def to_hubspot_ms(date_str):
-    """Convert date or ISO datetime string to HubSpot Unix ms (as string).
-    Handles: '2026-04-28', '2026-04-28T17:00:00Z',
-             '2026-04-28T17:00:00+00:00', None, empty strings.
-    Returns None if input is invalid or empty.
-    HubSpot requires timestamps as Unix ms strings (e.g. '1772631000000').
-    """
-    if not date_str:
-        return None
-    s = str(date_str).strip()
-    if not s:
-        return None
-    # Normalize trailing Z to +00:00 for fromisoformat compatibility
-    if s.endswith('Z'):
-        s = s[:-1] + '+00:00'
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        try:
-            dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return str(int(dt.timestamp() * 1000))
-
-
-def to_graph_datetime(date_str):
-    """Convert date or ISO datetime string to Microsoft Graph dateTime
-    format (ISO 8601 with seconds, no timezone suffix -- Graph pairs it
-    with a separate timeZone field).
-
-    Handles: '2026-04-28', '2026-04-28T17:00:00Z',
-             '2026-04-28T17:00:00+00:00', None, empty strings.
-    Returns None if input is invalid or empty.
-
-    Output format: 'YYYY-MM-DDTHH:MM:SS' (no Z, no offset).
-    Date-only inputs default to T00:00:00.
-    """
-    if not date_str:
-        return None
-    s = str(date_str).strip()
-    if not s:
-        return None
-    if s.endswith('Z'):
-        s = s[:-1] + '+00:00'
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        try:
-            dt = datetime.strptime(s, "%Y-%m-%d")
-        except ValueError:
-            return None
-    # Graph wants naive ISO format paired with a timeZone field
-    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+from datetime_utils import to_hubspot_ms, to_graph_datetime, resolve_due_date  # noqa: F401
+from stores import load_pending, save_pending, load_processed, save_processed, load_sync_map, save_sync_map  # noqa: F401
+from fireflies_client import fireflies_query, get_recent_transcripts, get_transcript_by_id  # noqa: F401
+from hubspot_client import (hubspot_request, find_hubspot_contact, _hubspot_owner_cache, resolve_hubspot_owner, create_hubspot_contact, get_contact_associations, log_hubspot_meeting, create_hubspot_task)  # noqa: F401
+from asana_client import asana_request, create_asana_task, find_asana_user_by_email  # noqa: F401
 
 
 def strip_emojis(text: str) -> str:
@@ -123,97 +70,6 @@ app = Flask(__name__)
 _app_only = MS_GRAPH_AUTH_MODE == "app" or (MS_GRAPH_AUTH_MODE == "auto" and not MS_GRAPH_REFRESH_TOKEN)
 logger.info(f"Graph auth mode: {'app-only (team-wide)' if _app_only else 'delegated (single-user)'}")
 logger.info(f"HubSpot owner map: {len(HUBSPOT_OWNER_MAP)} entries | fallback: {HUBSPOT_OWNER_ID or 'none'}")
-
-
-# ======================================================================
-#  PENDING APPROVALS STORE
-# ======================================================================
-
-def load_pending() -> dict:
-    try:
-        with open(PENDING_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def save_pending(pending: dict):
-    with open(PENDING_FILE, "w") as f:
-        json.dump(pending, f, indent=2, default=str)
-
-
-def load_processed() -> set:
-    try:
-        with open(PROCESSED_FILE, "r") as f:
-            return set(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return set()
-
-
-def save_processed(processed: set):
-    with open(PROCESSED_FILE, "w") as f:
-        json.dump(list(processed), f)
-
-
-# ======================================================================
-#  FIREFLIES API
-# ======================================================================
-
-FIREFLIES_GRAPHQL_URL = "https://api.fireflies.ai/graphql"
-
-
-def fireflies_query(query: str, variables: dict = None) -> dict:
-    headers = {
-        "Authorization": f"Bearer {FIREFLIES_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {"query": query}
-    if variables:
-        payload["variables"] = variables
-    resp = requests.post(FIREFLIES_GRAPHQL_URL, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if "errors" in data:
-        raise Exception(f"Fireflies API error: {data['errors']}")
-    return data["data"]
-
-
-def get_recent_transcripts(since_minutes: int = 30) -> list:
-    query = """
-    query { transcripts {
-        id title dateString: date duration organizer_email participants
-        summary { short_summary action_items keywords overview }
-        sentences { speaker_name text }
-    }}
-    """
-    data = fireflies_query(query)
-    transcripts = data.get("transcripts", [])
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
-    recent = []
-    for t in transcripts:
-        try:
-            ds = t.get("dateString", "")
-            if isinstance(ds, (int, float)):
-                t_date = datetime.fromtimestamp(ds / 1000 if ds > 1e12 else ds, tz=timezone.utc)
-            else:
-                t_date = datetime.fromisoformat(str(ds).replace("Z", "+00:00"))
-            if t_date >= cutoff:
-                recent.append(t)
-        except (ValueError, TypeError, OSError):
-            continue
-    return recent
-
-
-def get_transcript_by_id(transcript_id: str) -> dict:
-    query = """
-    query GetTranscript($id: String!) { transcript(id: $id) {
-        id title dateString: date duration organizer_email participants
-        summary { shorthand_bullet short_summary action_items keywords overview notes }
-        sentences { speaker_name text }
-    }}
-    """
-    data = fireflies_query(query, {"id": transcript_id})
-    return data.get("transcript")
 
 
 # ======================================================================
@@ -1340,244 +1196,6 @@ def create_outlook_draft(
 
 
 # ======================================================================
-#  HUBSPOT API
-# ======================================================================
-
-HUBSPOT_BASE = "https://api.hubapi.com"
-
-
-def hubspot_request(method: str, endpoint: str, data: dict = None, params: dict = None) -> dict:
-    headers = {
-        "Authorization": f"Bearer {HUBSPOT_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    url = f"{HUBSPOT_BASE}{endpoint}"
-    resp = requests.request(method, url, json=data, params=params, headers=headers, timeout=30)
-    resp.raise_for_status()
-    return resp.json() if resp.content else {}
-
-
-def find_hubspot_contact(email: str) -> Optional[dict]:
-    data = {
-        "filterGroups": [{"filters": [{"propertyName": "email", "operator": "EQ", "value": email}]}],
-        "properties": ["firstname", "lastname", "email", "company", "jobtitle", "hubspot_owner_id"],
-    }
-    result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
-    results = result.get("results", [])
-    return results[0] if results else None
-
-
-# ======================================================================
-
-_hubspot_owner_cache = {}  # email   owner_id cache
-
-
-def resolve_hubspot_owner(organizer_email: str) -> str:
-    """Resolve organizer email to HubSpot owner ID.
-    Priority: HUBSPOT_OWNER_MAP   HubSpot API lookup   HUBSPOT_OWNER_ID fallback."""
-    if not organizer_email:
-        return HUBSPOT_OWNER_ID
-    # Normalize alias emails to canonical @negevlabs.com
-    organizer_email = normalize_team_email(organizer_email)
-
-    # Check static map first (fast, no API call)
-    if organizer_email in HUBSPOT_OWNER_MAP:
-        return HUBSPOT_OWNER_MAP[organizer_email]
-
-    # Check cache
-    if organizer_email in _hubspot_owner_cache:
-        return _hubspot_owner_cache[organizer_email]
-
-    # Try HubSpot owners API lookup by email
-    try:
-        result = hubspot_request("GET", "/crm/v3/owners", params={"email": organizer_email, "limit": 1})
-        owners = result.get("results", [])
-        if owners:
-            owner_id = str(owners[0].get("id", ""))
-            _hubspot_owner_cache[organizer_email] = owner_id
-            logger.info(f"Resolved HubSpot owner: {organizer_email}   {owner_id}")
-            return owner_id
-    except Exception as e:
-        logger.warning(f"HubSpot owner lookup failed for {organizer_email}: {e}")
-
-    # Fallback to default
-    _hubspot_owner_cache[organizer_email] = HUBSPOT_OWNER_ID
-    return HUBSPOT_OWNER_ID
-
-
-def create_hubspot_contact(contact_info: dict, organizer_email: str = "") -> dict:
-    properties = {
-        "firstname": contact_info.get("name", "").split()[0] if contact_info.get("name") else "",
-        "lastname": " ".join(contact_info.get("name", "").split()[1:]) if contact_info.get("name") else "",
-        "email": contact_info.get("email", ""),
-        "company": contact_info.get("company", ""),
-        "jobtitle": contact_info.get("role", ""),
-    }
-    owner_id = resolve_hubspot_owner(organizer_email)
-    if owner_id:
-        properties["hubspot_owner_id"] = owner_id
-    properties = {k: v for k, v in properties.items() if v}
-    result = hubspot_request("POST", "/crm/v3/objects/contacts", {"properties": properties})
-    logger.info(f"Created HubSpot contact: {contact_info.get('name')} ({result.get('id')})   owner: {owner_id or 'none'}")
-    return result
-
-
-def resolve_due_date(item: dict, meeting_date_str: str) -> tuple:
-    """Convert due_days/due_context into actual dates for HubSpot and Asana.
-    Returns (hubspot_due: str ISO datetime, asana_due: str YYYY-MM-DD, display: str)"""
-    try:
-        meeting_dt = datetime.fromisoformat(meeting_date_str.replace("Z", "+00:00"))
-    except Exception:
-        meeting_dt = datetime.now(timezone.utc)
-
-    # Get due_days from Claude extraction, fallback to parsing due_context
-    due_days = item.get("due_days")
-    if due_days is None or not isinstance(due_days, (int, float)):
-        # Fallback: parse due_context string
-        ctx = (item.get("due_context") or "").lower()
-        if any(w in ctx for w in ["asap", "urgent", "today", "immediate"]):
-            due_days = 1
-        elif "tomorrow" in ctx:
-            due_days = 1
-        elif any(w in ctx for w in ["this week", "few days", "couple days"]):
-            due_days = 3
-        elif "next week" in ctx:
-            due_days = 7
-        elif any(w in ctx for w in ["two week", "couple week", "2 week"]):
-            due_days = 14
-        elif any(w in ctx for w in ["end of month", "month end"]):
-            due_days = 21
-        elif "next month" in ctx:
-            due_days = 30
-        else:
-            due_days = 7  # default
-
-    due_days = max(1, int(due_days))
-    due_dt = meeting_dt + timedelta(days=due_days)
-    hubspot_due = due_dt.strftime("%Y-%m-%dT17:00:00Z")
-    asana_due = due_dt.strftime("%Y-%m-%d")
-    display = due_dt.strftime("%b %d, %Y")
-    return hubspot_due, asana_due, display
-
-
-def get_contact_associations(contact_id: str) -> dict:
-    """Look up a contact's associated companies and deals."""
-    assoc = {"companies": [], "deals": []}
-    for obj_type in ("companies", "deals"):
-        try:
-            result = hubspot_request("GET", f"/crm/v4/objects/contacts/{contact_id}/associations/{obj_type}")
-            for item in (result.get("results") or []):
-                to_id = item.get("toObjectId")
-                if to_id:
-                    assoc[obj_type].append(str(to_id))
-        except Exception as e:
-            logger.warning(f"Association lookup {obj_type} for contact {contact_id}: {e}")
-    return assoc
-
-
-def log_hubspot_meeting(contact_id: str, meeting_body: str, meeting_date: str,
-                        title: str = "", transcript_id: str = "", duration_min: int = 30) -> dict:
-    """Create a Meeting engagement in HubSpot, associated with Contact + Company + Deal."""
-    # Build Fireflies link
-    fireflies_url = f"https://app.fireflies.ai/view/{transcript_id}" if transcript_id else ""
-    body_with_link = meeting_body
-    if fireflies_url:
-        body_with_link += f"\n\n---\nRecording: {fireflies_url}"
-
-    # Calculate meeting times
-    try:
-        from dateutil import parser as dtparser
-        start_dt = dtparser.parse(meeting_date)
-    except Exception:
-        start_dt = datetime.now(timezone.utc)
-    end_dt = start_dt + timedelta(minutes=duration_min)
-
-    properties = {
-        "hs_timestamp": int(start_dt.timestamp() * 1000),
-        "hs_meeting_title": title or "Meeting",
-        "hs_meeting_body": body_with_link,
-        "hs_meeting_start_time": int(start_dt.timestamp() * 1000),
-        "hs_meeting_end_time": int(end_dt.timestamp() * 1000),
-        "hs_meeting_outcome": "COMPLETED",
-    }
-
-    # Build associations: contact + company + deal
-    # Association type IDs: meeting->contact=200, meeting->company=188, meeting->deal=206
-    associations = [
-        {"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 200}]}
-    ]
-
-    # Look up related companies and deals
-    related = get_contact_associations(contact_id)
-    for company_id in related["companies"]:
-        associations.append(
-            {"to": {"id": company_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 188}]}
-        )
-    for deal_id in related["deals"]:
-        associations.append(
-            {"to": {"id": deal_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 206}]}
-        )
-
-    logger.info(f"Creating HubSpot meeting: contact={contact_id}, companies={related['companies']}, deals={related['deals']}")
-    data = {"properties": properties, "associations": associations}
-    return hubspot_request("POST", "/crm/v3/objects/meetings", data)
-
-
-def create_hubspot_task(contact_id: str, subject: str, body: str, due_date: str, organizer_email: str = "") -> dict:
-    ms = to_hubspot_ms(due_date) or str(int(datetime.now(timezone.utc).timestamp() * 1000))
-    logger.info(f"[hubspot_task] due_date input='{due_date}' converted='{ms}'")
-    data = {
-        "properties": {
-            "hs_task_subject": subject, "hs_task_body": body,
-            "hs_task_status": "NOT_STARTED", "hs_task_priority": "HIGH",
-            "hs_timestamp": ms,
-        },
-        "associations": [{"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 204}]}],
-    }
-    owner_id = resolve_hubspot_owner(organizer_email)
-    if owner_id:
-        data["properties"]["hubspot_owner_id"] = owner_id
-    return hubspot_request("POST", "/crm/v3/objects/tasks", data)
-
-
-# ======================================================================
-#  ASANA API
-# ======================================================================
-
-ASANA_BASE = "https://app.asana.com/api/1.0"
-
-
-def asana_request(method: str, endpoint: str, data: dict = None) -> dict:
-    headers = {"Authorization": f"Bearer {ASANA_API_KEY}", "Content-Type": "application/json"}
-    url = f"{ASANA_BASE}{endpoint}"
-    resp = requests.request(method, url, json={"data": data} if data else None, headers=headers, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("data", {})
-
-
-def create_asana_task(name: str, notes: str, due_on: str = None, assignee_gid: str = None) -> dict:
-    task_data = {"name": name, "notes": notes, "workspace": ASANA_WORKSPACE_GID}
-    if due_on:
-        task_data["due_on"] = due_on
-    if assignee_gid:
-        task_data["assignee"] = assignee_gid
-    if ASANA_PROJECT_GID:
-        task_data["projects"] = [ASANA_PROJECT_GID]
-    return asana_request("POST", "/tasks", task_data)
-
-
-def find_asana_user_by_email(email: str) -> Optional[str]:
-    """Look up Asana user GID by email. Returns GID or None."""
-    if not email or "placeholder" in email or "unknown" in email:
-        return None
-    try:
-        result = asana_request("GET", f"/users/{email}")
-        return result.get("gid")
-    except Exception:
-        return None
-
-
-# ======================================================================
 #  ASANA <-> MICROSOFT TO-DO BIDIRECTIONAL SYNC
 # ======================================================================
 
@@ -1585,21 +1203,6 @@ import threading as _threading
 
 _todo_poller_running = False
 _todo_last_poll_time = None
-
-
-def load_sync_map() -> dict:
-    """Load Asana<->To-Do mapping from /data/asana_todo_map.json."""
-    try:
-        with open(SYNC_MAP_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"user_lists": {}, "mappings": {}, "asana_webhook_id": None}
-
-
-def save_sync_map(sync_map: dict):
-    """Persist mapping to /data/asana_todo_map.json."""
-    with open(SYNC_MAP_FILE, "w") as f:
-        json.dump(sync_map, f, indent=2, default=str)
 
 
 def _graph_request_with_retry(method: str, url: str, json_body: dict = None, headers: dict = None, force_delegated: bool = False) -> dict:
@@ -3460,7 +3063,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.17.1-prompts-templates", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.17.2-leaf-clients", "deployed": "2026-06-21"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3494,7 +3097,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.17.1-prompts-templates", "steps": {}}
+    results = {"version": "2.17.2-leaf-clients", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
