@@ -316,7 +316,7 @@ class TestHelpers:
 class TestLearnRunEndpoint:
     def test_sync_run_returns_result(self, flask_client, monkeypatch):
         monkeypatch.setattr(ld, "run_learn",
-                            lambda dry_run=False, backlog=False: {
+                            lambda dry_run=False, backlog=False, force=False: {
                                 "status": "ok", "keepers": 3, "dry_run": dry_run, "backlog": backlog})
         resp = flask_client.get("/learn/run?sync=true&dry_run=true&backlog=1")
         assert resp.status_code == 200
@@ -375,3 +375,23 @@ class TestResolverKeys:
         assert not hasattr(ld, "XAI_API_KEY")
         assert not hasattr(ld, "SPOKEN_API_KEY")
         assert not hasattr(ld, "JINA_API_KEY")
+
+
+# ----------------------------------------------------------------------
+#  12. force=1 clears an orphaned run lock
+# ----------------------------------------------------------------------
+
+class TestForceLock:
+    def test_force_clears_orphaned_lock(self, learn_files, monkeypatch):
+        # Simulate an orphaned lock (a run killed mid-flight left the file behind).
+        with open(ld.LEARN_LOCK_FILE, "w") as f:
+            f.write("{}")
+        # Without force, a fresh (non-stale) lock blocks the run.
+        assert ld.run_learn(dry_run=True, force=False)["status"] == "skipped"
+        # With force, the lock is cleared and the run proceeds.
+        monkeypatch.setattr(ld, "fetch_unread", lambda *a, **k: [])
+        result = ld.run_learn(dry_run=True, force=True)
+        assert result["status"] == "ok"
+        # Lock released afterwards -- a later run can acquire again.
+        assert ld._acquire_run_lock() is True
+        ld._release_run_lock()

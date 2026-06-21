@@ -1221,10 +1221,17 @@ def _learn_run_inner(dry_run: bool, backlog: bool) -> dict:
     return result
 
 
-def run_learn(dry_run: bool = False, backlog: bool = False) -> dict:
+def run_learn(dry_run: bool = False, backlog: bool = False, force: bool = False) -> dict:
     """Public entry. Acquires the cross-process file lock + the in-process lock,
     runs the pipeline, releases both. Guarantees exactly one run (and exactly
-    one digest send) even under a two-worker race."""
+    one digest send) even under a two-worker race.
+
+    force=True unconditionally clears a pre-existing run lock first -- an
+    operator override for an orphaned lock (e.g. a container killed mid-run).
+    Do NOT use force on the real send run; it defeats the single-send guard."""
+    if force:
+        logger.warning("[learn] force=1 -- clearing any existing run lock before starting")
+        _release_run_lock()
     if not _acquire_run_lock():
         logger.warning("[learn] Skipping -- another run already in progress (cross-process)")
         return {"status": "skipped", "reason": "run already in progress"}
