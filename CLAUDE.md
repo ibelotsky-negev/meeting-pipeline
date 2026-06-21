@@ -7,7 +7,7 @@ Sara is a post-meeting intelligence pipeline for Negev Labs (biotech venture stu
 - **Repo:** `ibelotsky-negev/meeting-pipeline` (branch: `main`)
 - **Hosting:** Railway at `https://meeting-pipeline-production.up.railway.app`
 - **Stack:** Flask, Claude API, Fireflies, Microsoft Graph, HubSpot, Asana, APScheduler
-- **Single-file app:** Everything is in `app.py` (~2800 lines)
+- **Module layout:** `app.py` (~4000 lines: Flask `app:app` entrypoint, all routes, Weekly Pulse, Teams, To-Do sync, Graph auth, Phase-1/2 core, scheduler) plus extracted helper modules it re-exports -- see [Module Layout](#module-layout)
 
 ## Team
 
@@ -19,6 +19,31 @@ Sara is a post-meeting intelligence pipeline for Negev Labs (biotech venture stu
 | Kostia Adamsky | ka@negevlabs.com | N/A | No HubSpot seat |
 
 Internal domains: `negevlabs.com`, `negevcap.com`, `ariadnebio.com`, `adres.bio`, `zirmania.onmicrosoft.com` (must match INTERNAL_DOMAINS env var on Railway)
+
+## Module Layout
+
+`app.py` was split out of a single-file god-file (refactor phases 0-2, shipped @2.17.2). It is still the Flask `app:app` entrypoint and the SOLE owner of: all `@app.route` handlers, the single APScheduler instance, Weekly Pulse, Teams transcripts, To-Do sync, Graph/Outlook token functions, the Phase-1/2 core (`extract_meeting_intelligence`, `notify_organizer`, `process_transcript_phase1`, `execute_approved_actions`), and `strip_emojis`.
+
+Extracted modules (imported and **re-exported** by app.py):
+
+| Module | Contents |
+|--------|----------|
+| `config.py` | All env reads + derived constants; helpers `normalize_team_email`, `is_internal_email`, `resolve_internal_organizer`, `load_briefing_book` |
+| `prompts.py` | The 7 Weekly Pulse prompt strings (`PULSE_*`) |
+| `templates.py` | `REVIEW_TEMPLATE`, `RESULT_TEMPLATE` (review/result HTML) |
+| `datetime_utils.py` | `to_hubspot_ms`, `to_graph_datetime`, `resolve_due_date` |
+| `stores.py` | pending/processed/sync-map JSON persistence |
+| `fireflies_client.py` | Fireflies GraphQL client |
+| `hubspot_client.py` | HubSpot contacts/owners/meetings/tasks + `_hubspot_owner_cache` |
+| `asana_client.py` | Asana tasks + user lookup |
+
+**Re-export pattern (load-bearing).** Near the top, app.py does `from <module> import (...)  # noqa: F401`, so `app_module.X` and every existing bare reference keep resolving. Rules for agents:
+- To change a moved function/constant, edit it **in its module** -- NOT in app.py (app.py only re-exports it).
+- A new shared helper goes in the right module and is added to app.py's re-export line (keep the `# noqa: F401`).
+- When a test mocks a moved function, patch it in the function's **home module** (e.g. `monkeypatch.setattr(hubspot_client, "hubspot_request", ...)`), not `app_module` -- otherwise the patch won't intercept the function's internal calls. Functions still in app.py are patched on `app_module` as before.
+- **NOT yet extracted (stay in app.py on purpose):** Graph/Outlook token functions (`get_ms_graph_token`, `get_delegated_graph_token`, `is_app_only_mode`, `create_outlook_draft`, `_graph_request_with_retry`, `get_graph_app_only_token`) -- `get_delegated_graph_token` rotates the `global MS_GRAPH_REFRESH_TOKEN`, so they were kept together. Routes, Pulse, Teams, and To-Do sync also remain in app.py.
+
+**CRLF warning.** `app.py` is stored CRLF (repo has `autocrlf=true`, no `.gitattributes`). Edit it preserving CRLF or `git diff` shows a full-file rewrite (the Edit/Write tools and most replacement tools default to LF). For large scripted edits, read/write in binary keeping `\r\n`; confirm a clean diff with `git diff --cached --stat`, not `git -c core.autocrlf=false diff`.
 
 ## Session Start (MANDATORY)
 
@@ -40,7 +65,7 @@ python -c "import ast; ast.parse(open('app.py').read()); print('OK')"
 # 4. Commit and push
 ts=$(date +%Y%m%d%H%M%S)
 echo -n "$ts" > CACHEBUST
-git add app.py CACHEBUST
+git add app.py CACHEBUST   # + any changed module (config.py, hubspot_client.py, ...)
 git commit -m "deploy: VERSION_STRING [$ts]"
 git push
 # 5. Poll until live (Railway takes 60-180s)
@@ -50,7 +75,7 @@ curl -s https://meeting-pipeline-production.up.railway.app/test | python -m json
 ```
 
 ### CACHEBUST File
-Always update `CACHEBUST` with a timestamp on every deploy. This invalidates Docker layer caching so Railway picks up the new `app.py`.
+Always update `CACHEBUST` with a timestamp on every deploy. This invalidates Docker layer caching so Railway picks up the new code (app.py or any extracted module).
 
 ### Procfile
 The repo has a `Procfile` that must say:
@@ -169,8 +194,8 @@ Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_AP
 3. On failure, read the error, fix the root cause. 4. Max 5 hook-enforced retries; same error twice in a row = invoke @fixer.
 - Never weaken, skip, or delete a test to pass it. Fix the code.
 - ASCII-only in comments and non-user-facing strings.
-- Version string lives in exactly 2 places in app.py (/version and /test). Bump both on any app.py change.
-- Passing local checks does NOT mean deployed. Deploy = commit app.py + fresh-timestamp CACHEBUST, push to main, poll /version every 20s up to 4 min. Never confirm via /test.
+- Version string lives in exactly 2 places in app.py (/version and /test). Bump both on any deployed code change (app.py or an extracted module).
+- Passing local checks does NOT mean deployed. Deploy = commit changed code (app.py and/or modules) + fresh-timestamp CACHEBUST, push to main, poll /version every 20s up to 4 min. Never confirm via /test.
 - Tests are offline-only. Never add a test that calls a live API.
 
 ## Test-with-code mandate
