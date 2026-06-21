@@ -3008,6 +3008,60 @@ def egress_check():
     return jsonify(out)
 
 
+@app.route("/learn/debug-cluster", methods=["GET"])
+def learn_debug_cluster():
+    """THROWAWAY: isolate the clustering call+parse on a tiny synthetic fixture
+    (5 items spanning 2 obvious topics) using the real cluster model call.
+    Surfaces the raw model response, parse outcome, and resulting cluster sizes
+    so an all-singletons fallback can be diagnosed in ~10s without a full
+    backlog run. Remove before the final deploy."""
+    import learn_digest as _ld
+    fixture = [
+        {"title": "Cowork setup guide", "type": "article", "url": "https://e/1", "subject": "Cowork",
+         "content_date": "2026-01-10", "summary": "How to set up Cowork.", "specifics": [], "partial": False},
+        {"title": "Cowork daily monitor", "type": "article", "url": "https://e/2", "subject": "Cowork",
+         "content_date": "2026-03-10", "summary": "Cowork agentic daily-monitor workflow.", "specifics": [], "partial": False},
+        {"title": "Cowork agents tips", "type": "x", "url": "https://e/3", "subject": "Cowork",
+         "content_date": "2026-05-10", "summary": "Using Cowork agents effectively.", "specifics": [], "partial": False},
+        {"title": "Gut health basics", "type": "article", "url": "https://e/4", "subject": "Gut",
+         "content_date": "2026-02-01", "summary": "Digestion and the microbiome.", "specifics": [], "partial": False},
+        {"title": "Huberman gut episode", "type": "podcast", "url": "https://e/5", "subject": "Gut",
+         "content_date": "2026-04-01", "summary": "Huberman on gut health.", "specifics": [], "partial": False},
+    ]
+    captured = {}
+
+    def cap(prompt, model):
+        captured["prompt_len"] = len(prompt)
+        try:
+            raw = _ld._cluster_call(prompt, model)
+            captured["raw"] = raw
+            return raw
+        except Exception as e:
+            import traceback as _tb
+            captured["error"] = f"{type(e).__name__}: {e}"
+            captured["traceback"] = _tb.format_exc()[-1200:]
+            raise
+
+    clusters = _ld.cluster_items(fixture, call_fn=cap)
+    raw = captured.get("raw", "")
+    parsed = _ld._extract_json(raw) if raw else None
+    return jsonify({
+        "model": _ld.CURATE_MODEL,
+        "cluster_max_tokens": _ld.CLUSTER_MAX_TOKENS,
+        "prompt_len": captured.get("prompt_len"),
+        "call_error": captured.get("error"),
+        "call_traceback": captured.get("traceback"),
+        "raw_len": len(raw),
+        "raw_head": raw[:3000],
+        "parsed_ok": isinstance(parsed, dict),
+        "parsed_keys": list(parsed.keys()) if isinstance(parsed, dict) else None,
+        "model_cluster_count": len(parsed.get("clusters", [])) if isinstance(parsed, dict) else None,
+        "first_model_cluster": (parsed.get("clusters") or [None])[0] if isinstance(parsed, dict) else None,
+        "result_num_clusters": len(clusters),
+        "result_cluster_sizes": [len(c.get("items", [])) for c in clusters],
+    })
+
+
 _biweekly_lock = _threading.Lock()
 
 
@@ -3135,7 +3189,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.3-cluster-budget", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.18.4-cluster-debug", "deployed": "2026-06-21"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3173,7 +3227,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.3-cluster-budget", "steps": {}}
+    results = {"version": "2.18.4-cluster-debug", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
