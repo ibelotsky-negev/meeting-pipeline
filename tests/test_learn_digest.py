@@ -410,19 +410,22 @@ class TestTokenBudgets:
     def test_cluster_default_caller_uses_large_budget(self, monkeypatch):
         captured = {}
 
-        def fake(prompt, model, max_tokens=2000, tools=None):
+        def fake(prompt, model, max_tokens=2000, tools=None, timeout=None):
             captured["max_tokens"] = max_tokens
+            captured["timeout"] = timeout
             return json.dumps({"clusters": [{"topic": "Cowork", "members": [0, 1]}]})
 
         monkeypatch.setattr(ld, "_call_claude_text", fake)
         ld.cluster_items(_cowork_summaries()[:2])  # no call_fn -> production default path
         assert captured["max_tokens"] == ld.CLUSTER_MAX_TOKENS
+        assert captured["timeout"] == ld.LEARN_CLUSTER_TIMEOUT  # bounded, not the 10min default
 
     def test_curate_default_caller_uses_curate_budget(self, monkeypatch):
         captured = {}
 
-        def fake(prompt, model, max_tokens=2000, tools=None):
+        def fake(prompt, model, max_tokens=2000, tools=None, timeout=None):
             captured["max_tokens"] = max_tokens
+            captured["timeout"] = timeout
             return json.dumps({"keepers": [{"index": 0, "why": "w", "bucket": "General/Reference",
                                             "has_action": False, "action": ""}],
                                "superseded": [{"index": 1, "reason": "dup"}]})
@@ -532,3 +535,64 @@ class TestGrokXResolver:
         r = ld.resolve_x("https://x.com/i/status/123")
         assert r["partial"] is True
         assert "xAI 500" in r["reason"]
+
+
+# ----------------------------------------------------------------------
+#  16. Bounded execution: concurrency (order + failure isolation), heartbeat,
+#      and degrade-on-timeout so a run can never hang invisibly.
+# ----------------------------------------------------------------------
+
+class TestConcurrency:
+    def test_preserves_order(self):
+        out = ld._run_concurrent(list(range(10)), lambda i, x: x * 2, workers=4)
+        assert out == [x * 2 for x in range(10)]
+
+    def test_isolates_a_crashing_item(self):
+        def fn(i, x):
+            if x == 3:
+                raise RuntimeError("boom")
+            return x
+        out = ld._run_concurrent(list(range(6)), fn, workers=4)
+        assert out[3] is None  # the crasher
+        assert [out[i] for i in (0, 1, 2, 4, 5)] == [0, 1, 2, 4, 5]  # others intact, order kept
+
+    def test_sequential_path_when_workers_one(self):
+        out = ld._run_concurrent([1, 2, 3], lambda i, x: x + 100, workers=1)
+        assert out == [101, 102, 103]
+
+
+class TestHeartbeat:
+    def test_bump_and_set_progress(self, monkeypatch):
+        ld._set_progress(phase="resolve+summarize", done=0, total=3, last="", run_id="r1")
+        assert ld._LEARN_PROGRESS["phase"] == "resolve+summarize"
+        assert ld._LEARN_PROGRESS["total"] == 3
+        for _ in range(3):
+            ld._bump_progress("item")
+        assert ld._LEARN_PROGRESS["done"] == 3
+        assert ld._LEARN_PROGRESS["updated_at"] is not None
+
+    def test_read_status_includes_live_progress(self):
+        ld._set_progress(phase="cluster", done=1, total=1, last="x")
+        status = ld.read_status()
+        assert "live_progress" in status
+        assert status["live_progress"]["phase"] == "cluster"
+
+
+class TestDegradeOnFailure:
+    def test_summarize_degrades_when_call_raises(self):
+        # Simulate a timeout / API error during summarize -> base summary, no crash.
+        def boom(prompt, model):
+            raise RuntimeError("APITimeoutError")
+        item = {"subject": "Cowork", "url": "https://e/1", "type": "article"}
+        resolved = {"text": "real content", "kind": "article", "partial": False, "reason": "", "content_date": None}
+        summ = ld.summarize_item(item, resolved, call_fn=boom)
+        assert summ["title"]  # produced a summary record, did not raise
+        assert summ["type"] == "article"
+
+    def test_currency_check_degrades_when_call_raises(self):
+        def boom(prompt):
+            raise RuntimeError("APITimeoutError")
+        keeper = {"title": "MCP setup", "content_date": "2026-01-01", "summary": "..."}
+        out = ld.currency_check(keeper, "Claude Code MCP", mode="fast-moving", call_fn=boom)
+        assert out is keeper  # returned unchanged, no crash
+        assert "currency_note" not in out

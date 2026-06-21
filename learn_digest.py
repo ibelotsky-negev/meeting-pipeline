@@ -85,6 +85,13 @@ CURATE_MODEL = os.environ.get("LEARN_CURATE_MODEL", "claude-opus-4-8")
 CLUSTER_MAX_TOKENS = int(os.environ.get("LEARN_CLUSTER_MAX_TOKENS", "12000"))
 CURATE_MAX_TOKENS = int(os.environ.get("LEARN_CURATE_MAX_TOKENS", "4000"))
 
+# Bounded execution so a run can never hang invisibly. Concurrency turns the
+# ~80 sequential Grok/Anthropic per-item calls from ~hours into ~minutes;
+# per-call timeouts cap any single stuck call (the SDK default is 10min x3).
+LEARN_CONCURRENCY = int(os.environ.get("LEARN_CONCURRENCY", "5"))
+LEARN_ANTHROPIC_TIMEOUT = int(os.environ.get("LEARN_ANTHROPIC_TIMEOUT", "90"))
+LEARN_CLUSTER_TIMEOUT = int(os.environ.get("LEARN_CLUSTER_TIMEOUT", "180"))
+
 # fast-moving (default) | off | all -- which clusters get the live web check.
 LEARN_CURRENCY_CHECK = os.environ.get("LEARN_CURRENCY_CHECK", "fast-moving")
 
@@ -586,12 +593,15 @@ def resolve_item(item: dict) -> dict:
 # ======================================================================
 
 
-def _call_claude_text(prompt: str, model: str, max_tokens: int = 2000, tools=None) -> str:
+def _call_claude_text(prompt: str, model: str, max_tokens: int = 2000, tools=None, timeout: int = None) -> str:
     import anthropic
     api_key = os.environ.get("CLAUDE_API_KEY", "")
     if not api_key:
         raise RuntimeError("CLAUDE_API_KEY not set")
-    client = anthropic.Anthropic(api_key=api_key)
+    # Hard per-call timeout + single retry so a stuck call degrades fast instead
+    # of blocking the whole run on the SDK's 10-minute default (x3 retries).
+    client = anthropic.Anthropic(api_key=api_key).with_options(
+        timeout=float(timeout or LEARN_ANTHROPIC_TIMEOUT), max_retries=1)
     kwargs = {"model": model, "max_tokens": max_tokens,
               "messages": [{"role": "user", "content": prompt}]}
     if tools:
@@ -610,7 +620,7 @@ def _call_claude_web(prompt: str) -> str:
 def _cluster_call(prompt: str, model: str) -> str:
     """Default cluster-pass caller: large output budget so the whole-batch JSON
     is never truncated (a truncated response silently defeats consolidation)."""
-    return _call_claude_text(prompt, model, max_tokens=CLUSTER_MAX_TOKENS)
+    return _call_claude_text(prompt, model, max_tokens=CLUSTER_MAX_TOKENS, timeout=LEARN_CLUSTER_TIMEOUT)
 
 
 def _curate_call(prompt: str, model: str) -> str:
@@ -1199,16 +1209,65 @@ def write_status(status: dict):
 def read_status() -> dict:
     try:
         with open(LEARN_STATUS_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
-        return {"status": "no_runs", "message": "No learn-digest run has completed yet."}
+        data = {"status": "no_runs", "message": "No learn-digest run has completed yet."}
     except Exception as e:
-        return {"status": "error", "error": f"could not read status: {e}"}
+        data = {"status": "error", "error": f"could not read status: {e}"}
+    # Live heartbeat of any in-flight run (shared module state, single worker).
+    data["live_progress"] = dict(_LEARN_PROGRESS)
+    return data
 
 
 # ======================================================================
 #  RUN ORCHESTRATION
 # ======================================================================
+
+# Live progress (heartbeat) + bounded concurrency for the per-item phases.
+# Single gunicorn worker -> these module globals are shared with the
+# /learn/status request thread, so progress is visible mid-run.
+_PROGRESS_LOCK = _threading.Lock()
+_LEARN_PROGRESS = {"phase": "idle", "done": 0, "total": 0, "last": "", "run_id": None, "updated_at": None}
+
+
+def _set_progress(**kw):
+    with _PROGRESS_LOCK:
+        _LEARN_PROGRESS.update(kw)
+        _LEARN_PROGRESS["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _bump_progress(last: str):
+    with _PROGRESS_LOCK:
+        _LEARN_PROGRESS["done"] = _LEARN_PROGRESS.get("done", 0) + 1
+        _LEARN_PROGRESS["last"] = (last or "")[:120]
+        _LEARN_PROGRESS["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _run_concurrent(items: list, fn, workers: int = None) -> list:
+    """Run fn(index, item) over items with a bounded thread pool, preserving
+    input order. I/O-bound calls (Grok/Anthropic/HTTP) release the GIL, so
+    threads give real speedup. A crash in one item yields None for that slot
+    (caller filters) and never fails the run. workers<=1 runs sequentially."""
+    workers = workers or LEARN_CONCURRENCY
+    n = len(items)
+    results = [None] * n
+    if workers <= 1 or n <= 1:
+        for i, it in enumerate(items):
+            try:
+                results[i] = fn(i, it)
+            except Exception as e:
+                logger.error(f"[learn] concurrent item {i} crashed: {e}")
+        return results
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fn, i, it): i for i, it in enumerate(items)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                logger.error(f"[learn] concurrent item {i} crashed: {e}")
+    return results
 
 
 def _learn_run_inner(dry_run: bool, backlog: bool, limit: int = None) -> dict:
@@ -1216,30 +1275,47 @@ def _learn_run_inner(dry_run: bool, backlog: bool, limit: int = None) -> dict:
     run_id = uuid.uuid4().hex[:12]
     started = datetime.now(timezone.utc)
     processed_ids = _load_processed_ids()
+    _set_progress(phase="fetch", done=0, total=0, last="", run_id=run_id)
 
     messages = fetch_unread(LEARN_FOLDER_ID, processed_ids, backlog, limit=limit)
     if not messages:
+        _set_progress(phase="done", done=0, total=0, last="no unread items")
         result = {"status": "ok", "run_id": run_id, "sent": False, "reason": "no unread items",
                   "clusters": 0, "keepers": 0, "skipped": 0, "dry_run": dry_run}
         write_status(result)
         return result
 
-    # Resolve + summarize each message's primary link.
-    summaries = []
-    for msg in messages:
+    # Phase 1: resolve + summarize each message's link (concurrent, bounded).
+    # I/O-bound (Grok/Jina/Anthropic) -> threads turn ~80 sequential calls into
+    # minutes; each item degrades to partial on failure, never fails the run.
+    _set_progress(phase="resolve+summarize", done=0, total=len(messages))
+
+    def _resolve_one(i, msg):
         item = build_item(msg)
         resolved = resolve_item(item) if item.get("url") else _partial(item.get("type"), "no link found in message")
         summ = summarize_item(item, resolved)
         summ["message_id"] = item.get("message_id")
-        summaries.append(summ)
+        _bump_progress(f"[{item.get('type')}] {(item.get('url') or item.get('subject') or '')[:50]}")
+        return summ
 
-    # Cluster the whole batch, then curate each cluster.
+    summaries = [s for s in _run_concurrent(messages, _resolve_one) if s]
+
+    # Phase 2: cluster the WHOLE batch at once (single call -- consolidation
+    # needs the full set; deliberately NOT parallelized).
+    _set_progress(phase="cluster", done=0, total=1, last="clustering whole batch")
     clusters = cluster_items(summaries)
-    curated = [curate_cluster(c) for c in clusters]
 
-    # Currency check on fast-moving keepers; tag buckets already done in curate.
-    for c in curated:
-        c["keepers"] = [currency_check(k, c.get("topic")) for k in c.get("keepers", [])]
+    # Phase 3: curate each cluster + currency-check its keepers (concurrent per
+    # cluster -- this was the silent ~20-min window before).
+    _set_progress(phase="curate+currency", done=0, total=len(clusters))
+
+    def _curate_one(i, c):
+        cur = curate_cluster(c)
+        cur["keepers"] = [currency_check(k, cur.get("topic")) for k in cur.get("keepers", [])]
+        _bump_progress(f"curated: {(cur.get('topic') or '')[:50]}")
+        return cur
+
+    curated = [c for c in _run_concurrent(clusters, _curate_one) if c]
 
     total_keepers = sum(len(c.get("keepers") or []) for c in curated)
     total_skipped = sum(len(c.get("superseded") or []) for c in curated)
@@ -1247,6 +1323,8 @@ def _learn_run_inner(dry_run: bool, backlog: bool, limit: int = None) -> dict:
     local_date = (started + timedelta(hours=ISRAEL_UTC_OFFSET_HOURS)).strftime("%a %d %b %Y")
     subject = f"[Sara] Read/Learn digest -- {local_date}"
     body = render_digest_html(curated)
+    _set_progress(phase=("send+postprocess" if not dry_run else "render"),
+                  done=len(curated), total=len(curated), last=subject)
 
     sent, tasks_created = False, 0
     if dry_run:
@@ -1283,6 +1361,7 @@ def _learn_run_inner(dry_run: bool, backlog: bool, limit: int = None) -> dict:
         # without sending the email or mutating the mailbox.
         "body": body,
     }
+    _set_progress(phase="done", last=f"{total_keepers} keepers / {total_skipped} skipped")
     write_status(result)
     logger.info(f"[learn] Run {run_id} done: {result}")
     return result
