@@ -2991,173 +2991,6 @@ def learn_status():
     return jsonify(learn_digest.read_status())
 
 
-@app.route("/egress-check", methods=["GET"])
-def egress_check():
-    """THROWAWAY: from inside the container, probe each outbound host the
-    learn-digest resolvers need. Remove before the final deploy."""
-    hosts = [
-        "graph.microsoft.com", "api.anthropic.com", "api.x.ai", "api.twitter.com",
-        "r.jina.ai", "www.youtube.com", "spoken.md",
-    ]
-    out = {}
-    for h in hosts:
-        try:
-            r = requests.get(f"https://{h}", timeout=8)
-            out[h] = {"reachable": True, "status": r.status_code}
-        except Exception as e:
-            out[h] = {"reachable": False, "status": f"{type(e).__name__}: {str(e)[:120]}"}
-    return jsonify(out)
-
-
-@app.route("/learn/debug-cluster", methods=["GET"])
-def learn_debug_cluster():
-    """THROWAWAY: isolate the clustering call+parse on a tiny synthetic fixture
-    (5 items spanning 2 obvious topics) using the real cluster model call.
-    Surfaces the raw model response, parse outcome, and resulting cluster sizes
-    so an all-singletons fallback can be diagnosed in ~10s without a full
-    backlog run. Remove before the final deploy."""
-    import learn_digest as _ld
-    n = max(1, min(int(request.args.get("n", "5")), 200))
-    thin = request.args.get("thin", "").lower() in ("1", "true", "yes")
-    if n <= 5 and not thin:
-        fixture = [
-            {"title": "Cowork setup guide", "type": "article", "url": "https://e/1", "subject": "Cowork",
-             "content_date": "2026-01-10", "summary": "How to set up Cowork.", "specifics": [], "partial": False},
-            {"title": "Cowork daily monitor", "type": "article", "url": "https://e/2", "subject": "Cowork",
-             "content_date": "2026-03-10", "summary": "Cowork agentic daily-monitor workflow.", "specifics": [], "partial": False},
-            {"title": "Cowork agents tips", "type": "x", "url": "https://e/3", "subject": "Cowork",
-             "content_date": "2026-05-10", "summary": "Using Cowork agents effectively.", "specifics": [], "partial": False},
-            {"title": "Gut health basics", "type": "article", "url": "https://e/4", "subject": "Gut",
-             "content_date": "2026-02-01", "summary": "Digestion and the microbiome.", "specifics": [], "partial": False},
-            {"title": "Huberman gut episode", "type": "podcast", "url": "https://e/5", "subject": "Gut",
-             "content_date": "2026-04-01", "summary": "Huberman on gut health.", "specifics": [], "partial": False},
-        ]
-    else:
-        # Reproduce the real backlog shape: N items cycling a small subject set
-        # (so there ARE obvious duplicates), optionally with thin "content not
-        # retrieved" summaries like the unresolved X posts.
-        _subjects = ["Agents setup", "Loops", "Claude fable", "Psychedelic alpha", "Biotech rNPV",
-                     "Karpathy course", "Cowork setup", "MCP", "Investor data", "Gut health",
-                     "Second brain", "Design agent", "Wall Street repo", "Playwright MCP", "Negotiations"]
-        fixture = []
-        for i in range(n):
-            s = _subjects[i % len(_subjects)]
-            fixture.append({
-                "title": s, "type": "x", "url": f"https://e/{i}", "subject": s, "content_date": None,
-                "summary": ("content not retrieved -- from title/sender only" if thin else f"A saved post about {s}."),
-                "specifics": [], "partial": thin,
-            })
-    captured = {}
-
-    def cap(prompt, model):
-        captured["prompt_len"] = len(prompt)
-        try:
-            raw = _ld._cluster_call(prompt, model)
-            captured["raw"] = raw
-            return raw
-        except Exception as e:
-            import traceback as _tb
-            captured["error"] = f"{type(e).__name__}: {e}"
-            captured["traceback"] = _tb.format_exc()[-1200:]
-            raise
-
-    clusters = _ld.cluster_items(fixture, call_fn=cap)
-    raw = captured.get("raw", "")
-    parsed = _ld._extract_json(raw) if raw else None
-    return jsonify({
-        "n": n,
-        "thin": thin,
-        "model": _ld.CURATE_MODEL,
-        "cluster_max_tokens": _ld.CLUSTER_MAX_TOKENS,
-        "prompt_len": captured.get("prompt_len"),
-        "call_error": captured.get("error"),
-        "call_traceback": captured.get("traceback"),
-        "raw_len": len(raw),
-        "raw_head": raw[:2000],
-        "raw_tail": raw[-600:],
-        "parsed_ok": isinstance(parsed, dict),
-        "parsed_keys": list(parsed.keys()) if isinstance(parsed, dict) else None,
-        "model_cluster_count": len(parsed.get("clusters", [])) if isinstance(parsed, dict) else None,
-        "first_model_cluster": (parsed.get("clusters") or [None])[0] if isinstance(parsed, dict) else None,
-        "result_num_clusters": len(clusters),
-        "result_cluster_sizes": [len(c.get("items", [])) for c in clusters],
-    })
-
-
-@app.route("/learn/debug-grok-x", methods=["GET"])
-def learn_debug_grok_x():
-    """THROWAWAY: test whether Grok (api.x.ai, XAI_API_KEY) can read + summarize an
-    X post DIRECTLY from its URL with no X API bearer token. Remove before the
-    final deploy.
-      ?action=models                               -> list available xAI models
-      ?url=<x post url>&model=grok-4-latest&search=1 -> read + summarize test"""
-    import requests as _rq
-    key = os.environ.get("XAI_API_KEY", "")
-    if not key:
-        return jsonify({"error": "XAI_API_KEY not set"}), 400
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    if request.args.get("action", "") == "models":
-        try:
-            r = _rq.get("https://api.x.ai/v1/models", headers=headers, timeout=30)
-            return jsonify({"status": r.status_code, "body": r.json() if r.content else None})
-        except Exception as e:
-            return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
-    url = request.args.get("url", "")
-    if not url:
-        return jsonify({"error": "pass ?url=<x post url> or ?action=models"}), 400
-    model = request.args.get("model", "grok-4.3")
-    use_search = request.args.get("search", "1").lower() in ("1", "true", "yes")
-    prompt = (
-        "Read the X (Twitter) post at this exact URL and summarize ONLY its actual content "
-        "in 3-4 sentences. Include one short verbatim quote (in quotation marks) from the post "
-        "to prove you actually read it, and state the author handle. If you cannot access or "
-        "find the specific post, reply with exactly: CANNOT_ACCESS -- do not guess or summarize "
-        "from general knowledge.\nURL: " + url
-    )
-    if request.args.get("mode", "chat") == "tools":
-        # Agent Tools API (Live Search replacement): server-side web_search + x_search.
-        ep = request.args.get("endpoint", "responses")
-        tbody = {"model": model, "tools": [{"type": "web_search"}, {"type": "x_search"}],
-                 "input": [{"role": "user", "content": prompt}]}
-        try:
-            tr = _rq.post(f"https://api.x.ai/v1/{ep}", headers=headers, json=tbody, timeout=180)
-        except Exception as e:
-            return jsonify({"error": f"{type(e).__name__}: {e}", "mode": "tools", "endpoint": ep}), 500
-        tout = {"http_status": tr.status_code, "model": model, "mode": "tools", "endpoint": ep, "url": url}
-        try:
-            tdata = tr.json()
-        except Exception:
-            tout["raw_text"] = tr.text[:3000]
-            return jsonify(tout)
-        tout["output_text"] = tdata.get("output_text")
-        tout["citations"] = tdata.get("citations")
-        tout["raw"] = json.dumps(tdata)[:6000]
-        return jsonify(tout)
-    payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0}
-    if use_search:
-        payload["search_parameters"] = {"mode": "on", "sources": [{"type": "x"}, {"type": "web"}],
-                                         "return_citations": True}
-    try:
-        r = _rq.post("https://api.x.ai/v1/chat/completions", headers=headers, json=payload, timeout=120)
-    except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}", "model": model}), 500
-    out = {"http_status": r.status_code, "model": model, "search_enabled": use_search, "url": url}
-    try:
-        data = r.json()
-    except Exception:
-        out["raw_text"] = r.text[:2000]
-        return jsonify(out)
-    if r.status_code >= 400:
-        out["error_body"] = data
-        return jsonify(out)
-    choices = data.get("choices") or []
-    msg = (choices[0].get("message") or {}) if choices else {}
-    out["content"] = msg.get("content")
-    out["citations"] = data.get("citations") or msg.get("citations")
-    out["usage"] = data.get("usage")
-    return jsonify(out)
-
-
 _biweekly_lock = _threading.Lock()
 
 
@@ -3285,7 +3118,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.11-source-links", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.18.12-debug-cleanup", "deployed": "2026-06-21"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3323,7 +3156,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.11-source-links", "steps": {}}
+    results = {"version": "2.18.12-debug-cleanup", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
