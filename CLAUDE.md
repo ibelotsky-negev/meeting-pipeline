@@ -196,6 +196,7 @@ Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_AP
 - ASCII-only in comments and non-user-facing strings.
 - Version string lives in exactly 2 places in app.py (/version and /test). Bump both on any deployed code change (app.py or an extracted module).
 - Passing local checks does NOT mean deployed. Deploy = commit changed code (app.py and/or modules) + fresh-timestamp CACHEBUST, push to main, poll /version every 20s up to 4 min. Never confirm via /test.
+- Poll loops must exit on terminal status and carry a max-iteration cap -- never poll unconditionally.
 - Tests are offline-only. Never add a test that calls a live API.
 
 ## Test-with-code mandate

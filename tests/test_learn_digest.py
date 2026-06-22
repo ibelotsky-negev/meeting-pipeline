@@ -596,3 +596,73 @@ class TestDegradeOnFailure:
         out = ld.currency_check(keeper, "Claude Code MCP", mode="fast-moving", call_fn=boom)
         assert out is keeper  # returned unchanged, no crash
         assert "currency_note" not in out
+
+
+# ----------------------------------------------------------------------
+#  17. Source links: every keeper carries a clickable source URL in the
+#      digest + Asana notes (X->citation, else extracted; omit when none).
+# ----------------------------------------------------------------------
+
+class TestSourceLinks:
+    def test_summarize_prefers_x_citation_as_source(self):
+        item = {"subject": "Cowork", "url": "https://x.com/user/status/9?s=20", "type": "x"}
+        resolved = {"text": "real post content", "kind": "x", "partial": False, "reason": "",
+                    "content_date": None, "citations": ["https://x.com/i/status/9"]}
+        summ = ld.summarize_item(item, resolved, call_fn=lambda p, m: "{}")
+        assert summ["url"] == "https://x.com/i/status/9"  # canonical citation, not the ?s=20 link
+
+    def test_summarize_email_only_fallback_uses_extracted_link(self):
+        item = {"subject": "Burry", "url": "https://x.com/i/status/5", "type": "x"}
+        resolved = ld._partial("x", "no content retrieved")  # no citations
+        summ = ld.summarize_item(item, resolved, call_fn=lambda p, m: "{}")
+        assert summ["url"] == "https://x.com/i/status/5"
+
+    def test_summarize_no_url_when_none_extracted(self):
+        item = {"subject": "note to self", "url": "", "type": "article"}
+        summ = ld.summarize_item(item, ld._partial("article", "no link"), call_fn=lambda p, m: "{}")
+        assert summ["url"] == ""
+
+    def _keeper(self, url, partial=False):
+        return {"title": "Best", "url": url, "summary": "s", "why": "w",
+                "bucket": "General/Reference", "has_action": False, "action": "", "partial": partial}
+
+    def test_render_links_best_item_to_source(self):
+        html = ld.render_digest_html([{"topic": "T", "superseded": [],
+                                       "keepers": [self._keeper("https://example.com/post")]}])
+        assert '<a href="https://example.com/post"' in html and ">Best</a>" in html
+
+    def test_render_no_anchor_when_no_url(self):
+        html = ld.render_digest_html([{"topic": "T", "superseded": [],
+                                       "keepers": [self._keeper("", partial=True)]}])
+        assert "Best" in html and '<a href="">' not in html
+
+    def test_render_also_saved_links_each_member(self):
+        curated = [{"topic": "T", "keepers": [self._keeper("https://example.com/1")],
+                    "superseded": [{"title": "Older", "url": "https://example.com/2", "reason": "older"}]}]
+        html = ld.render_digest_html(curated)
+        assert "Also saved" in html and '<a href="https://example.com/2"' in html
+
+    def test_asana_notes_include_source_url(self, monkeypatch):
+        captured = {}
+
+        def fake_req(method, endpoint, data=None):
+            if endpoint == "/tasks":
+                captured["notes"] = data.get("notes", "")
+                return {"gid": "T1"}
+            return {}
+        monkeypatch.setattr(ld.asana_client, "asana_request", fake_req)
+        gid = ld.create_triage_task(self._keeper("https://example.com/post"))
+        assert gid == "T1"
+        assert "https://example.com/post" in captured["notes"]
+
+    def test_asana_notes_omit_source_when_no_url(self, monkeypatch):
+        captured = {}
+
+        def fake_req(method, endpoint, data=None):
+            if endpoint == "/tasks":
+                captured["notes"] = data.get("notes", "")
+                return {"gid": "T2"}
+            return {}
+        monkeypatch.setattr(ld.asana_client, "asana_request", fake_req)
+        ld.create_triage_task(self._keeper(""))
+        assert "Source:" not in captured["notes"]

@@ -658,7 +658,11 @@ def summarize_item(item: dict, resolved: dict, call_fn=None) -> dict:
     its title/sender only and never fabricated."""
     call_fn = call_fn or _call_claude_text
     subject = (item.get("subject") or "").strip()
-    url = item.get("url", "")
+    # Source URL for the digest/Asana link. Prefer the resolver's citation (X
+    # posts -> Grok's canonical x.com url_citation); else the URL extracted from
+    # the email (articles/YouTube/podcasts were fetched from it, and it is the
+    # fallback for email-only / unresolved items). "" -> no link is emitted.
+    url = (resolved.get("citations") or [None])[0] or item.get("url", "")
     kind = resolved.get("kind") or item.get("type") or "article"
     partial = resolved.get("partial", True)
     content = (resolved.get("text") or "").strip()
@@ -1016,6 +1020,16 @@ def render_digest_html(curated: list) -> str:
                 parts.append(f'<div style="margin-top:3px;color:#c05621;"><b>Currency:</b> {_esc(k.get("currency_note"))}</div>')
             if k.get("has_action") and k.get("action"):
                 parts.append(f'<div style="margin-top:3px;color:#553c9a;"><b>Action:</b> {_esc(k.get("action"))}</div>')
+        # "Also saved" -- the cluster's other items, each linking to its own
+        # source so superseded saves aren't lost (reasons are in the Skipped list).
+        also = c.get("superseded") or []
+        if also:
+            links = []
+            for s in also:
+                t, u = _esc(s.get("title")), _esc(s.get("url"))
+                links.append(f'<a href="{u}" style="color:#718096;">{t}</a>' if u else t)
+            parts.append('<div style="margin-top:8px;font-size:12px;color:#718096;">'
+                         f'Also saved ({len(also)}): ' + ", ".join(links) + '</div>')
         parts.append('</div>')
 
     # Collapsed skipped list.
@@ -1064,12 +1078,10 @@ def create_triage_task(keeper: dict) -> str:
     """Create a task in 'Read/Learn Triage', placed in the matching bucket
     section. Returns the task GID or '' on failure (never raises)."""
     try:
-        notes_lines = [
-            keeper.get("summary") or "",
-            "",
-            "Link: " + (keeper.get("url") or ""),
-            "Why this one: " + (keeper.get("why") or ""),
-        ]
+        notes_lines = [keeper.get("summary") or "", ""]
+        if keeper.get("url"):  # source link; omitted when no URL could be extracted (never fabricated)
+            notes_lines.append("Source: " + keeper["url"])
+        notes_lines.append("Why this one: " + (keeper.get("why") or ""))
         if keeper.get("currency_note"):
             notes_lines.append("Currency: " + keeper["currency_note"])
         if keeper.get("action"):
