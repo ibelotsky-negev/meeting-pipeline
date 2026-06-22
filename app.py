@@ -2996,6 +2996,75 @@ def learn_status():
     return jsonify(learn_digest.read_status())
 
 
+_fyi_trigger_lock = _threading.Lock()
+
+
+@app.route("/fyi/run", methods=["GET", "POST"])
+def fyi_run():
+    """Manually trigger FYI Triage (fyi_triage module). DRY-RUN by default.
+    ?days=N     -- lookback window in days (7 = calibration dry-run, 30 = backfill).
+                   Absent -> the cron default FYI_LOOKBACK_HOURS (24h).
+    ?live=1     -- request a real move. A move ALSO requires env FYI_LIVE=1; absent
+                   either gate the run is dry regardless of window.
+    ?backlog=1  -- re-process everything in the window, ignoring the processed-id store.
+    ?sync=true  -- run inline and return the result/traceback as JSON (diagnostic).
+    ?force=1    -- clear an orphaned run lock first (operator override; not for a live run).
+    ?email=1    -- also email a short run summary."""
+    import traceback as _fyi_tb
+    days = request.args.get("days", type=int)
+    live = request.args.get("live", "").lower() in ("true", "1", "yes")
+    backlog = request.args.get("backlog", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
+    force = request.args.get("force", "").lower() in ("true", "1", "yes")
+    email = request.args.get("email", "").lower() in ("true", "1", "yes")
+    limit = request.args.get("limit", type=int)  # diagnostic: cap messages per folder
+    if not _fyi_trigger_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import fyi_triage
+            result = fyi_triage.run_fyi(days=days, live=live, backlog=backlog, force=force,
+                                        limit=limit, send_summary=email)
+            return jsonify(result)
+        except Exception as e:
+            logger.error(f"[fyi] Sync run failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _fyi_tb.format_exc()}), 500
+        finally:
+            _fyi_trigger_lock.release()
+
+    def _run():
+        try:
+            import fyi_triage
+            fyi_triage.run_fyi(days=days, live=live, backlog=backlog, force=force,
+                               limit=limit, send_summary=email)
+            logger.info("[fyi] Manual run complete")
+        except Exception as e:
+            logger.error(f"[fyi] Manual run failed: {e}", exc_info=True)
+        finally:
+            _fyi_trigger_lock.release()
+
+    logger.info(f"[fyi] Trigger: days={days} live={live} backlog={backlog} force={force} "
+                "-- launching background thread")
+    t = _threading.Thread(target=_run, daemon=True)
+    try:
+        t.start()
+    except Exception as e:
+        _fyi_trigger_lock.release()  # never orphan the trigger lock if the thread won't start
+        logger.error(f"[fyi] Failed to start run thread: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": f"could not start run: {e}"}), 500
+    return jsonify({"status": "started", "days": days, "live": live, "backlog": backlog, "force": force})
+
+
+@app.route("/fyi/status", methods=["GET"])
+def fyi_status():
+    """Last FYI Triage run outcome (scanned/important/moved counts, per-message
+    decisions with reasons, or error traceback) + live heartbeat + FYI_LIVE state."""
+    import fyi_triage
+    return jsonify(fyi_triage.read_status())
+
+
 _biweekly_lock = _threading.Lock()
 
 
@@ -3123,7 +3192,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.15-learn-routing-priority", "deployed": "2026-06-22"})
+    return jsonify({"version": "2.19.0-fyi-triage", "deployed": "2026-06-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3161,7 +3230,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.15-learn-routing-priority", "steps": {}}
+    results = {"version": "2.19.0-fyi-triage", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -3951,6 +4020,23 @@ def learn_weekly_run():
         logger.error(f"[learn] Failed: {e}", exc_info=True)
 
 
+def fyi_daily_run():
+    """Scheduled daily FYI Triage (fyi_triage module).
+
+    Passes live=True so the run auto-promotes to real moves the moment Ken sets
+    FYI_LIVE=1 (STATE C/D) -- no code change needed. Until then the dual gate
+    keeps it DRY (FYI_LIVE unset at ship = STATE A), and a short would-move
+    summary is emailed each morning. Uses FYI_LOOKBACK_HOURS (24h). Single-run
+    dedup is enforced inside run_fyi via its atomic O_CREAT|O_EXCL lock."""
+    try:
+        logger.info("[fyi] Starting scheduled daily FYI Triage")
+        import fyi_triage
+        fyi_triage.run_fyi(live=True, send_summary=True)
+        logger.info("[fyi] Daily FYI Triage complete")
+    except Exception as e:
+        logger.error(f"[fyi] Failed: {e}", exc_info=True)
+
+
 _scheduler = None  # module-level so diagnostic endpoints can inspect it
 
 
@@ -4008,6 +4094,19 @@ def start_scheduler():
         minute=0,
         timezone="Asia/Jerusalem",
         id="learn_digest_weekly",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    # FYI Triage: daily 06:00 Asia/Jerusalem. tz-aware cron so DST is handled
+    # automatically (06:00 Israel = 03:00 UTC summer / 04:00 winter). Ships DRY
+    # (FYI_LIVE unset); auto-promotes to live moves once Ken sets FYI_LIVE=1.
+    _scheduler.add_job(
+        fyi_daily_run,
+        trigger="cron",
+        hour=6,
+        minute=0,
+        timezone="Asia/Jerusalem",
+        id="fyi_triage_daily",
         replace_existing=True,
         misfire_grace_time=3600,
     )

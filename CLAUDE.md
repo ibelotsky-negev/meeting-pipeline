@@ -140,6 +140,8 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/corrections/delete` | Deactivate a correction (`?id=`) |
 | `/learn/run` | Manual Read/Learn digest run (`?dry_run=&backlog=&force=&limit=`) |
 | `/learn/status` | Last Read/Learn run outcome + live heartbeat (`live_progress`, `cluster_diag`) |
+| `/fyi/run` | Manual FYI Triage run; DRY by default (`?days=N&live=1&backlog=&force=&sync=&email=`) |
+| `/fyi/status` | Last FYI Triage run outcome (scanned/important/moved + per-message decisions) + heartbeat + `fyi_live_env` |
 
 ## Architecture Notes
 
@@ -155,6 +157,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **To-Do sync** polls Asana tasks and creates matching Microsoft To-Do tasks for @negevlabs.com users
 - **Daily Pipeline Digest:** daily 06:45 IST (03:45 UTC), compiles every change + new activity in the NL 2026 Fundraise HubSpot pipeline over the trailing window (default 24h, resilient to missed runs), narrates deltas rather than state, applies Negev operating rules (stale-deal / overdue-task / wire-watch flags), and emails Ken a single morning brief (`daily_pipeline_digest.py`). See the daily-pipeline-digest Module section.
 - **Read/Learn Digest:** Friday 06:00 Asia/Jerusalem, drains Ken's Outlook "read/learn" folder, resolves each saved link, Opus cluster+curate against a Ken's-needs profile, emails one HTML digest + creates Asana keeper tasks (`learn_digest.py`). See the Read/Learn Digest Module section.
+- **FYI Triage:** daily 06:00 Asia/Jerusalem, scans the two high-volume auto-filed folders "4: notification" + "8: marketing", classifies each message IMPORTANT vs NOISE with Sonnet (reading the body, not just the from-address), and MOVES the important ones to "2: FYI". Dual-gated (`?live=1` AND env `FYI_LIVE=1`) -- ships DRY, auto-promotes to live once Ken sets `FYI_LIVE` (`fyi_triage.py`). See the FYI Triage Module section + ROLLOUT.md.
 
 ## email-pipeline-sync Module
 
@@ -234,6 +237,44 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
   (High `...657` / Med `...658` / Low `...659`). GUARD: never use the duplicate
   workspace Priority field `1206810235510187`.
 
+## FYI Triage Module
+
+Standalone module (`fyi_triage.py`) -- surfaces important mail buried in two
+high-volume auto-filed Outlook folders by MOVING the important messages into
+"2: FYI". Sources: **"4: notification"** (Fireflies/Humantic/Zoom/Calendly/OTP
+noise) and **"8: marketing"** (newsletters/IR blasts). Imported lazily by app.py
+(route + cron handlers only), never at module load. Reuses Sara infra:
+`email_pipeline_sync` Graph helpers (app-only token, retrying GET/POST,
+html_to_text), the Claude client, the send-email path, the Pulse-style atomic
+`O_CREAT|O_EXCL` run lock + single-worker topology. Full rollout: `ROLLOUT.md`.
+
+- **Folders resolved LIVE by display name** via Graph at run time
+  (`resolve_folder_map` -> `_walk_mail_folders`, recursive, cached). IDs are NEVER
+  hardcoded for addressing; `EXPECTED_FOLDER_IDS` (confirmed live 2026-06-22) is a
+  cross-check only (logs a warning on mismatch, still trusts the live value). The
+  run aborts rather than guess if any folder cannot be resolved, or if the
+  destination resolves equal to a source.
+- **Classifier:** Sonnet (`FYI_CLASSIFIER_MODEL`, classification tier -- NOT Opus),
+  one call per message, reads subject + sender + body excerpt. Rubric embedded in
+  `FYI_RUBRIC` (the 50-email calibration: 6 IMPORTANT exemplars + the NOISE list +
+  "named individual inside a marketing email = IMPORTANT" + precision-over-recall
+  tie-breaker). Unparseable/empty/errored -> NOISE (never move on uncertainty).
+- **Dual gate (load-bearing):** a real move requires BOTH `?live=1` AND env
+  `FYI_LIVE=1`. Absent either, the run is DRY (classify + log would-move, write no
+  ids, move nothing). The daily cron passes `live=True`, so it ships DRY while
+  `FYI_LIVE` is unset and auto-promotes to live the moment Ken sets `FYI_LIVE=1`.
+- **Windows (parameter, never fixed):** cron = 24h (`FYI_LOOKBACK_HOURS`); 7-day
+  calibration dry-run = `/fyi/run?days=7`; 30-day backfill = `/fyi/run?days=30&live=1`.
+  A window >30d (`FYI_MAX_DAYS`) must be passed explicitly; never scans the full
+  ~13k backlog. Per-folder fetch cap `FYI_MAX_PER_FOLDER` (logged when hit, not silent).
+- **Dedup:** processed-id store `/data/fyi_processed.json`, keyed by message id.
+  LIVE runs record every confidently-classified id (moved + noise); DRY runs write
+  nothing (so a later backfill still sees everything). `backlog=1` ignores the store.
+- **Safety:** only ever moves FROM the two named sources TO "2: FYI"
+  (`_assert_safe_move` guards every move: dest must be the resolved FYI id and not
+  a source). Never deletes/modifies anything else; idempotent. State files on
+  `/data`: `fyi_processed.json`, `fyi_lock.json`, `fyi_status.json`.
+
 ## Common Failure Modes
 
 | Symptom | Cause | Fix |
@@ -247,10 +288,14 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
 | /pulse/check shows false | Missing Azure AD permissions | Ken must grant + admin consent |
 | Read/Learn task Priority blank/wrong | Duplicate Asana Priority field used | Use field 1199941453034656, NOT 1206810235510187 |
 | Daily digest owner names blank / 403 | Missing HubSpot crm.objects.owners.read scope | Grant + reconnect HubSpot (granted 2026-06-14) |
+| FYI Triage classifies but never moves | Dual gate not fully open | Set BOTH `?live=1` AND env `FYI_LIVE=1`; absent either it stays DRY by design |
+| FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
 
 ## Environment Variables (Railway)
 
 Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_API_KEY`, `ASANA_API_KEY`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`, `MS_GRAPH_TENANT_ID`, `HUBSPOT_OWNER_MAP`, `BOT_SENDER_EMAIL=sara@negevlabs.com`, `ASANA_PROJECT_GID=1213263339592202`, `ASANA_WORKSPACE_GID=597593980065511`
+
+FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY`.
 
 ## Current Known Issues
 
