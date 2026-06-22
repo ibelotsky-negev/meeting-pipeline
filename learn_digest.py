@@ -72,6 +72,84 @@ ASANA_SECTIONS = {
 BUCKETS = list(ASANA_SECTIONS.keys())
 DEFAULT_BUCKET = "General/Reference"
 
+# ----------------------------------------------------------------------
+#  DETERMINISTIC SECTION ROUTING (Part A) + PRIORITY AT CREATION (Part B).
+#  Routing is keyed off the cluster topic + each keeper's own subject/title/
+#  summary tags already produced -- NO extra LLM call. Rules below are applied
+#  FIRST MATCH WINS, in order; the order encodes Ken's 2026-06-22 manual
+#  re-categorization. The biotech-vs-general-investing tie-breaker IS the
+#  ordering: a biotech signal (Negev Labs) is tested before the general
+#  family-office bucket (Zirmania), so "is the thesis biotech?" -> yes lands
+#  Negev, and a genuine 50/50 also defaults to Negev (per Ken). The router
+#  never returns the manual-only sections (Untitled / Video to watch / Drop --
+#  Not important); those are for Ken's hand-triage.
+#  GIDs verified live against project 1215897524719950 on 2026-06-22.
+LEARN_SECTION_GID = {
+    "Health": "1215899542179143",
+    "Negev Labs": "1215897524642810",
+    "Zirmania Family Office": "1215886226827868",
+    "Travel Relay": "1215886226830719",
+    "Ariadne Website": "1215898379087843",
+    "Sara Pipeline": "1215899505871771",
+    "General / Reference": "1215899505871835",
+}
+LEARN_DEFAULT_SECTION = "General / Reference"
+
+# Sara Pipeline encodes convention (b) (Ken's choice 2026-06-22): ONLY items
+# that parallel the Sara meeting-pipeline (post-meeting / transcript / meeting-
+# intelligence / chief-of-staff system builds like OpenClaw, plus self-
+# referential Sara infra). General Claude tooling (Cowork, Obsidian, PKM,
+# second-brain) falls through to General / Reference.
+_ROUTING_RULES = [
+    ("Health", (
+        "health", "wellness", "biohack", "longevity", "peptide", "nootropic",
+        "sleep", "supplement", "diet", "digestion", "gut health", "microbiome",
+        "huberman", "hormone", "hormonal", "testosterone", "metabolic",
+        "nutrition", "fasting", "fitness", "vitamin", "mens health",
+    )),
+    ("Negev Labs", (
+        "drug develop", "clinical", "biotech", "pharma", "therapeutic", "rnpv",
+        "unmet need", "psychedelic", "psilocybin", "mdma", "ketamine", "cns",
+        "parkinson", "pd-apathy", "apathy", "ai-in-bio", "ai in bio", "techbio",
+        "ariadne bio", "ariadne fundrais", "ariadne raise", "ariadne investor",
+        "skinny label", "skinny-label", "hikma", "ra capital", "lonza", "ardd",
+        "coefficient bio", "2048 ventures", "life science", "life-science",
+        "fda", "indication", "preclinical", "phase ii", "phase iii",
+    )),
+    ("Zirmania Family Office", (
+        "macro", "market crash", "stock market", "recession", "public equit",
+        "equities", "commodit", "copper", "semiconductor", "michael burry",
+        "burry", "generalist vc", "co-invest", "vntr", "startup nation",
+        "deal sourcing", "deal-sourcing", "gp/lp", "storyteller",
+        "asset allocation", "saas vs biotech", "family office", "hedge fund",
+        "valuation",
+    )),
+    ("Travel Relay", (
+        "travel", "flight", "booking", "itinerary", "hotel", "airline", "kiwi",
+        "trip", "boarding", "check-in", "travel assistant",
+    )),
+    ("Ariadne Website", (
+        "design system", "ui design", "ux design", "web design", "css",
+        "tailwind", "figma", "landing page", "site build", "site-build",
+        "frontend", "front-end", "typography", "web component",
+    )),
+    ("Sara Pipeline", (
+        "meeting pipeline", "meeting-pipeline", "post-meeting", "openclaw",
+        "meeting intelligence", "transcript pipeline", "chief of staff",
+        "chief-of-staff", "sara pipeline",
+    )),
+]
+
+# Priority custom field bound to the Read/Learn Triage project (Part B). GUARD:
+# the workspace also has a DUPLICATE Priority field 1206810235510187 -- never
+# use it; only this project-bound field GID is correct.
+LEARN_PRIORITY_FIELD_GID = "1199941453034656"
+LEARN_PRIORITY_OPTION_GID = {
+    "High": "1199941453034657",
+    "Medium": "1199941453034658",
+    "Low": "1199941453034659",
+}
+
 # Models: summaries on the extraction tier (Sonnet), cluster/curate/currency on
 # the judgement tier (Opus) -- same tiers as the Weekly Pulse.
 SUMMARY_MODEL = os.environ.get("LEARN_SUMMARY_MODEL", "claude-sonnet-4-6")
@@ -854,6 +932,8 @@ def curate_cluster(cluster: dict, profile: str = KEN_PROFILE, call_fn=None) -> d
         it = dict(items[0])
         it["why"] = "only item in this cluster"
         it["bucket"] = DEFAULT_BUCKET
+        it["topic"] = topic
+        it["priority"] = _default_priority(it)
         it["has_action"] = False
         it["action"] = ""
         return {"topic": topic, "keepers": [it], "superseded": []}
@@ -874,9 +954,18 @@ def curate_cluster(cluster: dict, profile: str = KEN_PROFILE, call_fn=None) -> d
         "complementary value. Mark every other item superseded/redundant with a one-line "
         "reason. Tag each keeper with one bucket from: [" + buckets_str + "]. Flag whether the "
         "keeper carries a concrete action for Ken (has_action) and, if so, a one-line action.\n"
+        "Also assign each keeper a priority of High, Medium, or Low for Ken:\n"
+        "- High: live and actionable for Ken's active builds, the Ariadne raise, or portfolio "
+        "diligence (fundraising targets, psychedelic/biotech news, CLAUDE.md/loop discipline he "
+        "is actively using, valuation/DD frameworks, the flight MCP for Travel).\n"
+        "- Medium: relevant background, worth evaluating but not time-sensitive (most general AI "
+        "tooling, conference notes, macro/IR references, secondary tools).\n"
+        "- Low: tangential or evergreen (personal-product pages, market-doom commentary, "
+        "unverifiable/promotional threads, content-not-retrieved items, fabricated-model items). "
+        "If you cannot confidently assign, use Medium.\n"
         "Return ONLY a JSON object:\n"
         '{"keepers": [{"index": int, "why": "why this one is best for Ken", "bucket": "one of the buckets", '
-        '"has_action": true/false, "action": "one line or empty"}], '
+        '"priority": "High|Medium|Low", "has_action": true/false, "action": "one line or empty"}], '
         '"superseded": [{"index": int, "reason": "why dropped"}]}\n\n'
         "Items:\n" + "\n".join(lines)
     )
@@ -895,6 +984,8 @@ def curate_cluster(cluster: dict, profile: str = KEN_PROFILE, call_fn=None) -> d
             it = dict(items[idx])
             it["why"] = (k.get("why") or "").strip() or "best fit for Ken's current work"
             it["bucket"] = _normalize_bucket(k.get("bucket"))
+            it["topic"] = topic
+            it["priority"] = _normalize_priority(k.get("priority"))
             it["has_action"] = bool(k.get("has_action"))
             it["action"] = (k.get("action") or "").strip()
             keepers.append(it)
@@ -906,6 +997,8 @@ def curate_cluster(cluster: dict, profile: str = KEN_PROFILE, call_fn=None) -> d
         it = dict(items[win])
         it["why"] = "most recent item in the cluster (auto-selected)"
         it["bucket"] = DEFAULT_BUCKET
+        it["topic"] = topic
+        it["priority"] = _default_priority(it)
         it["has_action"] = False
         it["action"] = ""
         keepers.append(it)
@@ -1078,13 +1171,45 @@ def send_digest_email(subject: str, body: str, content_type: str = "HTML"):
 # ======================================================================
 
 
+def _normalize_priority(value) -> str:
+    """Map a model-provided priority to one of High/Medium/Low. Anything
+    unknown, empty, or unparseable defaults to Medium (per the rubric)."""
+    v = (value or "").strip().lower()
+    if v.startswith("high"):
+        return "High"
+    if v.startswith("low"):
+        return "Low"
+    return "Medium"
+
+
+def _default_priority(item: dict) -> str:
+    """Priority for keepers NOT judged by the curation model (single-item
+    clusters and the deterministic fallback): content-not-retrieved items
+    are Low per the rubric; everything else defaults to Medium."""
+    return "Low" if item.get("partial") else "Medium"
+
+
+def route_section(keeper: dict) -> str:
+    """Deterministic Asana section GID for a keeper: FIRST MATCH WINS over
+    _ROUTING_RULES, keyed off the cluster topic + the keeper own subject/
+    title/summary tags already produced. No LLM call. Falls back to
+    General / Reference; never returns a manual-only section."""
+    text = " ".join(str(keeper.get(k) or "") for k in
+                    ("topic", "subject", "title", "summary", "specifics")).lower()
+    for name, keywords in _ROUTING_RULES:
+        if any(kw in text for kw in keywords):
+            return LEARN_SECTION_GID[name]
+    return LEARN_SECTION_GID[LEARN_DEFAULT_SECTION]
+
+
 def _section_for_bucket(bucket: str) -> str:
     return ASANA_SECTIONS.get(_normalize_bucket(bucket), ASANA_SECTIONS[DEFAULT_BUCKET])
 
 
 def create_triage_task(keeper: dict) -> str:
-    """Create a task in 'Read/Learn Triage', placed in the matching bucket
-    section. Returns the task GID or '' on failure (never raises)."""
+    """Create a task in 'Read/Learn Triage', routed to its section
+    deterministically (route_section) with Priority set at creation. Returns
+    the task GID or '' on failure (never raises)."""
     try:
         notes_lines = [keeper.get("summary") or "", ""]
         if keeper.get("url"):  # source link; omitted when no URL could be extracted (never fabricated)
@@ -1094,10 +1219,14 @@ def create_triage_task(keeper: dict) -> str:
             notes_lines.append("Currency: " + keeper["currency_note"])
         if keeper.get("action"):
             notes_lines.append("Action: " + keeper["action"])
+        priority = _normalize_priority(keeper.get("priority"))
         data = {
             "name": (keeper.get("title") or "Read/Learn item")[:250],
             "notes": "\n".join(notes_lines),
             "projects": [ASANA_PROJECT_GID_LEARN],
+            # Priority set at creation (Part B). Guard: never the duplicate
+            # workspace field 1206810235510187 -- only the project-bound field.
+            "custom_fields": {LEARN_PRIORITY_FIELD_GID: LEARN_PRIORITY_OPTION_GID[priority]},
         }
         ws = os.environ.get("ASANA_WORKSPACE_GID", "")
         if ws:
@@ -1106,9 +1235,9 @@ def create_triage_task(keeper: dict) -> str:
         task_gid = (task or {}).get("gid")
         if not task_gid:
             return ""
-        section_gid = _section_for_bucket(keeper.get("bucket"))
+        section_gid = route_section(keeper)
         asana_client.asana_request("POST", f"/sections/{section_gid}/addTask", {"task": task_gid})
-        logger.info(f"[learn] Asana task {task_gid} -> section {keeper.get('bucket')}")
+        logger.info(f"[learn] Asana task {task_gid} -> section {section_gid} (priority={priority})")
         return task_gid
     except Exception as e:
         logger.error(f"[learn] Asana task creation failed: {e}")

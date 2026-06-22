@@ -723,3 +723,109 @@ class TestSourceLinks:
         monkeypatch.setattr(ld.asana_client, "asana_request", fake_req)
         ld.create_triage_task(self._keeper(""))
         assert "Source:" not in captured["notes"]
+
+
+# ----------------------------------------------------------------------
+#  11. Deterministic section routing (Part A) + Priority at creation (Part B)
+# ----------------------------------------------------------------------
+
+class TestRoutingAndPriority:
+    def _k(self, **kw):
+        base = {"topic": "", "subject": "", "title": "", "summary": "", "specifics": []}
+        base.update(kw)
+        return base
+
+    def test_route_health(self):
+        gid = ld.route_section(self._k(topic="Huberman sleep and longevity protocol"))
+        assert gid == ld.LEARN_SECTION_GID["Health"]
+
+    def test_route_biotech_investing_to_negev(self):
+        gid = ld.route_section(self._k(topic="Biotech rNPV valuation, Phase II asset"))
+        assert gid == ld.LEARN_SECTION_GID["Negev Labs"]
+
+    def test_route_general_markets_to_zirmania(self):
+        gid = ld.route_section(self._k(topic="Copper supercycle and public equities thesis"))
+        assert gid == "1215886226827868"
+        gid2 = ld.route_section(self._k(topic="Michael Burry semiconductor short"))
+        assert gid2 == ld.LEARN_SECTION_GID["Zirmania Family Office"]
+
+    def test_route_travel(self):
+        gid = ld.route_section(self._k(topic="Cheap flight booking via Kiwi"))
+        assert gid == ld.LEARN_SECTION_GID["Travel Relay"]
+
+    def test_route_design_to_ariadne(self):
+        gid = ld.route_section(self._k(topic="Design system and Tailwind UI components"))
+        assert gid == ld.LEARN_SECTION_GID["Ariadne Website"]
+
+    def test_route_sara_parallel(self):
+        gid = ld.route_section(self._k(topic="OpenClaw chief-of-staff meeting pipeline build"))
+        assert gid == ld.LEARN_SECTION_GID["Sara Pipeline"]
+
+    def test_route_default_general(self):
+        # generic Claude tooling (Cowork/Obsidian) falls through to General (convention b)
+        gid = ld.route_section(self._k(topic="Claude Cowork setup with Obsidian notes"))
+        assert gid == ld.LEARN_SECTION_GID["General / Reference"]
+
+    def test_biotech_signal_wins_tiebreaker(self):
+        # an item carrying BOTH a biotech and a general-investing word -> Negev
+        gid = ld.route_section(self._k(topic="biotech valuation and public equities allocation"))
+        assert gid == ld.LEARN_SECTION_GID["Negev Labs"]
+
+    def test_priority_field_gid_guard(self):
+        assert ld.LEARN_PRIORITY_FIELD_GID == "1199941453034656"
+        assert ld.LEARN_PRIORITY_FIELD_GID != "1206810235510187"
+
+    def test_priority_option_gids(self):
+        assert ld.LEARN_PRIORITY_OPTION_GID["High"] == "1199941453034657"
+        assert ld.LEARN_PRIORITY_OPTION_GID["Medium"] == "1199941453034658"
+        assert ld.LEARN_PRIORITY_OPTION_GID["Low"] == "1199941453034659"
+
+    def test_normalize_priority(self):
+        assert ld._normalize_priority("High") == "High"
+        assert ld._normalize_priority("low") == "Low"
+        assert ld._normalize_priority("Medium") == "Medium"
+        assert ld._normalize_priority(None) == "Medium"
+        assert ld._normalize_priority("garbage") == "Medium"
+
+    def test_default_priority_partial_low(self):
+        assert ld._default_priority({"partial": True}) == "Low"
+        assert ld._default_priority({"partial": False}) == "Medium"
+
+    def _capture(self, monkeypatch, keeper):
+        cap = {}
+
+        def fake_req(method, endpoint, data=None):
+            if endpoint == "/tasks":
+                cap["task"] = data
+                return {"gid": "T9"}
+            if "addTask" in endpoint:
+                cap["section_endpoint"] = endpoint
+            return {}
+        monkeypatch.setattr(ld.asana_client, "asana_request", fake_req)
+        ld.create_triage_task(keeper)
+        return cap
+
+    def test_create_task_priority_high(self, monkeypatch):
+        k = {"title": "Ariadne raise targets", "summary": "s", "has_action": True,
+             "priority": "High", "url": ""}
+        cap = self._capture(monkeypatch, k)
+        assert cap["task"]["custom_fields"] == {"1199941453034656": "1199941453034657"}
+
+    def test_create_task_priority_medium_default(self, monkeypatch):
+        # no priority key -> Medium
+        k = {"title": "x", "summary": "s", "has_action": True, "url": ""}
+        cap = self._capture(monkeypatch, k)
+        assert cap["task"]["custom_fields"]["1199941453034656"] == "1199941453034658"
+
+    def test_create_task_priority_low(self, monkeypatch):
+        k = {"title": "promo thread", "summary": "s", "has_action": True,
+             "priority": "Low", "url": ""}
+        cap = self._capture(monkeypatch, k)
+        assert cap["task"]["custom_fields"]["1199941453034656"] == "1199941453034659"
+
+    def test_create_task_routes_to_health_section(self, monkeypatch):
+        k = {"title": "Huberman sleep protocol", "summary": "longevity", "topic": "health",
+             "has_action": True, "priority": "Medium", "url": ""}
+        cap = self._capture(monkeypatch, k)
+        assert cap["section_endpoint"] == "/sections/1215899542179143/addTask"
+
