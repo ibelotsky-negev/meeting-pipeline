@@ -256,9 +256,18 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
   destination resolves equal to a source.
 - **Classifier:** Sonnet (`FYI_CLASSIFIER_MODEL`, classification tier -- NOT Opus),
   one call per message, reads subject + sender + body excerpt. Rubric embedded in
-  `FYI_RUBRIC` (the 50-email calibration: 6 IMPORTANT exemplars + the NOISE list +
+  `FYI_RUBRIC` (the 50-email calibration: IMPORTANT exemplars + the NOISE list +
   "named individual inside a marketing email = IMPORTANT" + precision-over-recall
   tie-breaker). Unparseable/empty/errored -> NOISE (never move on uncertainty).
+- **Deterministic precision guards (pure functions, NO LLM call, run before the
+  classifier; from the STATE B precision pass):** (1) mail from an internal domain
+  (`FYI_INTERNAL_DOMAINS`, default = the INTERNAL_DOMAINS set) -> NOISE (own
+  outbound / sent-copy / reply thread); (2) bulk broadcast / broker blast --
+  `FYI_BROADCAST_DOMAINS` (ccsend/vccross/rflafferty/iangels) or an `OFFER//`
+  subject -> NOISE; (3) **recency guard** drops anything received before the window
+  cutoff; (4) **dedup** collapses repeated invites/reminders (key = sender +
+  subject stripped of RE:/FW:/Reminder:) so only one surfaces. The nuanced
+  1:1-vs-broadcast and automated-urgency-bait calls stay with the model.
 - **Dual gate (load-bearing):** a real move requires BOTH `?live=1` AND env
   `FYI_LIVE=1`. Absent either, the run is DRY (classify + log would-move, write no
   ids, move nothing). The daily cron passes `live=True`, so it ships DRY while
@@ -295,7 +304,7 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
 
 Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_API_KEY`, `ASANA_API_KEY`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`, `MS_GRAPH_TENANT_ID`, `HUBSPOT_OWNER_MAP`, `BOT_SENDER_EMAIL=sara@negevlabs.com`, `ASANA_PROJECT_GID=1213263339592202`, `ASANA_WORKSPACE_GID=597593980065511`
 
-FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY`.
+FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY` / `FYI_BROADCAST_DOMAINS` (broker/ESP blast domains -> deterministic NOISE) and `INTERNAL_DOMAINS` (own-outbound -> deterministic NOISE).
 
 ## Current Known Issues
 

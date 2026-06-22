@@ -40,6 +40,7 @@ Author: Negev Labs
 """
 
 import os
+import re
 import json
 import time
 import uuid
@@ -104,6 +105,32 @@ FYI_RECIPIENTS = [
 # the scheduled cron itself is tz-aware via Asia/Jerusalem). 3 = IDT (summer).
 ISRAEL_UTC_OFFSET_HOURS = int(os.environ.get("ISRAEL_UTC_OFFSET_HOURS", "3"))
 
+# Internal domains -- mail FROM any of these is own outbound / sent-copy / reply
+# thread (NOISE) even when addressed to investors and full of substance. Sourced
+# from the shared INTERNAL_DOMAINS env (same as the rest of Sara), defaulting to
+# the known set. This is the highest-impact over-inclusion fix (LEAK 1).
+FYI_INTERNAL_DOMAINS = [
+    d.strip().lower() for d in os.environ.get(
+        "INTERNAL_DOMAINS",
+        "negevlabs.com,negevcap.com,ariadnebio.com,adres.bio,zirmania.onmicrosoft.com",
+    ).split(",") if d.strip()
+]
+
+# Bulk-broadcast / broker-blast infrastructure (LEAK 3). A message from one of
+# these domains -- or with a broker "OFFER//" subject -- is a one-to-many blast,
+# not a 1:1 message to Ken, so it is NOISE even when it lists real deal specifics.
+# Kept CONSERVATIVE so a named individual at a normal domain (Forge, Dakota, ...)
+# is never caught; the nuanced 1:1-vs-broadcast calls go to the model.
+FYI_BROADCAST_DOMAINS = [
+    d.strip().lower() for d in os.environ.get(
+        "FYI_BROADCAST_DOMAINS",
+        "ccsend.com,vccross.com,rflafferty.com,iangels.com",
+    ).split(",") if d.strip()
+]
+
+_OFFER_SUBJECT_RE = re.compile(r"^\s*offers?\s*//", re.I)
+_SUBJECT_PREFIX_RE = re.compile(r"^\s*(re|fw|fwd|reminder)\s*:\s*", re.I)
+
 
 def fyi_live_enabled() -> bool:
     """Second of the two gates: the FYI_LIVE env switch. Read at CALL TIME so a
@@ -139,39 +166,62 @@ venture studio, and Zirmania Family Office). The email was auto-sorted into a hi
 "notification" or "marketing" folder. Decide whether it is IMPORTANT enough to surface to
 Ken's "FYI" folder, or whether it is NOISE that should stay where it is.
 
-READ THE BODY -- do NOT judge by the from-address alone. A bulk sender's address can carry a
-real, personal message (e.g. a named individual writing inside an otherwise-marketing email);
-that is IMPORTANT.
+Be STRICT. These folders are ~95% noise; only a few percent should ever surface. When in doubt,
+classify NOISE. READ THE BODY -- do not judge by the from-address alone (a real person can write
+inside a bulk template), but a real name in a signature does NOT by itself make a broadcast
+important.
 
 IMPORTANT (surface it) -- any of:
-- A genuine action is required of Ken: signature / e-sign requests, document approvals,
-  financial or banking actions (wires, account setup), KYC/subscription docs.
-- A REAL PERSON opening or continuing a 1:1 conversation -- including a named individual
-  writing inside an otherwise-marketing or form email. Read the body to catch this.
-- Deal flow / co-invest / investor or partner outreach with real substance (a specific
-  opportunity, a real intro, a term or allocation conversation).
-- Portfolio / watchlist investor-relations or governance: an AGM notice, a shareholder
-  letter, a material corporate action from a company Ken holds or tracks.
+- A genuine action Ken must PERSONALLY execute: sign / e-sign a document, approve a doc, move
+  money (wire, authorize a payment, fund/set up an account), complete KYC/subscription docs.
+- A REAL PERSON writing TO Ken in a 1:1 message (or a 1:1 reply) with a specific ask --
+  including a named individual writing inside an otherwise-marketing or form email. The test is
+  "is this addressed to Ken specifically?", not "does it contain a name?".
+- Deal flow / co-invest / investor or partner outreach with real substance directed at Ken
+  specifically (a specific opportunity, a real intro, a term or allocation conversation).
+- Portfolio / watchlist investor-relations or governance for a company Ken actually holds or
+  tracks: an AGM notice, a shareholder letter, a material corporate action.
 
-Confirmed IMPORTANT examples (positive exemplars):
-  1. A YC SAFE signature request (e.g. Kinro via HelloSign / "Signature requested").
-  2. A Webflow / website form submission from a named founder (e.g. "New form submission",
-     a CEO reaching out).
-  3. A public-company AGM notice (e.g. "Announces Result of Annual General Meeting").
-  4. A conference-sponsorship proposal from a named sender (e.g. a psychedelics conference).
-  5. A funding-round invitation with substance (e.g. "Series C invite", a real allocation ask).
-  6. A banking / account invitation naming a specific person to coordinate with.
+Confirmed IMPORTANT examples:
+  1. A YC SAFE signature request (Kinro via HelloSign / "Signature requested" -- Ken must sign).
+  2. A Webflow / website form submission from a named founder reaching out.
+  3. A public-company AGM notice for a holding ("Result of Annual General Meeting").
+  4. A conference-sponsorship proposal from a named sender writing to Ken.
+  5. A funding-round invitation with a real allocation ask directed at Ken.
+  6. A banking/account invitation naming a specific person to coordinate with (Relay/Kubasov).
+  7. A 1:1 named person with a specific ask: "Re: Negev Capital // Dakota" (Dakota), a Forge
+     "Secondary Opportunity in Ramp/Replit" addressed to the Zirmania team, "Update since we
+     last spoke", a payment Ken must authorize (Revolut "authorize a card payment").
 
-NOISE (leave it in place) -- do NOT surface:
+NOISE (leave it in place) -- do NOT surface. This is the large majority:
+- OWN OUTBOUND: anything FROM Ken or an internal Negev/Negevcap/Ariadne/Zirmania/Adres address
+  (own sends, sent-copies, reply threads) -- NOISE even when addressed to investors and full of
+  substance (e.g. the "Negev Labs Q2 2026 Update" blast, "Test send - Shareholder Letter").
+- URGENCY-BAIT FROM AUTOMATED SENDERS: automated product/service/account notices are NOISE even
+  when the subject says "Action required" or "Important update" -- subject-line urgency does NOT
+  make it important, and do NOT rationalize a vague "action". Examples (all NOISE): a model
+  retirement/deprecation notice ("Retirement notice for Claude Sonnet 4/Opus 4",
+  notice@email.anthropic.com), a "Reminder: Important update regarding your PayPal account",
+  policy/security/account updates from no-reply product addresses. The ONLY automated notices
+  that are IMPORTANT are those requiring Ken to personally sign or move money (see above).
+- MASS BROADCAST (one-to-many) vs 1:1: a broadcast that merely CONTAINS deal specifics is NOISE,
+  even with a real name in the signature. Broadcast signals: bulk-ESP infrastructure senders
+  (Constant Contact/ccsend.com, mailN.*, info@/invest@/marketing@/myteam@ blasts), a "REMINDER:"
+  prefix on a pitch, an identical body sent widely, a generic salutation, product-launch
+  announcements, IR mass updates, broker "OFFER//"/"OFFERS//" blasts. NOISE examples: VCCross /
+  Lafferty "OFFER// ..." broker blasts, "REMINDER: Invitation to invest in SportsCenter"
+  (iAngels), "LingoPure Capital Raise" (Constant Contact), "invitation to Meridian by AngelList"
+  (product launch), a WilmerHale "Pentagon Adds 65 Entities" mass alert, an off-thesis cold
+  "Series A: Disruptive HVAC Hardware" broadcast, AngelList/PharmAla marketing IR blasts,
+  Estateguru/Republic mass updates.
 - Meeting-automation echo: Fireflies, Humantic, Zoom bot join/recap/prep, "Notetaker has
   joined", "Meeting Prep", "Your meeting recap", "Catch up on yesterday".
 - LinkedIn and social notifications (invitations, profile views, job listings, network digests).
-- Newsletters, substacks, webinars and webinar invites, market-outlook blasts, promotional
-  "database inside" or "save 20%" emails.
-- OTPs / verification codes / login codes.
-- Ken's own outbound or test sends, and automated delivery/confirmation receipts.
+- Newsletters, substacks, webinars/webinar invites, market-outlook blasts, "database inside" or
+  "save 20%" promotions.
+- OTPs / verification / login codes.
 - Calendly booking notifications ("New Event: ... Zoom call").
-- Receipts, invoices, credentials, and automated confirmations.
+- Receipts, invoices, credentials, automated delivery/confirmation receipts.
 
 TIE-BREAKER: when you are not clearly sure it is important, classify NOISE. A missed surface is
 cheap; a wrong move erodes trust. Precision over recall."""
@@ -401,6 +451,63 @@ def _sender_address(msg: dict) -> str:
     return (((msg.get("from") or {}).get("emailAddress") or {}).get("address") or "").strip()
 
 
+def _sender_domain(sender: str) -> str:
+    s = (sender or "").lower()
+    return s.rsplit("@", 1)[-1] if "@" in s else ""
+
+
+def _is_internal_sender(sender: str) -> bool:
+    """True if the sender is on an internal domain (own outbound / sent-copy /
+    reply thread). Pure function -- no LLM (LEAK 1)."""
+    dom = _sender_domain(sender)
+    return bool(dom) and any(dom == d or dom.endswith("." + d) for d in FYI_INTERNAL_DOMAINS)
+
+
+def _is_broadcast(msg: dict) -> bool:
+    """True if the message is a bulk broadcast / broker blast -- an ESP-infra
+    domain or an 'OFFER//' broker-offer subject -- rather than a 1:1 message to
+    Ken. Pure function -- no LLM (LEAK 3). Conservative: normal-domain named
+    senders (Forge, Dakota, ...) are never caught."""
+    dom = _sender_domain(_sender_address(msg))
+    if dom and any(dom == d or dom.endswith("." + d) for d in FYI_BROADCAST_DOMAINS):
+        return True
+    return bool(_OFFER_SUBJECT_RE.match(msg.get("subject") or ""))
+
+
+def _normalize_subject(subject: str) -> str:
+    """Lowercased subject with leading RE:/FW:/FWD:/Reminder: prefixes stripped
+    (repeatedly), for dedup keying."""
+    s = (subject or "").strip()
+    while True:
+        m = _SUBJECT_PREFIX_RE.match(s)
+        if not m:
+            break
+        s = s[m.end():]
+    return s.strip().lower()
+
+
+def _dedup_key(msg: dict) -> tuple:
+    """Collapse repeated identical invitations/reminders within a run: key on
+    sender + normalized subject (strip RE:/FW:/Reminder:)."""
+    return (_sender_address(msg).lower(), _normalize_subject(msg.get("subject")))
+
+
+def _received_in_window(msg: dict, cutoff_iso: str) -> bool:
+    """True if the message was received at/after the cutoff. Defensive recency
+    guard so a stale/forwarded item is never surfaced as live even if it slips
+    past the fetch filter. Unknown/unparseable received time -> kept (never
+    silently dropped)."""
+    rcv = msg.get("receivedDateTime")
+    if not rcv:
+        return True
+    try:
+        rdt = datetime.strptime(str(rcv)[:19], "%Y-%m-%dT%H:%M:%S")
+        cdt = datetime.strptime(str(cutoff_iso)[:19], "%Y-%m-%dT%H:%M:%S")
+        return rdt >= cdt
+    except Exception:
+        return True
+
+
 def _message_text(msg: dict) -> str:
     """Compact text the classifier reads: subject + sender + body excerpt. Body
     HTML is reduced to text and truncated to FYI_BODY_CHARS (enough to spot a real
@@ -440,7 +547,6 @@ def _extract_json(text: str):
     surrounding prose). Returns the parsed object or None."""
     if not text:
         return None
-    import re
     fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.S)
     candidate = fence.group(1) if fence else text
     start = candidate.find("{")
@@ -458,7 +564,18 @@ def classify_message(msg: dict, call_fn=None) -> tuple:
     Reads the body (not just the from-address). Null-safe: an unparseable reply or
     an empty message degrades to NOISE (precision over recall -- never move on
     uncertainty). Returns (decision, reason). The caller treats an exception as a
-    transient failure and does NOT record the id, so a later run can retry."""
+    transient failure and does NOT record the id, so a later run can retry.
+
+    Two over-inclusion leaks are handled DETERMINISTICALLY here (pure functions,
+    no LLM, no cost): mail from an internal domain (LEAK 1) and a bulk broadcast /
+    broker blast (LEAK 3-infra). Everything else, including the nuanced
+    1:1-vs-broadcast and automated-urgency-bait calls, goes to the model with the
+    sharpened rubric."""
+    sender = _sender_address(msg)
+    if _is_internal_sender(sender):
+        return "NOISE", "internal-domain sender (own outbound / sent-copy / reply thread)"
+    if _is_broadcast(msg):
+        return "NOISE", "mass broadcast / broker blast (not a 1:1 message to Ken)"
     call_fn = call_fn or _call_claude_text
     content = _message_text(msg)
     prompt = (
@@ -660,19 +777,39 @@ def _fyi_run_inner(dry_run: bool, days: int, backlog: bool, limit: int,
         for m in msgs:
             fetched.append((sname, m))
 
-    if not fetched:
+    # Recency guard: drop anything received before the cutoff (defensive -- the
+    # fetch $filter already scopes by receivedDateTime, but a stale/forwarded item
+    # must never be surfaced as live).
+    in_window = [(s, m) for (s, m) in fetched if _received_in_window(m, since_iso)]
+    dropped_stale = len(fetched) - len(in_window)
+
+    # Dedup: collapse repeated identical invitations/reminders within the run so
+    # only ONE surfaces. Key on sender + normalized subject (strip RE:/FW:/
+    # Reminder:); fetch is newest-first, so the first seen is the representative.
+    representatives, duplicates, seen = [], [], {}
+    for (s, m) in in_window:
+        k = _dedup_key(m)
+        if k in seen:
+            duplicates.append((s, m, seen[k]))
+        else:
+            seen[k] = (m.get("subject") or "").strip()
+            representatives.append((s, m))
+
+    if not representatives:
         result = {"status": "ok", "run_id": run_id, "dry_run": dry_run, "backlog": backlog,
                   "window": window_desc, "scanned": 0, "important": 0, "moved": 0,
-                  "noise": 0, "capped": any_capped, "decisions": [],
+                  "noise": 0, "deduped": len(duplicates), "dropped_stale": dropped_stale,
+                  "capped": any_capped, "decisions": [],
                   "finished_at": datetime.now(timezone.utc).isoformat()}
-        _set_progress(phase="done", done=0, total=0, last="no messages in window")
+        _set_progress(phase="done", done=0, total=0, last="nothing to classify in window")
         write_status(result)
-        logger.info(f"[fyi] Run {run_id}: no messages in window {window_desc}")
+        logger.info(f"[fyi] Run {run_id}: nothing to classify (window {window_desc}, "
+                    f"{dropped_stale} stale, {len(duplicates)} duplicates)")
         return result
 
-    # Classify each message (concurrent, bounded). An exception is isolated and
-    # marked ok=False so the caller does NOT record its id (allows a retry).
-    _set_progress(phase="classify", done=0, total=len(fetched), last="")
+    # Classify each representative (concurrent, bounded). An exception is isolated
+    # and marked ok=False so the caller does NOT record its id (allows a retry).
+    _set_progress(phase="classify", done=0, total=len(representatives), last="")
 
     def _classify_one(i, pair):
         sname, m = pair
@@ -692,14 +829,28 @@ def _fyi_run_inner(dry_run: bool, days: int, backlog: bool, limit: int,
         _bump_progress(f"[{rec['decision']}] {rec['subject'][:50]}")
         return rec
 
-    decisions = [d for d in _run_concurrent(fetched, _classify_one) if d]
+    rep_decisions = [d for d in _run_concurrent(representatives, _classify_one) if d]
+
+    # Duplicates inherit a deterministic NOISE decision (collapsed within run) so
+    # only the representative can surface; they are still recorded as processed.
+    dup_decisions = []
+    for (s, m, rep_subj) in duplicates:
+        dup_decisions.append({
+            "id": m.get("id"), "source": s, "subject": (m.get("subject") or "").strip(),
+            "sender": _sender_address(m), "webLink": m.get("webLink"),
+            "received": m.get("receivedDateTime"), "decision": "NOISE",
+            "reason": f"duplicate of '{rep_subj[:60]}' collapsed within run", "ok": True,
+        })
+
+    decisions = rep_decisions + dup_decisions
     important = [d for d in decisions if d.get("decision") == "IMPORTANT"]
     noise = [d for d in decisions if d.get("decision") != "IMPORTANT"]
 
     moved = 0
     if dry_run:
-        logger.info(f"[fyi] [dry-run] {len(fetched)} scanned -> {len(important)} would move, "
-                    f"{len(noise)} noise (no move, no ids written)")
+        logger.info(f"[fyi] [dry-run] {len(decisions)} decided -> {len(important)} would move, "
+                    f"{len(noise)} noise ({dropped_stale} stale, {len(duplicates)} deduped; "
+                    "no move, no ids written)")
         _set_progress(phase="done", last=f"would move {len(important)}")
     else:
         _set_progress(phase="move", done=0, total=len(important), last="")
@@ -733,7 +884,8 @@ def _fyi_run_inner(dry_run: bool, days: int, backlog: bool, limit: int,
 
     result = {
         "status": "ok", "run_id": run_id, "dry_run": dry_run, "backlog": backlog,
-        "window": window_desc, "since": since_iso, "scanned": len(fetched),
+        "window": window_desc, "since": since_iso, "scanned": len(decisions),
+        "fetched": len(fetched), "deduped": len(duplicates), "dropped_stale": dropped_stale,
         "important": len(important), "moved": moved, "noise": len(noise),
         "capped": any_capped, "subject": subject,
         # The reviewable artifact (STATE B / STATE C): every decision with reason.

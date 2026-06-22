@@ -57,7 +57,12 @@ def stub_folders(monkeypatch):
     return mapping
 
 
-def _msg(mid, subject, sender, body="", folder_received="2026-06-20T10:00:00Z"):
+def _msg(mid, subject, sender, body="", folder_received=None):
+    if folder_received is None:
+        # Default to "recent" so messages survive the recency guard in any
+        # reasonable window; tests that exercise recency pass an explicit date.
+        from datetime import datetime, timezone, timedelta
+        folder_received = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "id": mid, "subject": subject,
         "from": {"emailAddress": {"address": sender}},
@@ -142,11 +147,19 @@ def _oracle(prompt, model):
     contains these cue phrases (as worked examples), so matching the whole prompt
     would always fire."""
     low = prompt.split("Email:\n", 1)[-1].lower()
+    # Automated urgency-bait (LEAK 2): NOISE despite "action required"/"important update".
+    urgency_bait = ("model will be retired", "retirement notice", "automated product notice",
+                    "important update regarding your paypal")
     noise_cues = ("notetaker has joined", "linkedin profile", "newsletter", "verification code",
-                  "meeting recap", "scheduled via calendly")
+                  "meeting recap", "scheduled via calendly") + urgency_bait
+    # 1:1 personally-executed action / named ask to Ken (LEAK 2 keepers + LEAK 3 1:1).
     important_cues = ("please sign", "submitted the contact form", "annual general meeting",
                       "i'd love to discuss negev sponsoring", "series c", "invited you to set up",
-                      "co-investing")
+                      "co-investing", "authorize a card payment", "take an allocation")
+    # Urgency-bait is checked FIRST so a "please sign"-free automated notice cannot
+    # be rescued by an incidental keyword.
+    if any(c in low for c in urgency_bait):
+        return json.dumps({"decision": "NOISE", "reason": "automated urgency-bait, no personal action"})
     if any(c in low for c in important_cues):
         return json.dumps({"decision": "IMPORTANT", "reason": "real action/person/deal in body"})
     if any(c in low for c in noise_cues):
@@ -518,6 +531,169 @@ class TestLiveEnv:
 # ======================================================================
 #  10. /fyi/run + /fyi/status endpoints (thin wrappers).
 # ======================================================================
+
+# ======================================================================
+#  11. STATE B precision fixes -- over-inclusion leaks + dedup + recency.
+#  Each case below is a permanent regression test for a confirmed false
+#  positive from the first 7-day dry-run (79/394 flagged, target ~3-5%).
+# ======================================================================
+
+class TestLeak1OwnOutbound:
+    """Mail FROM an internal domain is NOISE (own outbound / sent-copy / reply
+    thread) even when addressed to investors and full of substance. Deterministic
+    -- no LLM call."""
+
+    def test_internal_sender_is_noise_without_llm(self):
+        called = {"n": 0}
+
+        def boom(p, m):
+            called["n"] += 1
+            return '{"decision":"IMPORTANT","reason":"lots of substance"}'
+
+        # The "Negev Labs Q2 2026 Update" cluster: from bk@negevcap.com to external investors.
+        msg = _msg("own1", "Negev Labs Q2 2026 Update", "bk@negevcap.com",
+                   "Dear investors, our Q2 update: revenue, the raise, MJFF co-funding, wire details...")
+        d, _ = ft.classify_message(msg, call_fn=boom)
+        assert d == "NOISE"
+        assert called["n"] == 0  # decided deterministically, never reached the model
+
+    def test_test_send_from_internal_is_noise(self):
+        msg = _msg("own2", "Test send - Negev Labs - Shareholder Letter", "bk@negevlabs.com",
+                   "Testing delivery of the shareholder letter.")
+        d, _ = ft.classify_message(msg, call_fn=lambda p, m: '{"decision":"IMPORTANT","reason":"x"}')
+        assert d == "NOISE"
+
+    def test_is_internal_sender_helper(self):
+        for s in ("bk@negevcap.com", "bk@negevlabs.com", "x@ariadnebio.com",
+                  "y@adres.bio", "z@zirmania.onmicrosoft.com"):
+            assert ft._is_internal_sender(s) is True, s
+        assert ft._is_internal_sender("ceo@external.com") is False
+        assert ft._is_internal_sender("") is False
+
+
+class TestLeak2UrgencyBait:
+    """Automated product/service/account notices are NOISE even with 'Action
+    required' / 'Important update', UNLESS they require a money movement or a
+    signature Ken must personally execute."""
+
+    def test_claude_retirement_notice_is_noise(self):
+        msg = _msg("ub1", "[Action required] Retirement notice for Claude Sonnet 4",
+                   "notice@email.anthropic.com",
+                   "The Claude Sonnet 4 model will be retired. Migrate to a newer model id. "
+                   "This is an automated product notice; no payment or signature is needed.")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "NOISE"
+
+    def test_paypal_important_update_is_noise(self):
+        msg = _msg("ub2", "Reminder: Important update regarding your PayPal account",
+                   "noreply@news.paypal.com",
+                   "Important update regarding your PayPal account. Review our updated policy.")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "NOISE"
+
+    def test_signature_request_still_important(self):
+        msg = _msg("ub3", "Signature requested by YC Safes", "noreply@mail.hellosign.com",
+                   "Please sign the SAFE for Kinro - investment by Ken Belotsky.")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "IMPORTANT"
+
+    def test_payment_authorization_still_important(self):
+        msg = _msg("ub4", "Authorize your card payment", "noreply@revolut.com",
+                   "Please authorize a card payment of $4,200 to complete the transaction.")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "IMPORTANT"
+
+
+class TestLeak3Broadcast:
+    """A named individual writing TO Ken = IMPORTANT. A one-to-many broadcast
+    that merely CONTAINS deal specifics = NOISE, even with a real name in the
+    signature. The clearest broker/ESP-infra cases are deterministic."""
+
+    def test_vccross_offer_blast_is_noise_without_llm(self):
+        called = {"n": 0}
+
+        def boom(p, m):
+            called["n"] += 1
+            return '{"decision":"IMPORTANT","reason":"deal specifics"}'
+
+        msg = _msg("bc1", "OFFERS// Crusoe, Figure AI, Anthropic secondary", "invest@vccross.com",
+                   "We are offering secondary allocations in Crusoe, Figure AI, Anthropic...")
+        d, _ = ft.classify_message(msg, call_fn=boom)
+        assert d == "NOISE" and called["n"] == 0
+
+    def test_lafferty_offer_is_noise(self):
+        msg = _msg("bc2", "OFFER// Replit / Figure", "jgelet@rflafferty.com", "Broker offer blast.")
+        assert ft.classify_message(msg, call_fn=lambda p, m: '{"decision":"IMPORTANT"}')[0] == "NOISE"
+
+    def test_iangels_reminder_pitch_is_noise(self):
+        msg = _msg("bc3", "REMINDER: Invitation to invest in SportsCenter", "myteam@iangels.com",
+                   "Reminder to join the SportsCenter syndicate round.")
+        assert ft.classify_message(msg, call_fn=lambda p, m: '{"decision":"IMPORTANT"}')[0] == "NOISE"
+
+    def test_ccsend_capital_raise_is_noise(self):
+        msg = _msg("bc4", "Reminder: LingoPure Capital Raise", "noreply@shared1.ccsend.com",
+                   "LingoPure is raising; here is the deck.")
+        assert ft.classify_message(msg, call_fn=lambda p, m: '{"decision":"IMPORTANT"}')[0] == "NOISE"
+
+    def test_named_individual_to_ken_is_important(self):
+        # Forge/Dakota style: not internal, not broadcast infra -> reaches the model,
+        # which keeps a 1:1 named-person specific ask.
+        msg = _msg("bc5", "Zirmania Team, Secondary Opportunity in Ramp", "matthew.bell@forgeglobal.com",
+                   "Hi Ken, we have a secondary opportunity in Ramp at a specific price -- "
+                   "can Zirmania take an allocation this week? Best, Matthew")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "IMPORTANT"
+
+    def test_is_broadcast_helper(self):
+        assert ft._is_broadcast(_msg("x", "OFFER// foo", "a@b.com", "")) is True
+        assert ft._is_broadcast(_msg("x", "OFFERS// foo", "a@b.com", "")) is True
+        assert ft._is_broadcast(_msg("x", "hi", "anyone@vccross.com", "")) is True
+        assert ft._is_broadcast(_msg("x", "hi", "x@shared1.ccsend.com", "")) is True
+        # Keepers must NOT be flagged as broadcast.
+        assert ft._is_broadcast(_msg("x", "Re: Negev Capital // Dakota", "jk@dakota.com", "")) is False
+        assert ft._is_broadcast(_msg("x", "Zirmania Team, Secondary in Ramp",
+                                      "matthew.bell@forgeglobal.com", "")) is False
+
+
+class TestRecencyGuard:
+    def test_received_in_window_helper(self):
+        cut = "2026-06-15T00:00:00Z"
+        assert ft._received_in_window({"receivedDateTime": "2026-06-22T10:00:00Z"}, cut) is True
+        assert ft._received_in_window({"receivedDateTime": "2026-01-10T10:00:00Z"}, cut) is False
+        assert ft._received_in_window({}, cut) is True  # unknown received -> do not drop
+
+    def test_stale_item_not_surfaced(self, fyi_files, stub_folders, monkeypatch):
+        stale = _msg("xylo", "Xylo Bio Update, January 2026", "updates@xylobio.com",
+                     "Our January 2026 update.", folder_received="2026-01-15T10:00:00Z")
+        fresh = _msg("fresh", "IMP real ask", "ceo@startup.com", "A real ask.")  # default -> recent
+        monkeypatch.setattr(ft, "fetch_messages",
+                            lambda fid, s, processed_ids=None, backlog=False, limit=None:
+                            ([stale, fresh], False) if fid == SRC_NOTIF else ([], False))
+        monkeypatch.setattr(ft, "classify_message", lambda m, call_fn=None: ("IMPORTANT", "x"))
+        res = ft.run_fyi(dry_run=True, days=7)
+        ids = [d["id"] for d in res["decisions"]]
+        assert "xylo" not in ids   # dropped by the recency guard
+        assert "fresh" in ids
+
+
+class TestRunDedup:
+    def test_five_identical_invites_one_important(self, fyi_files, stub_folders, monkeypatch):
+        subs = ["Kubasov invited you to Relay",
+                "Reminder: Kubasov invited you to Relay",
+                "RE: Kubasov invited you to Relay",
+                "Reminder: Kubasov invited you to Relay",
+                "Kubasov invited you to Relay"]
+        msgs = [_msg(f"kub{i}", s, "invites@relayfi.com",
+                     "Alexander Kubasov invited you to set up Relay banking.",
+                     folder_received=f"2026-06-2{i}T10:00:00Z") for i, s in enumerate(subs)]
+        monkeypatch.setattr(ft, "fetch_messages",
+                            lambda fid, s, processed_ids=None, backlog=False, limit=None:
+                            (msgs, False) if fid == SRC_NOTIF else ([], False))
+        monkeypatch.setattr(ft, "classify_message", lambda m, call_fn=None: ("IMPORTANT", "invite"))
+        monkeypatch.setattr(ft, "move_to_fyi", MagicMock(return_value=True))
+        res = ft.run_fyi(dry_run=True, days=30)  # wide window so recency keeps all 5
+        important = [d for d in res["decisions"] if d["decision"] == "IMPORTANT"]
+        assert len(important) == 1, important
+
+    def test_normalize_subject_strips_prefixes(self):
+        assert ft._normalize_subject("Reminder: Foo") == ft._normalize_subject("Foo")
+        assert ft._normalize_subject("RE: Foo") == ft._normalize_subject("FW: Foo") == ft._normalize_subject("Foo")
+
 
 class TestEndpoints:
     def test_status_returns_module_status(self, flask_client, monkeypatch):
