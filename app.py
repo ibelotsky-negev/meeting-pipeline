@@ -2980,7 +2980,12 @@ def learn_run():
 
     logger.info(f"[learn] Trigger: dry_run={dry_run} backlog={backlog} force={force} -- launching background thread")
     t = _threading.Thread(target=_run, daemon=True)
-    t.start()
+    try:
+        t.start()
+    except Exception as e:
+        _learn_trigger_lock.release()  # never orphan the trigger lock if the thread won't start
+        logger.error(f"[learn] Failed to start run thread: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": f"could not start run: {e}"}), 500
     return jsonify({"status": "started", "dry_run": dry_run, "backlog": backlog, "force": force, "limit": limit})
 
 
@@ -3118,7 +3123,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.12-debug-cleanup", "deployed": "2026-06-21"})
+    return jsonify({"version": "2.18.13-grok-parse-guard", "deployed": "2026-06-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3156,7 +3161,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.12-debug-cleanup", "steps": {}}
+    results = {"version": "2.18.13-grok-parse-guard", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

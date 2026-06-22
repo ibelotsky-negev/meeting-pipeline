@@ -456,11 +456,6 @@ def resolve_podcast(url: str) -> dict:
     return {"text": text[:20000], "kind": "podcast", "partial": False, "reason": "", "content_date": None}
 
 
-def _tweet_id(url: str):
-    m = re.search(r"/status(?:es)?/(\d+)", url) or re.search(r"/i/status/(\d+)", url)
-    return m.group(1) if m else None
-
-
 def _grok_responses_call(prompt: str, model: str, timeout: int = 90) -> dict:
     """Call the xAI Agent Tools API (POST /v1/responses) with server-side
     x_search + web_search so Grok reads an X post directly from its URL -- no X
@@ -486,7 +481,11 @@ def _grok_responses_call(prompt: str, model: str, timeout: int = 90) -> dict:
             return resp.json()
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
-            if attempt < 1:
+            # Retry only transient failures (network errors, or 429/5xx). A
+            # non-retryable 4xx (400/401/404) fails fast -- no wasted retry/fee.
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            retryable = status is None or status in (429, 500, 502, 503, 504)
+            if attempt < 1 and retryable:
                 time.sleep(3)
                 continue
             raise RuntimeError(last)
@@ -495,26 +494,31 @@ def _grok_responses_call(prompt: str, model: str, timeout: int = 90) -> dict:
 
 def _parse_grok_responses(data: dict):
     """Extract the assistant text + url citations from an xAI /v1/responses
-    payload. Walks output[] for the assistant message because the top-level
-    output_text convenience is frequently null. Returns (text, citations)."""
+    payload. Walks output[] for the ASSISTANT MESSAGE item only -- the top-level
+    output_text convenience is frequently null, and other item types (reasoning,
+    tool_result) can carry a STRING content that must NOT be iterated as dicts
+    (would raise AttributeError and blank the item). Returns (text, citations)."""
     data = data or {}
     citations = []
     txt = (data.get("output_text") or "").strip()
     for item in (data.get("output") or []):
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or item.get("type") != "message" or item.get("role") != "assistant":
             continue
-        if not txt and item.get("type") == "message" and item.get("role") == "assistant":
-            parts = [c["text"] for c in (item.get("content") or [])
-                     if c.get("type") == "output_text" and c.get("text")]
-            if parts:
-                txt = "\n".join(parts).strip()
+        parts = []
         for c in (item.get("content") or []):
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "output_text" and c.get("text"):
+                parts.append(c["text"])
             for a in (c.get("annotations") or []):
-                if a.get("type") == "url_citation" and a.get("url"):
+                if isinstance(a, dict) and a.get("type") == "url_citation" and a.get("url"):
                     citations.append(a["url"])
+        if not txt and parts:
+            txt = "\n".join(parts).strip()
     return txt, citations
 
 
+# retained for planned X-video STT (mp4 -> Grok-STT); see Asana backlog
 def _grok_stt(mp4_url: str):
     """DORMANT: transcribe an mp4's audio via Grok STT (api.x.ai/v1/stt). Kept
     for a future X-video path but currently UNWIRED -- the Grok x_search
@@ -562,7 +566,11 @@ def resolve_x(url: str) -> dict:
     except Exception as e:
         logger.warning(f"[learn] Grok x_search failed {url[:60]}: {e}")
         return _partial("x", f"Grok x_search error: {e}")
-    text, citations = _parse_grok_responses(data)
+    try:
+        text, citations = _parse_grok_responses(data)
+    except Exception as e:
+        logger.warning(f"[learn] Grok response parse failed {url[:60]}: {e}")
+        return _partial("x", f"Grok response parse error: {e}")
     if not text or text.strip().upper().startswith("CANNOT_ACCESS"):
         return _partial("x", "Grok could not access the post (CANNOT_ACCESS)")
     logger.info(f"[learn] x resolved via Grok x_search ({model}): {len(text)} chars {url[:60]}")
@@ -1114,24 +1122,24 @@ def create_triage_task(keeper: dict) -> str:
 
 def fetch_unread(folder_id: str = LEARN_FOLDER_ID, processed_ids: set = None, backlog: bool = False,
                  limit: int = None) -> list:
-    """Fetch unread messages from the read/learn folder by ID, skipping any IDs
-    already in learn_processed.json. First run fetches the full backlog; we do
-    NOT chunk -- the clustering pass must see the whole set at once. limit (if
-    set) caps the number returned -- a diagnostic knob for fast partial runs."""
+    """Fetch messages from the read/learn folder by ID. Normal runs fetch UNREAD
+    only and skip IDs already in learn_processed.json. A backlog run (backlog=True)
+    is the manual 'reprocess everything' switch: it fetches the ENTIRE folder (not
+    just unread) AND ignores the processed-ID store, so already-seen items are
+    re-processed from scratch. We do NOT chunk -- the clustering pass must see the
+    whole set at once. limit (if set) caps the number returned (diagnostic knob)."""
     processed_ids = processed_ids or set()
     base = f"{eps.MS_GRAPH_BASE}/users/{MAILBOX}/mailFolders/{folder_id}/messages"
-    params = {
-        "$filter": "isRead eq false",
-        "$select": "id,subject,from,receivedDateTime,body,webLink",
-        "$top": "50",
-    }
+    params = {"$select": "id,subject,from,receivedDateTime,body,webLink", "$top": "50"}
+    if not backlog:
+        params["$filter"] = "isRead eq false"  # normal run: unread only
     url = base
     messages, pages = [], 0
     while url and pages < 25:
         data = eps.graph_get(url, params=params if url == base else None) or {}
         for m in (data.get("value") or []):
-            if m.get("id") in processed_ids:
-                continue
+            if not backlog and m.get("id") in processed_ids:
+                continue  # backlog=True re-processes already-seen items
             messages.append(m)
         url = data.get("@odata.nextLink")
         pages += 1
@@ -1139,7 +1147,7 @@ def fetch_unread(folder_id: str = LEARN_FOLDER_ID, processed_ids: set = None, ba
             break
     if limit:
         messages = messages[:limit]
-    logger.info(f"[learn] Fetched {len(messages)} unread (backlog={backlog}, pages={pages}, limit={limit})")
+    logger.info(f"[learn] Fetched {len(messages)} messages (backlog={backlog}, pages={pages}, limit={limit})")
     return messages
 
 

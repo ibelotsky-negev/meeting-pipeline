@@ -475,6 +475,15 @@ class TestFetchLimit:
         assert len(ld.fetch_unread(limit=2)) == 2
         assert len(ld.fetch_unread()) == 5
 
+    def test_backlog_true_reprocesses_seen_ids(self, monkeypatch):
+        page = {"value": [{"id": "seen-1", "subject": "old"}, {"id": "fresh-2", "subject": "new"}]}
+        monkeypatch.setattr(ld.eps, "graph_get", lambda url, params=None: page)
+        # Normal run (backlog=False): an already-processed id is skipped.
+        assert [m["id"] for m in ld.fetch_unread(processed_ids={"seen-1"})] == ["fresh-2"]
+        # Backlog run (backlog=True): the processed-ID store is ignored -> re-process all.
+        assert [m["id"] for m in ld.fetch_unread(processed_ids={"seen-1"}, backlog=True)] \
+            == ["seen-1", "fresh-2"]
+
 
 # ----------------------------------------------------------------------
 #  15. X resolver via Grok Agent Tools API (x_search) -- parser + degrade
@@ -513,6 +522,20 @@ class TestGrokXResolver:
             {"output_text": None, "output": [{"type": "reasoning", "summary": []}]})
         assert text == "" and citations == []
 
+    def test_parse_survives_tool_result_with_string_content(self):
+        # xAI can return a tool_result item whose "content" is a STRING (not a
+        # list). The citation walk must not iterate it as a list of dicts and
+        # crash (AttributeError), which would mislabel the X post as partial.
+        data = {"output_text": None, "output": [
+            {"type": "tool_result", "content": "raw string result from x_thread_fetch"},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "Author @real. The actual post text.",
+                 "annotations": [{"type": "url_citation", "url": "https://x.com/i/status/9"}]}]},
+        ]}
+        text, citations = ld._parse_grok_responses(data)
+        assert "actual post text" in text
+        assert citations == ["https://x.com/i/status/9"]
+
     def test_resolve_x_returns_content_on_success(self, monkeypatch):
         monkeypatch.setattr(ld, "_grok_responses_call", lambda prompt, model: GROK_RESPONSES_REAL)
         r = ld.resolve_x("https://x.com/i/status/123")
@@ -535,6 +558,40 @@ class TestGrokXResolver:
         r = ld.resolve_x("https://x.com/i/status/123")
         assert r["partial"] is True
         assert "xAI 500" in r["reason"]
+
+    def test_resolve_x_partial_with_distinct_reason_on_parse_error(self, monkeypatch):
+        # A parse crash must degrade to partial with a PARSE-specific reason,
+        # not be mislabeled as "could not access".
+        monkeypatch.setattr(ld, "_grok_responses_call", lambda prompt, model: {"ok": True})
+
+        def bad_parse(data):
+            raise ValueError("unexpected shape")
+        monkeypatch.setattr(ld, "_parse_grok_responses", bad_parse)
+        r = ld.resolve_x("https://x.com/i/status/123")
+        assert r["partial"] is True
+        assert "parse error" in r["reason"]
+
+    def test_grok_call_fails_fast_on_non_retryable_4xx(self, monkeypatch):
+        import requests as _rq
+        calls = {"n": 0}
+
+        class _Resp:
+            status_code = 400
+
+            def raise_for_status(self):
+                raise _rq.HTTPError(response=self)
+
+            def json(self):
+                return {}
+
+        def fake_post(*a, **k):
+            calls["n"] += 1
+            return _Resp()
+        monkeypatch.setattr(ld.requests, "post", fake_post)
+        monkeypatch.setattr(ld.time, "sleep", lambda *a, **k: None)
+        with pytest.raises(RuntimeError):
+            ld._grok_responses_call("p", "m")
+        assert calls["n"] == 1  # 400 is not retried (only network/429/5xx are)
 
 
 # ----------------------------------------------------------------------
