@@ -721,7 +721,7 @@ def _pulse_truncate_input(text, max_chars=PULSE_MAX_INPUT_CHARS):
     if len(text) <= max_chars:
         return text
     logger.warning(f"[pulse] Truncating input from {len(text)} to {max_chars} chars (~20K tokens)")
-    return text[:max_chars] + "\n\n[... TRUNCATED — input exceeded 20K token limit ...]"
+    return text[:max_chars] + "\n\n[... TRUNCATED -- input exceeded 20K token limit ...]"
 
 
 PULSE_MODEL_EXTRACT = "claude-sonnet-4-6"    # Passes 1-3: signal extraction
@@ -1220,7 +1220,7 @@ def _graph_request_with_retry(method: str, url: str, json_body: dict = None, hea
         try:
             resp = requests.request(method, url, json=json_body, headers=hdrs, timeout=30)
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-                logger.warning(f"[todo-sync] Graph {method} {url} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ {resp.status_code}, retrying (attempt {attempt+1}/3)")
+                logger.warning(f"[todo-sync] Graph {method} {url} -> {resp.status_code}, retrying (attempt {attempt+1}/3)")
                 continue
             resp.raise_for_status()
             return resp.json() if resp.content else {}
@@ -3123,7 +3123,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.18.13-grok-parse-guard", "deployed": "2026-06-22"})
+    return jsonify({"version": "2.18.14-ascii-cleanup", "deployed": "2026-06-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3161,7 +3161,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.18.13-grok-parse-guard", "steps": {}}
+    results = {"version": "2.18.14-ascii-cleanup", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -3262,7 +3262,7 @@ def webhook_teams_transcript():
 
 @app.route("/webhook/asana", methods=["POST"])
 def asana_webhook():
-    """Asana webhook handler ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â handshake + event processing."""
+    """Asana webhook handler -- handshake + event processing."""
     import threading
 
     # Handshake: echo X-Hook-Secret back
