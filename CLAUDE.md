@@ -259,3 +259,32 @@ Tests NOT required for:
 - Small refactors fully covered by the existing suite (a green hook is the proof)
 
 When required, tests ship in the same commit as the code. If unsure whether a change is significant, write the test. Never weaken, skip, or delete an existing test to pass it (unchanged rule).
+
+## CLAUDE.md self-maintenance (MANDATORY)
+
+CLAUDE.md is the shared, checked-in map of this project -- keep it true. When a
+change alters how the system is built, run, deployed, or reasoned about, update
+CLAUDE.md in the SAME commit as the change (same discipline as the
+Test-with-code mandate). A stale guide is worse than none.
+
+Update REQUIRED when you:
+- Add / remove / rename a module, endpoint, webhook, or scheduled job
+- Change architecture, data flow, a deploy/build step, or the single-worker topology
+- Add / rename an env var, persistent file path, external service, or a key ID a
+  future session needs
+- Hit a non-obvious gotcha worth a row in Common Failure Modes
+- Change a documented behavior, owner ID, domain list, or routing/priority rule
+
+Update NOT needed for:
+- Version bumps, CACHEBUST, dependency bumps
+- Bug fixes already covered by existing docs/tests
+- One-off data operations, manual runs, or transient investigations (these live
+  in git history / the run record, not the guide)
+- Log lines, comments, user-facing copy tweaks
+
+Rules:
+- Map, not changelog (git log is the changelog); pointers, not a code mirror
+  (link to the file/symbol instead of copying logic).
+- If a change makes an existing line wrong, FIX or DELETE that line -- do not
+  just append.
+- ASCII-only; preserve CRLF (this file is CRLF, autocrlf=true).
