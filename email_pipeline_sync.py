@@ -891,6 +891,16 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
     return stats
 
 
+def run_daily(lookback_days: int = 3) -> dict:
+    """No-argv entrypoint for the scheduler. Scans a rolling lookback window
+    (default 3 days, so a missed run is covered by the next), logs to HubSpot,
+    and emails the run report. Ledger + HubSpot dedupe make the overlap safe."""
+    today = datetime.now(timezone.utc).date()
+    since = (today - timedelta(days=lookback_days)).isoformat()
+    until = (today + timedelta(days=1)).isoformat()
+    return run_sync(since, until, DEFAULT_MAILBOXES, dry_run=False, send_report=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync deal emails from Outlook to HubSpot")
     parser.add_argument("--since", help="Window start YYYY-MM-DD (backfill mode). Default: 3 days ago")

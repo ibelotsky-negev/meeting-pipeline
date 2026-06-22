@@ -174,7 +174,7 @@ via Claude (haiku), logs relevant emails to HubSpot as email engagements. Full s
 - Ledger: SQLite at `/data/email_pipeline_sync.db` (Railway volume) or project dir locally
 - UNCERTAIN classifications are never auto-logged -- they go to the run report for human review
 - Run report emailed to bk@negevlabs.com from BOT_SENDER_EMAIL
-- Daily scheduling: wire into APScheduler only AFTER backfill validation
+- Scheduled daily at 03:15 UTC via APScheduler (`email_sync_run` -> `email_pipeline_sync.run_daily`), 3-day rolling lookback; runs before the 03:45 digest so logged engagements are visible to it. Manual: `railway run python email_pipeline_sync.py`
 
 ## daily-pipeline-digest Module
 

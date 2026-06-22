@@ -160,6 +160,28 @@ def test_log_email_returns_failed_associations(monkeypatch):
     assert failed == ["deals:d1"]
 
 
+def test_run_daily_window_and_flags(monkeypatch):
+    captured = {}
+
+    def fake_run_sync(since, until, mailboxes, dry_run, send_report):
+        captured.update(since=since, until=until, mailboxes=mailboxes,
+                        dry_run=dry_run, send_report=send_report)
+        return {"logged": 1}
+
+    monkeypatch.setattr(eps, "run_sync", fake_run_sync)
+    result = eps.run_daily(lookback_days=3)
+
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone.utc).date()
+    # Scheduler contract: real write, report on, rolling lookback window
+    assert captured["dry_run"] is False
+    assert captured["send_report"] is True
+    assert captured["mailboxes"] == eps.DEFAULT_MAILBOXES
+    assert captured["since"] == (today - timedelta(days=3)).isoformat()
+    assert captured["until"] == (today + timedelta(days=1)).isoformat()
+    assert result == {"logged": 1}
+
+
 def test_log_email_all_associations_ok(monkeypatch):
     monkeypatch.setattr(eps, "hubspot_request",
                         lambda method, endpoint, data=None, params=None: {"id": "999"})

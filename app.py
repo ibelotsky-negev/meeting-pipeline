@@ -2884,6 +2884,7 @@ def teams_poll_now():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 _digest_lock = _threading.Lock()
+_email_sync_lock = _threading.Lock()
 
 
 @app.route("/digest/trigger", methods=["GET"])
@@ -3192,7 +3193,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.19.1-fyi-precision", "deployed": "2026-06-22"})
+    return jsonify({"version": "2.20.0-email-sync-schedule", "deployed": "2026-06-22"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3230,7 +3231,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.19.1-fyi-precision", "steps": {}}
+    results = {"version": "2.20.0-email-sync-schedule", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -3966,6 +3967,27 @@ def daily_digest_run():
         _digest_lock.release()
 
 
+def email_sync_run():
+    """Scheduled email-pipeline-sync run (email_pipeline_sync module).
+
+    Scans team mailboxes for deal correspondence, logs new deal-relevant
+    emails to HubSpot, and emails the run report. The module keeps its own
+    run ledger, so a failed run is covered by the next run's lookback window;
+    no retry logic is needed here."""
+    if not _email_sync_lock.acquire(blocking=False):
+        logger.warning("[email-sync] Skipped scheduled run -- email sync already running")
+        return
+    try:
+        logger.info("[email-sync] Starting scheduled email-pipeline-sync")
+        import email_pipeline_sync
+        email_pipeline_sync.run_daily()
+        logger.info("[email-sync] Email-pipeline-sync complete")
+    except Exception as e:
+        logger.error(f"[email-sync] Failed: {e}", exc_info=True)
+    finally:
+        _email_sync_lock.release()
+
+
 def biweekly_update_run():
     """Scheduled biweekly business update (biweekly_business_update module).
 
@@ -4055,6 +4077,15 @@ def start_scheduler():
         misfire_grace_time=3600,  # 1-hour window to fire if exact time was missed
     )
     _scheduler.add_job(
+        email_sync_run,
+        trigger="cron",
+        hour=3,             # 03:15 UTC = 06:15 Israel (IDT), before the digest reads HubSpot
+        minute=15,
+        id="email_pipeline_sync",
+        replace_existing=True,
+        misfire_grace_time=3600,  # 1-hour window to fire if exact time was missed
+    )
+    _scheduler.add_job(
         daily_digest_run,
         trigger="cron",
         hour=3,             # 03:45 UTC = 06:45 Israel (IDT), after the overnight email sync
@@ -4131,7 +4162,7 @@ def start_scheduler():
     _scheduler.start()
     pulse_job = _scheduler.get_job("weekly_pulse")
     next_run = pulse_job.next_run_time if pulse_job else "NOT REGISTERED"
-    logger.info(f"[scheduler] Started: polling every {POLL_INTERVAL_MINUTES}m, weekly pulse Sunday 19:00 UTC")
+    logger.info(f"[scheduler] Started: polling every {POLL_INTERVAL_MINUTES}m, weekly pulse Sunday 19:00 UTC, email sync daily 03:15 UTC")
     logger.info(f"[scheduler] Weekly pulse job registered: next run = {next_run}")
     logger.info(f"[scheduler] Teams subscription renewal every 12h; boot ensure at {boot_run_time}")
 
