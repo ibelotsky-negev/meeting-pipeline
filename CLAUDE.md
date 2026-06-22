@@ -136,6 +136,8 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/corrections/ingest` | Scan Sara's mailbox now for reply-corrections |
 | `/corrections/add` | Add a standing correction (`?text=`) |
 | `/corrections/delete` | Deactivate a correction (`?id=`) |
+| `/learn/run` | Manual Read/Learn digest run (`?dry_run=&backlog=&force=&limit=`) |
+| `/learn/status` | Last Read/Learn run outcome + live heartbeat (`live_progress`, `cluster_diag`) |
 
 ## Architecture Notes
 
@@ -149,6 +151,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Microsoft Graph** uses app-only auth (team-wide), refresh token persisted at `/data/refresh_token.txt`
 - **Teams transcripts** via Graph webhook subscription, renewed every 50 min via APScheduler
 - **To-Do sync** polls Asana tasks and creates matching Microsoft To-Do tasks for @negevlabs.com users
+- **Read/Learn Digest:** Friday 06:00 Asia/Jerusalem, drains Ken's Outlook "read/learn" folder, resolves each saved link, Opus cluster+curate against a Ken's-needs profile, emails one HTML digest + creates Asana keeper tasks (`learn_digest.py`). See the Read/Learn Digest Module section.
 
 ## email-pipeline-sync Module
 
@@ -167,6 +170,48 @@ via Claude (haiku), logs relevant emails to HubSpot as email engagements. Full s
 - Run report emailed to bk@negevlabs.com from BOT_SENDER_EMAIL
 - Daily scheduling: wire into APScheduler only AFTER backfill validation
 
+## Read/Learn Digest Module
+
+Standalone module (`learn_digest.py`) -- weekly drains Ken's Outlook "read/learn"
+folder, resolves each saved link (article -> Jina/trafilatura, YouTube ->
+transcript, podcast -> spoken.md, X -> Grok x_search), runs a per-item Sonnet
+summary, an Opus cluster+curate pass (best 1-2 per topic vs a Ken's-needs
+profile), a web_search currency check on fast-moving AI-tooling keepers, and
+emits one Friday HTML digest + Asana keeper tasks. Full spec:
+`read-learn-digest-spec.md`. Imported lazily by app.py (route handlers only), not
+at module load. Reuses Sara infra: Graph app-only token (via `email_pipeline_sync`),
+Claude client, send-email, the Pulse-style atomic lock pattern.
+
+- Scheduler: weekly **Friday 06:00 Asia/Jerusalem** (tz-aware cron). Atomic
+  `O_CREAT|O_EXCL` lock at `/data/learn_lock.json` (2h stale-reclaim);
+  processed-id dedup at `/data/learn_processed.json`. Mail moved to a read/learn
+  "Processed" childfolder, never deleted.
+- Endpoints: `/learn/run` (`?dry_run=&backlog=&force=&limit=`), `/learn/status`.
+  `backlog=1` is the manual "reprocess everything" switch (ignores processed-ids
+  AND the unread filter); default/cron runs are unread-only + skip-already-seen.
+- X content via the Grok Agent Tools API (`x_search`, `XAI_API_KEY`) -- NO X
+  bearer token. Optional resolver keys (XAI_API_KEY, SPOKEN_API_KEY, JINA_API_KEY)
+  are read at CALL TIME inside resolvers, never at module scope; an absent key
+  degrades that item to "content not retrieved" and never fabricates.
+- **Asana output** -> "Read/Learn Triage" project `1215897524719950`. Keeper
+  tasks (only `has_action` keepers) route to a section **deterministically** via
+  `route_section()` -- a FIRST-MATCH-WINS keyword table (`_ROUTING_RULES`) keyed
+  off the cluster topic + keeper subject/title/summary, with NO extra LLM call
+  (the LLM `bucket` tag is now informational only). Order: Health -> Negev Labs
+  (biotech/life-sci investing) -> Zirmania Family Office (general/non-biotech
+  investing) -> Travel Relay -> Ariadne Website -> Sara Pipeline -> General/
+  Reference (default). Biotech-vs-general tie-breaker IS the ordering (Negev
+  tested before Zirmania). Sara Pipeline = convention (b): only items paralleling
+  the Sara meeting-pipeline (OpenClaw/post-meeting/transcript/CoS builds + self-
+  referential Sara infra); general Claude tooling (Cowork/Obsidian/PKM) falls
+  through to General/Reference. The router NEVER targets the manual-only sections
+  (Untitled, Video to watch, Drop -- Not important).
+- **Priority** custom field set at creation: the Opus curate output emits a
+  per-keeper High/Med/Low (rubric in the prompt); single-item/fallback keepers
+  default Medium (Low if content-not-retrieved). Field GID **1199941453034656**
+  (High `...657` / Med `...658` / Low `...659`). GUARD: never use the duplicate
+  workspace Priority field `1206810235510187`.
+
 ## Common Failure Modes
 
 | Symptom | Cause | Fix |
@@ -178,6 +223,7 @@ via Claude (haiku), logs relevant emails to HubSpot as email engagements. Full s
 | Webhook handler misses state change | Trusting new_value from payload | Fetch from API instead |
 | /test returns 502 timeout | Sequential API calls too slow | Known issue, use /version + /config |
 | /pulse/check shows false | Missing Azure AD permissions | Ken must grant + admin consent |
+| Read/Learn task Priority blank/wrong | Duplicate Asana Priority field used | Use field 1199941453034656, NOT 1206810235510187 |
 
 ## Environment Variables (Railway)
 
