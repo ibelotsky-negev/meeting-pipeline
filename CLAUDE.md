@@ -266,8 +266,15 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
   `FYI_BROADCAST_DOMAINS` (ccsend/vccross/rflafferty/iangels) or an `OFFER//`
   subject -> NOISE; (3) **recency guard** drops anything received before the window
   cutoff; (4) **dedup** collapses repeated invites/reminders (key = sender +
-  subject stripped of RE:/FW:/Reminder:) so only one surfaces. The nuanced
-  1:1-vs-broadcast and automated-urgency-bait calls stay with the model.
+  subject stripped of RE:/FW:/Reminder:) so only one surfaces; (5) **held-company
+  IR** (FIX A, round 3): material IR (AGM / clinical readout / financing / M&A,
+  gated by `FYI_MATERIAL_IR_KEYWORDS`) from a tracked holding (`FYI_HELD_DOMAINS` /
+  `FYI_HELD_NAMES`: Solvonis, Xylo Bio, Filament Health, Reset Pharma, PharmAla,
+  BlaBlaCar, Estateguru, ...) -> IMPORTANT even from info@/no-reply. The nuanced
+  1:1-vs-broadcast and automated-urgency-bait calls stay with the model, and so
+  does the syndicate-platform allocation invite (FIX B): a SPECIFIC named-round
+  invite is IMPORTANT even via an ESP/no-reply (Concentric Series C), but the ESP
+  domain alone never auto-NOISEs and generic platform marketing stays NOISE.
 - **Dual gate (load-bearing):** a real move requires BOTH `?live=1` AND env
   `FYI_LIVE=1`. Absent either, the run is DRY (classify + log would-move, write no
   ids, move nothing). The daily cron passes `live=True`, so it ships DRY while
@@ -304,7 +311,7 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
 
 Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_API_KEY`, `ASANA_API_KEY`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`, `MS_GRAPH_TENANT_ID`, `HUBSPOT_OWNER_MAP`, `BOT_SENDER_EMAIL=sara@negevlabs.com`, `ASANA_PROJECT_GID=1213263339592202`, `ASANA_WORKSPACE_GID=597593980065511`
 
-FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY` / `FYI_BROADCAST_DOMAINS` (broker/ESP blast domains -> deterministic NOISE) and `INTERNAL_DOMAINS` (own-outbound -> deterministic NOISE).
+FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY` / `FYI_BROADCAST_DOMAINS` (broker/ESP blast domains -> deterministic NOISE) / `FYI_HELD_DOMAINS` + `FYI_HELD_NAMES` (tracked holdings -> material IR is deterministic IMPORTANT) and `INTERNAL_DOMAINS` (own-outbound -> deterministic NOISE).
 
 ## Current Known Issues
 

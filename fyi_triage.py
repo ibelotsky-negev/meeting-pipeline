@@ -131,6 +131,37 @@ FYI_BROADCAST_DOMAINS = [
 _OFFER_SUBJECT_RE = re.compile(r"^\s*offers?\s*//", re.I)
 _SUBJECT_PREFIX_RE = re.compile(r"^\s*(re|fw|fwd|reminder)\s*:\s*", re.I)
 
+# Held / tracked companies (FIX A, STATE B round 3). Material IR (AGM, clinical
+# readout, financing, M&A) FROM one of these is IMPORTANT even from info@/no-reply
+# with a generic salutation -- the classifier otherwise NOISEs portfolio IR for
+# lack of a holdings list. Keyed DETERMINISTICALLY on the company's OWN sender
+# domain (the IR comes from the company) or its name leading the subject (wire-
+# distributed IR), then gated by a materiality keyword so routine marketing from
+# the same company still falls through to the model. No structured holdings file
+# exists in the repo (briefing-book.md lists a partial portfolio as prose);
+# seeded from the known holdings/watchlist, env-overridable.
+FYI_HELD_DOMAINS = [
+    d.strip().lower() for d in os.environ.get(
+        "FYI_HELD_DOMAINS",
+        "solvonis.com,xylobio.com,diamondthera.com,filament.health,resetpharma.com,"
+        "pharmala.com,blablacar.com,estateguru.co",
+    ).split(",") if d.strip()
+]
+FYI_HELD_NAMES = [
+    n.strip().lower() for n in os.environ.get(
+        "FYI_HELD_NAMES",
+        "solvonis,awakn,xylo bio,xylobio,diamond therapeutics,filament health,reset pharma,"
+        "pharmala,blablacar,comuto,estateguru,reconnect labs",
+    ).split(",") if n.strip()
+]
+# Materiality gate: genuine IR-event words (NOT generic "update"/"newsletter").
+FYI_MATERIAL_IR_KEYWORDS = (
+    "announce", "annual general meeting", "agm", "shareholder", "results", "readout",
+    "topline", "top-line", "data", "phase 1", "phase 2", "phase 3", "phase i", "phase ii",
+    "phase iii", "clinical", "trial", "financing", "fundrais", "placing", "offering",
+    "acquisition", "merger", "m&a", "milestone", "approval", "dividend", "interim",
+)
+
 
 def fyi_live_enabled() -> bool:
     """Second of the two gates: the FYI_LIVE env switch. Read at CALL TIME so a
@@ -177,10 +208,15 @@ IMPORTANT (surface it) -- any of:
 - A REAL PERSON writing TO Ken in a 1:1 message (or a 1:1 reply) with a specific ask --
   including a named individual writing inside an otherwise-marketing or form email. The test is
   "is this addressed to Ken specifically?", not "does it contain a name?".
-- Deal flow / co-invest / investor or partner outreach with real substance directed at Ken
-  specifically (a specific opportunity, a real intro, a term or allocation conversation).
+- Deal flow / co-invest / investor or partner outreach with real substance: a SPECIFIC funding-
+  round allocation/investment invite (a named company + round + an allocation/participation ask)
+  is IMPORTANT deal flow EVEN when delivered via a syndicate/ESP platform or a no-reply address
+  (e.g. a "Series C invite"). Judge by the specific deal + ask, NOT the delivery channel.
 - Portfolio / watchlist investor-relations or governance for a company Ken actually holds or
-  tracks: an AGM notice, a shareholder letter, a material corporate action.
+  tracks (Solvonis/ex-AWAKN, Xylo Bio, Diamond Therapeutics, Filament Health, Reset Pharma,
+  PharmAla, BlaBlaCar/Comuto, Estateguru, ...): material IR is IMPORTANT even from info@/no-reply
+  with a generic salutation -- an AGM notice, a clinical readout, a financing, an M&A/corporate
+  action, a shareholder letter.
 
 Confirmed IMPORTANT examples:
   1. A YC SAFE signature request (Kinro via HelloSign / "Signature requested" -- Ken must sign).
@@ -213,7 +249,10 @@ NOISE (leave it in place) -- do NOT surface. This is the large majority:
   (iAngels), "LingoPure Capital Raise" (Constant Contact), "invitation to Meridian by AngelList"
   (product launch), a WilmerHale "Pentagon Adds 65 Entities" mass alert, an off-thesis cold
   "Series A: Disruptive HVAC Hardware" broadcast, AngelList/PharmAla marketing IR blasts,
-  Estateguru/Republic mass updates.
+  Estateguru/Republic mass updates. EXCEPTION (do NOT NOISE these): a SPECIFIC named-round
+  allocation invite to participate (see IMPORTANT above) -- only GENERIC platform marketing
+  (newsletters, "Dear Investor" digests, event promos, product launches) stays NOISE; and
+  MATERIAL IR from a company Ken holds/tracks (see IMPORTANT above).
 - Meeting-automation echo: Fireflies, Humantic, Zoom bot join/recap/prep, "Notetaker has
   joined", "Meeting Prep", "Your meeting recap", "Catch up on yesterday".
 - LinkedIn and social notifications (invitations, profile views, job listings, network digests).
@@ -474,6 +513,23 @@ def _is_broadcast(msg: dict) -> bool:
     return bool(_OFFER_SUBJECT_RE.match(msg.get("subject") or ""))
 
 
+def _is_held_company_ir(msg: dict) -> bool:
+    """True if this is material IR (AGM, clinical readout, financing, M&A) FROM a
+    held/tracked company (FIX A). Pure function -- no LLM. The company is
+    identified by its own sender domain OR its name leading the subject; gated by
+    a materiality keyword so routine marketing from the same company is NOT
+    surfaced. An UNHELD company's identical-shape press release returns False."""
+    subj = (msg.get("subject") or "").strip().lower()
+    dom = _sender_domain(_sender_address(msg))
+    by_domain = bool(dom) and any(dom == d or dom.endswith("." + d) for d in FYI_HELD_DOMAINS)
+    by_name = any(subj.startswith(n) for n in FYI_HELD_NAMES)
+    if not (by_domain or by_name):
+        return False
+    body = eps.html_to_text(((msg.get("body") or {}).get("content")) or "") or ""
+    text = (subj + " " + body[:2000]).lower()
+    return any(kw in text for kw in FYI_MATERIAL_IR_KEYWORDS)
+
+
 def _normalize_subject(subject: str) -> str:
     """Lowercased subject with leading RE:/FW:/FWD:/Reminder: prefixes stripped
     (repeatedly), for dedup keying."""
@@ -574,6 +630,8 @@ def classify_message(msg: dict, call_fn=None) -> tuple:
     sender = _sender_address(msg)
     if _is_internal_sender(sender):
         return "NOISE", "internal-domain sender (own outbound / sent-copy / reply thread)"
+    if _is_held_company_ir(msg):
+        return "IMPORTANT", "material IR from a held/tracked portfolio company"
     if _is_broadcast(msg):
         return "NOISE", "mass broadcast / broker blast (not a 1:1 message to Ken)"
     call_fn = call_fn or _call_claude_text

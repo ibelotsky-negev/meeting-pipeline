@@ -695,6 +695,143 @@ class TestRunDedup:
         assert ft._normalize_subject("RE: Foo") == ft._normalize_subject("FW: Foo") == ft._normalize_subject("Foo")
 
 
+# ======================================================================
+#  12. STATE B round 3 -- two confirmed false negatives, same root: the
+#  classifier could not recognize (A) portfolio-holding IR or (B) an
+#  allocation invite delivered via a syndicate platform.
+# ======================================================================
+
+class TestFixAPortfolioHoldings:
+    """Material IR (AGM, clinical readout, financing, M&A) from a HELD/TRACKED
+    company is IMPORTANT even from info@/no-reply with a generic salutation.
+    Deterministic holdings lookup -- no LLM."""
+
+    def test_solvonis_svn002_readout_is_important_without_llm(self):
+        called = {"n": 0}
+
+        def boom(p, m):
+            called["n"] += 1
+            return '{"decision":"NOISE","reason":"no evidence Solvonis is a holding"}'
+
+        msg = _msg("pa1", "Solvonis Announces Positive SVN-002 Bridging Data", "info@solvonis.com",
+                   "Solvonis announces positive topline data from the SVN-002 bridging study.")
+        d, _ = ft.classify_message(msg, call_fn=boom)
+        assert d == "IMPORTANT"
+        assert called["n"] == 0  # decided deterministically by the holdings lookup
+
+    def test_solvonis_agm_is_important(self):
+        msg = _msg("pa2", "Solvonis Announces Result of Annual General Meeting", "info@solvonis.com",
+                   "The Company announces the results of its Annual General Meeting; all resolutions passed.")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "IMPORTANT"
+
+    def test_unheld_company_press_release_is_noise(self):
+        # Identical-shape press release from an UNHELD company -> NOISE.
+        msg = _msg("pa3", "Acme Bio Announces Positive Phase 2 Data", "info@acmebio.com",
+                   "Acme Bio announces positive topline data from its Phase 2 study.")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "NOISE"
+
+    def test_held_generic_marketing_still_noise(self):
+        # A held company's NON-material marketing has no IR keyword -> falls
+        # through to the model and stays NOISE.
+        msg = _msg("pa4", "Solvonis quarterly newsletter", "info@solvonis.com",
+                   "Read our latest blog post and follow us on social media.")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "NOISE"
+
+    def test_is_held_company_ir_helper(self):
+        held_material = _msg("h1", "Solvonis Announces Positive SVN-002 Data", "info@solvonis.com",
+                             "positive topline data")
+        assert ft._is_held_company_ir(held_material) is True
+        held_generic = _msg("h2", "Solvonis monthly digest", "info@solvonis.com",
+                            "Follow our blog and socials.")
+        assert ft._is_held_company_ir(held_generic) is False  # no material IR keyword
+        unheld_material = _msg("h3", "Acme Announces Phase 2 Data", "info@acmebio.com",
+                               "positive topline data")
+        assert ft._is_held_company_ir(unheld_material) is False
+
+
+class TestFixBSyndicateInvite:
+    """A specific funding-round allocation/investment invite is deal flow even via
+    a syndicate/ESP platform. Only generic platform marketing stays NOISE. The ESP
+    domain must NOT auto-NOISE."""
+
+    def test_concentric_series_c_invite_is_important(self):
+        msg = _msg("sb1", "Concentric AI Series C Invite", "noreply@mail1.syndicategroup.com",
+                   "You are invited to participate in the Concentric AI Series C with an allocation.")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "IMPORTANT"
+
+    def test_generic_syndicate_newsletter_is_noise(self):
+        msg = _msg("sb2", "Weekly syndicate digest", "noreply@mail1.syndicategroup.com",
+                   "Dear Investor, here are this week's deals and an event invite across the platform.")
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "NOISE"
+
+    def test_syndicate_domain_does_not_auto_noise(self):
+        # The ESP domain alone must not be a deterministic broadcast NOISE (unlike
+        # the broker OFFER// domains), so a real invite can reach the model.
+        assert ft._is_broadcast(_msg("x", "Concentric AI Series C Invite",
+                                     "noreply@mail1.syndicategroup.com", "")) is False
+
+    def test_broker_offer_blast_still_noise(self):
+        # Must NOT re-leak VCCross/Lafferty OFFER// broker blasts.
+        assert ft.classify_message(_msg("x", "OFFERS// Crusoe, Figure AI", "invest@vccross.com", "..."),
+                                   call_fn=lambda p, m: '{"decision":"IMPORTANT"}')[0] == "NOISE"
+
+
+# Permanent keep-set: these 11 must stay IMPORTANT forever. Re-confirmed every run.
+KEEP_SET = [
+    _msg("ks1", "Signature requested by YC Safes", "noreply@mail.hellosign.com",
+         "Please sign the SAFE for Kinro - investment by Ken Belotsky."),
+    _msg("ks2", "New form submission on Webflow for Negev-Labs", "no-reply-forms@webflow.com",
+         "Noah Petermann, CEO of Aniva Health, submitted the contact form: I'd like to discuss a raise."),
+    _msg("ks3", "Solvonis Announces Result of Annual General Meeting", "info@solvonis.com",
+         "The Company announces the results of its Annual General Meeting; all resolutions passed."),
+    _msg("ks4", "Sponsorship opportunity -- psychedelics conference", "events@psychsummit.org",
+         "Hi Ken, this is Yanis Dida. I'd love to discuss Negev sponsoring our psychedelics conference."),
+    _msg("ks5", "Concentric AI Series C Invite", "noreply@mail1.syndicategroup.com",
+         "You are invited to participate in the Concentric AI Series C with an allocation."),
+    _msg("ks6", "Relay banking invitation", "invites@relayfi.com",
+         "Alexander Kubasov invited you to set up Negev's Relay business banking account."),
+    NAMED_INSIDE_MARKETING,
+    _msg("ks8", "Zirmania Team, Secondary Opportunity in Ramp", "matthew.bell@forgeglobal.com",
+         "Hi Ken, a secondary opportunity in Ramp -- can Zirmania take an allocation this week? Matthew"),
+    _msg("ks9", "Authorize your card payment", "noreply@revolut.com",
+         "Please authorize a card payment of $4,200 to complete the transaction."),
+    _msg("ks10", "Solvonis Announces Positive SVN-002 Bridging Data", "info@solvonis.com",
+         "Solvonis announces positive topline data from the SVN-002 bridging study."),
+    _msg("ks11", "Re: Negev Capital // Dakota", "jkovaleski@dakota.com",
+         "Hi Ken, following up on Negev Capital -- can Negev take an allocation? Best, Jordan"),
+]
+
+# Permanent noise-set: these must stay NOISE.
+NOISE_SET = [
+    _msg("nsx1", "Negev Labs Q2 2026 Update", "bk@negevcap.com",
+         "Dear investors, our Q2 update with wire details and a lot of substance."),
+    _msg("nsx2", "[Action required] Retirement notice for Claude Sonnet 4", "notice@email.anthropic.com",
+         "The Claude Sonnet 4 model will be retired. Automated product notice; no action."),
+    _msg("nsx3", "Reminder: Important update regarding your PayPal account", "noreply@news.paypal.com",
+         "Important update regarding your PayPal account policy."),
+    _msg("nsx4", "OFFERS// Crusoe, Figure AI", "invest@vccross.com", "Broker offer sheet."),
+    _msg("nsx5", "OFFER// Replit / Figure", "jgelet@rflafferty.com", "Broker offer sheet."),
+    _msg("nsx6", "REMINDER: Invitation to invest in SportsCenter", "myteam@iangels.com",
+         "Syndicate reminder to join the round."),
+    _msg("nsx7", "Ship your first AI agent in a day", "theaicorner1@substack.com",
+         "This week's newsletter; subscribe."),
+    _msg("nsx8", "Weekly syndicate digest", "noreply@mail1.syndicategroup.com",
+         "Dear Investor, this week's deals across the platform."),
+    _msg("nsx9", "Acme Bio Announces Positive Phase 2 Data", "info@acmebio.com",
+         "Acme Bio announces positive topline data from its Phase 2 study."),
+]
+
+
+class TestKeepSetRegression:
+    @pytest.mark.parametrize("msg", KEEP_SET, ids=lambda m: m["id"])
+    def test_keep_set_stays_important(self, msg):
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "IMPORTANT"
+
+    @pytest.mark.parametrize("msg", NOISE_SET, ids=lambda m: m["id"])
+    def test_noise_set_stays_noise(self, msg):
+        assert ft.classify_message(msg, call_fn=_oracle)[0] == "NOISE"
+
+
 class TestEndpoints:
     def test_status_returns_module_status(self, flask_client, monkeypatch):
         monkeypatch.setattr(ft, "read_status",
