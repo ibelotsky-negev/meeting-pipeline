@@ -132,6 +132,8 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/pulse/history` | Browse archived pulse reports |
 | `/biweekly/trigger` | Manual biweekly business update (`?dry_run=&sync=&force=&start=&end=`) |
 | `/biweekly/status` | Last biweekly update run outcome |
+| `/digest/trigger` | Manual daily pipeline (CRM activity) digest (`?dry_run=&sync=`) |
+| `/digest/status` | Last daily pipeline digest run outcome |
 | `/corrections` | List active standing corrections (`?all=true` incl. inactive) |
 | `/corrections/ingest` | Scan Sara's mailbox now for reply-corrections |
 | `/corrections/add` | Add a standing correction (`?text=`) |
@@ -144,13 +146,14 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Phase 1 (auto):** Fireflies/Teams triggers -> Claude extracts intelligence -> notification email sent with review link
 - **Phase 2 (manual):** Organizer opens review page -> edits tasks/email -> clicks Approve -> HubSpot + Asana + Outlook actions created
 - **Weekly Pulse:** Sunday 22:00 IST, scans all team emails/Teams/meetings, 4-pass Claude analysis, Green/Yellow/Red report emailed to Ken
-- **Biweekly Business Update:** every other Monday 07:15 IST, distills the trailing ~2 weeks of pulse archives into a team-facing, technical-detail-free business update emailed to Ken to forward (`biweekly_business_update.py`; weekly Monday cron gated to every other week by `should_run_biweekly`)
+- **Biweekly Business Update:** every other Monday 07:15 IST, distills the trailing ~2 weeks of pulse archives into a team-facing, technical-detail-free business update written in Ken's first-person voice for him to forward (`biweekly_business_update.py`; weekly Monday cron gated to every other week by `should_run_biweekly`)
 - **Standing Corrections:** Ken replies to a pulse/biweekly email with a correction; `sara_corrections.py` ingests it from Sara's mailbox (scheduled every 20 min) and injects it as an authoritative override into both the pulse synthesis and the biweekly distill. Baseline correction (Ariadne fundraising structure) is always applied. Store: `/data/sara_corrections.json`
 - **Pending approvals** stored in `/data/pending_approvals.json` (Railway persistent volume at `/data/`)
 - **Pulse archives** stored in `/data/pulse/{YYYY}-W{WW}.json`
 - **Microsoft Graph** uses app-only auth (team-wide), refresh token persisted at `/data/refresh_token.txt`
 - **Teams transcripts** via Graph webhook subscription, renewed every 50 min via APScheduler
 - **To-Do sync** polls Asana tasks and creates matching Microsoft To-Do tasks for @negevlabs.com users
+- **Daily Pipeline Digest:** daily 06:45 IST (03:45 UTC), compiles every change + new activity in the NL 2026 Fundraise HubSpot pipeline over the trailing window (default 24h, resilient to missed runs), narrates deltas rather than state, applies Negev operating rules (stale-deal / overdue-task / wire-watch flags), and emails Ken a single morning brief (`daily_pipeline_digest.py`). See the daily-pipeline-digest Module section.
 - **Read/Learn Digest:** Friday 06:00 Asia/Jerusalem, drains Ken's Outlook "read/learn" folder, resolves each saved link, Opus cluster+curate against a Ken's-needs profile, emails one HTML digest + creates Asana keeper tasks (`learn_digest.py`). See the Read/Learn Digest Module section.
 
 ## email-pipeline-sync Module
@@ -169,6 +172,25 @@ via Claude (haiku), logs relevant emails to HubSpot as email engagements. Full s
 - UNCERTAIN classifications are never auto-logged -- they go to the run report for human review
 - Run report emailed to bk@negevlabs.com from BOT_SENDER_EMAIL
 - Daily scheduling: wire into APScheduler only AFTER backfill validation
+
+## daily-pipeline-digest Module
+
+Standalone module (`daily_pipeline_digest.py`) -- compiles every change and new
+activity in the NL 2026 Fundraise HubSpot pipeline over the previous window
+(default 24h, resilient to missed runs via a persisted last-run watermark) and
+emails Ken a single readable morning brief. Covers all deal owners, narrates
+deltas rather than state, links deals/activities to their HubSpot records, and
+applies Negev operating rules deterministically (stale-deal, overdue-task,
+wire-watch flags). Composer model: haiku. Shares credentials, HTTP helpers, and
+the SQLite ledger file with `email_pipeline_sync.py` (imported as `eps`).
+
+- Scheduler: daily **06:45 Israel (03:45 UTC)** via APScheduler. Manual:
+  `/digest/trigger` (`?dry_run=&sync=`), `/digest/status` for the last-run
+  outcome. CLI: `python daily_pipeline_digest.py [--since YYYY-MM-DD] [--dry-run]`.
+- Degrades gracefully when HubSpot read scopes are missing (reports the gap,
+  does not crash). Status persisted at `/data/daily_pipeline_digest_status.json`.
+- Recipients: `DIGEST_RECIPIENTS` (default bk@negevlabs.com); optional
+  `DIGEST_CC`. Pipeline: `DIGEST_PIPELINE_ID` (defaults to the shared id).
 
 ## Read/Learn Digest Module
 
@@ -224,6 +246,7 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
 | /test returns 502 timeout | Sequential API calls too slow | Known issue, use /version + /config |
 | /pulse/check shows false | Missing Azure AD permissions | Ken must grant + admin consent |
 | Read/Learn task Priority blank/wrong | Duplicate Asana Priority field used | Use field 1199941453034656, NOT 1206810235510187 |
+| Daily digest owner names blank / 403 | Missing HubSpot crm.objects.owners.read scope | Grant + reconnect HubSpot (granted 2026-06-14) |
 
 ## Environment Variables (Railway)
 
