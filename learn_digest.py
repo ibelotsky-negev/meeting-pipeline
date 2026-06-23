@@ -123,6 +123,15 @@ _ROUTING_RULES = [
         "deal sourcing", "deal-sourcing", "gp/lp", "storyteller",
         "asset allocation", "saas vs biotech", "family office", "hedge fund",
         "valuation",
+        # Financial deal-analysis / investment-workflow automation tooling routes
+        # here by default (Zirmania = general non-biotech investing/automation).
+        # Biotech is tested first, so a biotech deal-analysis tool still lands
+        # Negev; only a build-it-yourself meeting-pipeline parallel goes to Sara.
+        "financial services", "financial workflow", "financial model",
+        "deal analysis", "deal-analysis", "deal data", "deal-data",
+        "due diligence", "due-diligence", "investment workflow",
+        "investment-workflow", "underwriting", "bloomberg", "factset",
+        "pitchbook", "capital iq", "dcf", "lbo",
     )),
     ("Travel Relay", (
         "travel", "flight", "booking", "itinerary", "hotel", "airline", "kiwi",
@@ -207,6 +216,12 @@ KEN_PROFILE = """Ken Belotsky's working context (judge "best for KEN", not "most
   Anthropic Managed Agents, MCP connectors, Google Apps Script, HubSpot, Asana,
   Microsoft Graph/Teams, Telegram bots. Disciplines: SVL (self-verifying loop),
   one-chat-one-deployable-unit, spec-in-claude.ai then implement-in-Claude-Code.
+- INCLUDE-HIGH signal: financial deal-analysis / investment-workflow automation tooling
+  (Claude for Financial Services, valuation/DCF/LBO modeling, due-diligence or deal-data
+  automation agents, Bloomberg/FactSet/PitchBook-class pulls). This is Zirmania family-office
+  core AND feeds Ken's own automation builds -- always KEEP it and rate it High; it OUTRANKS
+  the generic "AI tooling = Medium" default. Generic dev/coding tooling with no financial /
+  deal-analysis purpose stays Medium.
 - "Best" = most applicable to how Ken actually works AND most current -- not most popular.
 - Currency matters most for AI-tooling (Claude Code, Cowork, MCP, skills, agent frameworks,
   models): these change monthly. Biotech, investing, and health age slowly and are judged on
@@ -933,7 +948,7 @@ def curate_cluster(cluster: dict, profile: str = KEN_PROFILE, call_fn=None) -> d
         it["why"] = "only item in this cluster"
         it["bucket"] = DEFAULT_BUCKET
         it["topic"] = topic
-        it["priority"] = _default_priority(it)
+        it["priority"] = _apply_priority_floor(it, _default_priority(it))
         it["has_action"] = False
         it["action"] = ""
         return {"topic": topic, "keepers": [it], "superseded": []}
@@ -958,6 +973,13 @@ def curate_cluster(cluster: dict, profile: str = KEN_PROFILE, call_fn=None) -> d
         "- High: live and actionable for Ken's active builds, the Ariadne raise, or portfolio "
         "diligence (fundraising targets, psychedelic/biotech news, CLAUDE.md/loop discipline he "
         "is actively using, valuation/DD frameworks, the flight MCP for Travel).\n"
+        "- High (financial/investment tooling): tools, platforms, or agents that DO financial "
+        "deal analysis or its automation -- valuation/DCF/LBO modeling, due-diligence automation, "
+        "investment-workflow automation, or deal-data pulls (Bloomberg/FactSet/PitchBook-class). "
+        "This serves Zirmania family-office deal analysis AND Ken's own automation builds, and "
+        "OUTRANKS the generic AI-tooling = Medium default. The discriminator is 'does the tool DO "
+        "financial/investment/deal analysis or its automation?'; generic dev/coding tooling with "
+        "no financial/deal-analysis purpose stays Medium.\n"
         "- Medium: relevant background, worth evaluating but not time-sensitive (most general AI "
         "tooling, conference notes, macro/IR references, secondary tools).\n"
         "- Low: tangential or evergreen (personal-product pages, market-doom commentary, "
@@ -985,7 +1007,7 @@ def curate_cluster(cluster: dict, profile: str = KEN_PROFILE, call_fn=None) -> d
             it["why"] = (k.get("why") or "").strip() or "best fit for Ken's current work"
             it["bucket"] = _normalize_bucket(k.get("bucket"))
             it["topic"] = topic
-            it["priority"] = _normalize_priority(k.get("priority"))
+            it["priority"] = _apply_priority_floor(it, _normalize_priority(k.get("priority")))
             it["has_action"] = bool(k.get("has_action"))
             it["action"] = (k.get("action") or "").strip()
             keepers.append(it)
@@ -998,7 +1020,7 @@ def curate_cluster(cluster: dict, profile: str = KEN_PROFILE, call_fn=None) -> d
         it["why"] = "most recent item in the cluster (auto-selected)"
         it["bucket"] = DEFAULT_BUCKET
         it["topic"] = topic
-        it["priority"] = _default_priority(it)
+        it["priority"] = _apply_priority_floor(it, _default_priority(it))
         it["has_action"] = False
         it["action"] = ""
         keepers.append(it)
@@ -1032,9 +1054,16 @@ def is_fast_moving(topic: str) -> bool:
 
 def currency_check(keeper: dict, topic: str, mode: str = None, call_fn=None) -> dict:
     """For a keeper in a fast-moving AI-tooling cluster, confirm it is still
-    current; if superseded, annotate keeper['currency_note'] with the newer
-    resource. Gated by LEARN_CURRENCY_CHECK (fast-moving|off|all). The web call
-    is NOT made for skipped clusters."""
+    current; annotate keeper['currency_note']. Gated by LEARN_CURRENCY_CHECK
+    (fast-moving|off|all). The web call is NOT made for skipped clusters.
+
+    The check assesses TWO INDEPENDENT axes -- (1) is the approach superseded,
+    (2) can the item's SPECIFIC claim (a named repo/feature) be verified -- and
+    keeps them separate. An unverifiable sub-claim is recorded as an
+    informational caveat ONLY: it never frames the item as superseded/fabricated
+    and never downgrades priority. Relevance is judged by curation, not by
+    whether one sub-claim could be web-confirmed (the 2026-06-23 over-hedge
+    fix). currency_check itself never touches keeper['priority']."""
     mode = mode or LEARN_CURRENCY_CHECK
     if mode == "off":
         return keeper
@@ -1043,10 +1072,17 @@ def currency_check(keeper: dict, topic: str, mode: str = None, call_fn=None) -> 
 
     call_fn = call_fn or _call_claude_web
     prompt = (
-        "Today, is the tool/approach below still the current best practice, or has it been "
-        "superseded by something newer? Use web search to check. Be concise.\n"
-        'Return ONLY a JSON object: {"current": true/false, "note": "if superseded, name the '
-        'newer canonical tool/resource in one line; else empty"}.\n\n'
+        "Assess the item below on TWO INDEPENDENT axes. Use web search. Be concise.\n"
+        "1) current: is the general tool/approach still current best practice, or has it "
+        "been superseded by something newer?\n"
+        "2) verifiable: can you confirm the item's SPECIFIC factual claim (e.g. a named "
+        "open-source repo, product, or feature actually exists)?\n"
+        "Keep them SEPARATE: if you cannot verify a specific sub-claim but the underlying "
+        "capability is real and plausible, set verifiable=false and current=true -- do NOT "
+        "mark it superseded merely because a sub-claim is unverifiable.\n"
+        'Return ONLY a JSON object: {"current": true/false, "verifiable": true/false, '
+        '"note": "one line -- if superseded, name the newer canonical resource; if a '
+        'sub-claim is unverifiable, say which; else empty"}.\n\n'
         "Topic: " + (topic or "") + "\n"
         "Item title: " + (keeper.get("title") or "") + "\n"
         "Item date: " + str(keeper.get("content_date")) + "\n"
@@ -1058,10 +1094,20 @@ def currency_check(keeper: dict, topic: str, mode: str = None, call_fn=None) -> 
     except Exception as e:
         logger.warning(f"[learn] currency check failed: {e}")
         return keeper
-    if parsed.get("current") is False:
-        note = (parsed.get("note") or "").strip()
+    verifiable = parsed.get("verifiable")
+    current = parsed.get("current")
+    note = (parsed.get("note") or "").strip()
+    # Unverifiable sub-claim but NOT superseded -> caveat only; relevance intact.
+    # (verifiable absent -> None -> falls through to the current-based branches,
+    # preserving the original binary behavior.)
+    if verifiable is False and current is not False:
+        keeper["currency_note"] = (
+            "specific claim unverified" + (": " + note if note else "")
+            + " -- kept on relevance; underlying capability stands"
+        )
+    elif current is False:
         keeper["currency_note"] = "likely superseded" + (": " + note if note else "")
-    elif parsed.get("current") is True:
+    elif current is True:
         keeper["currency_note"] = "confirmed current"
     return keeper
 
@@ -1187,6 +1233,57 @@ def _default_priority(item: dict) -> str:
     clusters and the deterministic fallback): content-not-retrieved items
     are Low per the rubric; everything else defaults to Medium."""
     return "Low" if item.get("partial") else "Medium"
+
+
+# Financial deal-analysis / investment-workflow automation tooling is Zirmania
+# family-office core AND feeds Ken's own automation builds, so this class is
+# HIGH priority -- it OUTRANKS the generic "AI tooling = Medium" default. The
+# discriminator is "does the tool DO financial/investment/deal analysis or its
+# automation?": a finance-domain signal AND a tooling/agent/automation signal
+# must BOTH be present, so generic dev/coding tooling (no finance signal) stays
+# Medium and finance NEWS with no tool (no tooling signal) is not elevated.
+# Finance terms use word boundaries so "valuation" does NOT match "evaluation"
+# (model-eval is everywhere in AI-tooling content).
+_FINANCE_SIGNAL_RE = re.compile(
+    r"\b("
+    r"financial[ -]?(?:workflow|service|services|model|modeling|modelling|analy\w+)"
+    r"|deal[ -]?(?:analysis|analytics|sourcing|data|flow|memo)"
+    r"|due[ -]?diligence|diligence automation"
+    r"|valuation|dcf|discounted cash flow|lbo|leveraged buyout"
+    r"|investment[ -]?(?:workflow|analysis|analytics|research|committee|memo)"
+    r"|underwriting|wall street|bloomberg|factset|pitchbook|capital iq|capiq|cap table"
+    r")\b",
+    re.I,
+)
+# Substring tooling signals (safe: no bare "ai"/"api"/"app" which collide with
+# common words like email/capital/happen). "model" intentionally covers
+# modeling; "automat" covers automation/automate/automated.
+_TOOLING_SIGNALS = (
+    "agent", "automat", "workflow", "tool", "platform", "software", "copilot",
+    "assistant", "llm", "claude", "gpt", "mcp", "pipeline", "open-source",
+    "open source", "framework", "model",
+)
+
+
+def _is_financial_workflow_tool(item: dict) -> bool:
+    """True when an item is tooling/platform/agent for financial deal analysis
+    or its automation (the HIGH-priority Zirmania/own-builds class). Requires a
+    finance-domain signal AND a tooling signal across the same text route_section
+    reads (topic + subject + title + summary + specifics)."""
+    text = " ".join(str(item.get(k) or "") for k in
+                    ("topic", "subject", "title", "summary", "specifics")).lower()
+    if not _FINANCE_SIGNAL_RE.search(text):
+        return False
+    return any(sig in text for sig in _TOOLING_SIGNALS)
+
+
+def _apply_priority_floor(item: dict, priority: str) -> str:
+    """Floor financial deal-analysis / investment-workflow automation tooling to
+    High, overriding a lower model/default verdict. The relevance is Ken's, not
+    the model's, to downrank (the 2026-06-23 under-rating fix)."""
+    if priority != "High" and _is_financial_workflow_tool(item):
+        return "High"
+    return priority
 
 
 def route_section(keeper: dict) -> str:

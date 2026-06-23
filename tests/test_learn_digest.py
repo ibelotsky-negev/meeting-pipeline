@@ -175,6 +175,98 @@ class TestCuration:
 
 
 # ----------------------------------------------------------------------
+#  5b. FIX 1: financial deal-analysis / investment-workflow automation tooling
+#      is the HIGH-priority class -- it OUTRANKS the generic AI-tooling = Medium
+#      default; generic dev/coding tooling stays Medium.
+# ----------------------------------------------------------------------
+
+class TestFinancialPriorityClass:
+    def _fin_item(self, **kw):
+        base = {
+            "title": "Anthropic open-sources Wall Street financial-workflow agents",
+            "type": "article", "subject": "Claude for Financial Services",
+            "content_date": "2026-06-20",
+            "summary": ("Open-source agents that automate financial deal analysis and "
+                        "investment-workflow tasks (valuation, due-diligence data pulls)."),
+            "specifics": [], "partial": False,
+        }
+        base.update(kw)
+        return base
+
+    def _generic_code_item(self, **kw):
+        base = {
+            "title": "New GitHub Copilot autocomplete for developers",
+            "type": "article", "subject": "Copilot",
+            "content_date": "2026-06-20",
+            "summary": "A coding assistant that suggests code completions in your IDE.",
+            "specifics": [], "partial": False,
+        }
+        base.update(kw)
+        return base
+
+    def test_detector_flags_financial_workflow_tool(self):
+        assert ld._is_financial_workflow_tool(self._fin_item()) is True
+
+    def test_detector_ignores_generic_coding_tool(self):
+        assert ld._is_financial_workflow_tool(self._generic_code_item()) is False
+
+    def test_detector_ignores_model_evaluation_false_positive(self):
+        # "evaluation" must NOT trip the "valuation" finance signal.
+        item = {"title": "A harness for LLM model evaluation", "subject": "evals",
+                "summary": "Run model evaluation suites with this agent framework.",
+                "topic": "", "specifics": []}
+        assert ld._is_financial_workflow_tool(item) is False
+
+    def test_finance_tool_floored_to_high_single_item(self):
+        # single-item cluster default is Medium; the finance floor lifts to High.
+        out = ld.curate_cluster({"topic": "Claude for Financial Services",
+                                 "items": [self._fin_item()]})
+        assert out["keepers"][0]["priority"] == "High"
+
+    def test_generic_coding_stays_medium_single_item(self):
+        out = ld.curate_cluster({"topic": "Coding assistants",
+                                 "items": [self._generic_code_item()]})
+        assert out["keepers"][0]["priority"] == "Medium"
+
+    def test_finance_floor_overrides_model_medium(self):
+        # the model judges Medium; the deterministic floor must override to High.
+        items = [self._fin_item(),
+                 self._fin_item(title="FactSet ships a deal-data agent")]
+
+        def fake_call(prompt, model):
+            return json.dumps({
+                "keepers": [{"index": 0, "why": "best", "bucket": "Zirmania Family Office",
+                             "priority": "Medium", "has_action": False, "action": ""}],
+                "superseded": [{"index": 1, "reason": "dup"}],
+            })
+
+        out = ld.curate_cluster({"topic": "Claude for Financial Services", "items": items},
+                                call_fn=fake_call)
+        assert out["keepers"][0]["priority"] == "High"
+
+    def test_generic_coding_not_floored_model_medium_stays(self):
+        items = [self._generic_code_item(),
+                 self._generic_code_item(title="Cursor tab improvements")]
+
+        def fake_call(prompt, model):
+            return json.dumps({
+                "keepers": [{"index": 0, "why": "best", "bucket": "General/Reference",
+                             "priority": "Medium", "has_action": False, "action": ""}],
+                "superseded": [{"index": 1, "reason": "dup"}],
+            })
+
+        out = ld.curate_cluster({"topic": "Coding assistants", "items": items},
+                                call_fn=fake_call)
+        assert out["keepers"][0]["priority"] == "Medium"
+
+    def test_finance_tool_routes_to_zirmania(self):
+        # routing decision: this class -> Zirmania Family Office by default.
+        gid = ld.route_section(self._fin_item(
+            topic="Claude for Financial Services deal-analysis agents"))
+        assert gid == ld.LEARN_SECTION_GID["Zirmania Family Office"]
+
+
+# ----------------------------------------------------------------------
 #  6. Currency check: annotate superseded keeper; skip slow-moving clusters
 # ----------------------------------------------------------------------
 
@@ -200,6 +292,41 @@ class TestCurrencyCheck:
         fake_web = MagicMock()
         ld.currency_check({"title": "x"}, "Claude Code agents", mode="off", call_fn=fake_web)
         assert fake_web.call_count == 0
+
+    def test_unverifiable_claim_keeps_relevance_and_does_not_downgrade(self):
+        # FIX 2 exemplar: the specific repo claim cannot be web-confirmed, but the
+        # capability is real and high-relevance. The caveat is informational only;
+        # it must NOT frame the item as superseded/fabricated and must NOT touch
+        # priority (relevance is curation's call, not the currency check's).
+        keeper = {"title": "Anthropic open-sources financial-workflow agents",
+                  "content_date": "2026-06-20",
+                  "summary": "Open-source repo for Claude financial deal-analysis agents.",
+                  "priority": "High"}
+
+        def fake_web(prompt):
+            return json.dumps({"current": True, "verifiable": False,
+                               "note": "could not confirm the named open-source repo exists"})
+
+        out = ld.currency_check(keeper, "Claude for Financial Services agents",
+                                mode="fast-moving", call_fn=fake_web)
+        assert out["priority"] == "High"                       # not auto-downgraded
+        note = out["currency_note"].lower()
+        assert "superseded" not in note                        # not framed as outdated
+        assert "fabricat" not in note                          # not framed as fabricated
+        assert "unverified" in note                            # caveat IS recorded
+        assert "relevance" in note
+
+    def test_superseded_still_flagged_when_verifiable(self):
+        # The genuinely-superseded path is unchanged: name the newer resource.
+        keeper = {"title": "Old approach", "content_date": "2025-01-01", "summary": "..."}
+
+        def fake_web(prompt):
+            return json.dumps({"current": False, "verifiable": True,
+                               "note": "superseded by the v2 connector"})
+
+        out = ld.currency_check(keeper, "Claude Code MCP", mode="fast-moving", call_fn=fake_web)
+        assert out["currency_note"].startswith("likely superseded")
+        assert "v2 connector" in out["currency_note"]
 
 
 # ----------------------------------------------------------------------

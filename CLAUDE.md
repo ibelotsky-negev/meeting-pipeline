@@ -224,18 +224,34 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
   off the cluster topic + keeper subject/title/summary, with NO extra LLM call
   (the LLM `bucket` tag is now informational only). Order: Health -> Negev Labs
   (biotech/life-sci investing) -> Zirmania Family Office (general/non-biotech
-  investing) -> Travel Relay -> Ariadne Website -> Sara Pipeline -> General/
-  Reference (default). Biotech-vs-general tie-breaker IS the ordering (Negev
-  tested before Zirmania). Sara Pipeline = convention (b): only items paralleling
+  investing, incl. financial deal-analysis / investment-workflow automation
+  tooling by default) -> Travel Relay -> Ariadne Website -> Sara Pipeline ->
+  General/Reference (default). Biotech-vs-general tie-breaker IS the ordering
+  (Negev tested before Zirmania); a biotech deal-analysis tool still lands Negev,
+  and only a meeting-pipeline-parallel build goes to Sara. Sara Pipeline = convention (b): only items paralleling
   the Sara meeting-pipeline (OpenClaw/post-meeting/transcript/CoS builds + self-
   referential Sara infra); general Claude tooling (Cowork/Obsidian/PKM) falls
   through to General/Reference. The router NEVER targets the manual-only sections
   (Untitled, Video to watch, Drop -- Not important).
 - **Priority** custom field set at creation: the Opus curate output emits a
   per-keeper High/Med/Low (rubric in the prompt); single-item/fallback keepers
-  default Medium (Low if content-not-retrieved). Field GID **1199941453034656**
-  (High `...657` / Med `...658` / Low `...659`). GUARD: never use the duplicate
-  workspace Priority field `1206810235510187`.
+  default Medium (Low if content-not-retrieved). A DETERMINISTIC floor
+  (`_apply_priority_floor` -> `_is_financial_workflow_tool`, run in
+  `curate_cluster`) then overrides any lower verdict to **High** for financial
+  deal-analysis / investment-workflow automation tooling (valuation/DCF/LBO
+  modeling, DD/deal-data automation, Bloomberg/FactSet/PitchBook-class agents) --
+  Zirmania core + Ken's own builds; it OUTRANKS the generic "AI tooling = Medium"
+  default. Discriminator = finance-domain signal (word-boundary regex, so
+  "valuation" != "evaluation") AND a tooling signal both present; generic
+  dev/coding tooling stays Medium. Field GID **1199941453034656** (High `...657`
+  / Med `...658` / Low `...659`). GUARD: never use the duplicate workspace
+  Priority field `1206810235510187`.
+- **Currency check** (`currency_check`, fast-moving keepers) assesses TWO
+  INDEPENDENT axes -- (1) superseded? (2) is the SPECIFIC claim verifiable? -- and
+  keeps them separate: an unverifiable sub-claim (e.g. a named repo cannot be
+  web-confirmed) is an informational caveat ONLY; it never frames the item as
+  superseded/fabricated and never downgrades priority. Relevance is curation's
+  call, not the currency check's.
 
 ## FYI Triage Module
 

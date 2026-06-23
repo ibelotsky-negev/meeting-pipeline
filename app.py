@@ -3193,7 +3193,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.20.2-fyi-allocation-langs", "deployed": "2026-06-23"})
+    return jsonify({"version": "2.21.0-learn-finance-priority", "deployed": "2026-06-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3231,7 +3231,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.20.2-fyi-allocation-langs", "steps": {}}
+    results = {"version": "2.21.0-learn-finance-priority", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
