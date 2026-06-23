@@ -151,11 +151,16 @@ def _oracle(prompt, model):
     urgency_bait = ("model will be retired", "retirement notice", "automated product notice",
                     "important update regarding your paypal")
     noise_cues = ("notetaker has joined", "linkedin profile", "newsletter", "verification code",
-                  "meeting recap", "scheduled via calendly") + urgency_bait
-    # 1:1 personally-executed action / named ask to Ken (LEAK 2 keepers + LEAK 3 1:1).
+                  "meeting recap", "scheduled via calendly", "market outlook", "webinar") + urgency_bait
+    # 1:1 personally-executed action / named ask to Ken (LEAK 2 keepers + LEAK 3 1:1) plus the
+    # STATE D deal-flow signal: a specific company + round/allocation + an ACTION ASK (confirm
+    # interest / commit / participate). These are body-content cues -- language- and sender-
+    # agnostic -- so a Russian "Replit Series D" allocation offer surfaces while a generic
+    # "market outlook" digest (any language) does not.
     important_cues = ("please sign", "submitted the contact form", "annual general meeting",
                       "i'd love to discuss negev sponsoring", "series c", "invited you to set up",
-                      "co-investing", "authorize a card payment", "take an allocation")
+                      "co-investing", "authorize a card payment", "take an allocation",
+                      "confirm your interest", "confirm participation")
     # Urgency-bait is checked FIRST so a "please sign"-free automated notice cannot
     # be rescued by an incidental keyword.
     if any(c in low for c in urgency_bait):
@@ -776,7 +781,82 @@ class TestFixBSyndicateInvite:
                                    call_fn=lambda p, m: '{"decision":"IMPORTANT"}')[0] == "NOISE"
 
 
-# Permanent keep-set: these 11 must stay IMPORTANT forever. Re-confirmed every run.
+# ======================================================================
+#  13. STATE D round 5 -- a specific allocation/round/secondary offer is deal
+#  flow ACROSS language, recipient count, and sender. The confirmed casualty:
+#  a Russian-language "Replit. Series D" allocation offer ($9B), sent by an
+#  external VC to a 3-person investor distribution with a "Dear investors"
+#  salutation -- it was suppressed by three signals (non-English salutation,
+#  multi-recipient broadcast, external fund) that must NOT override a specific
+#  company + round + confirm-interest ask. Generic non-English VC marketing with
+#  no allocation ask must STILL be NOISE (no language-based over-correction).
+#
+#  The discriminator stays with the classifier (no hardcoded sender): the oracle
+#  keys on the BODY signal (named company + round/allocation + an action ask),
+#  not the from-address. Salutations are transliterated to keep this file ASCII
+#  (tools corrupt Unicode); the signal, not literal Cyrillic, is what matters.
+# ======================================================================
+
+REPLIT_SERIES_D = _msg(
+    "repd1", "Replit. Series D", "ke@brv.vc",
+    "Uvazhaemye investory! We are opening a Series D allocation in Replit at a $9B valuation. "
+    "Please confirm your interest ASAP to reserve participation. IRR projections and an LP teaser attached.")
+
+REPLIT_SERIES_D_REPLY = _msg(
+    "repd2", "Re: Replit. Series D", "ke@brv.vc",
+    "Uvazhaemye investory! Following up with the data room and SPV terms for the Replit Series D "
+    "allocation. Confirm participation this week to be included.")
+
+NON_ENGLISH_GENERIC_VC_NEWSLETTER = _msg(
+    "repd3", "Nedelnyi obzor venchurnogo rynka", "newsletter@somevcfund.com",
+    "Uvazhaemye investory! This week's venture market outlook and trends -- general commentary, no "
+    "specific deal or allocation on offer. Read our blog and subscribe. In the news: Replit, OpenAI.")
+
+NON_ENGLISH_SELF_HELP_BLAST = _msg(
+    "repd4", "Sila mysli -- webinar Dzhona Kekho", "info@kehoe-mind.com",
+    "Uvazhaemye druzya! Join John Kehoe's mind-power webinar. Transform your life. Save 20% today; subscribe now.")
+
+
+class TestStateDAllocationAcrossLanguage:
+    """A SPECIFIC investment opportunity (named company + round/secondary/
+    allocation + an action ask) is IMPORTANT deal flow regardless of language,
+    recipient count, or sender. Generic VC marketing -- in any language -- stays
+    NOISE. The classifier owns this nuance (no deterministic sender rule)."""
+
+    def test_replit_series_d_is_important(self):
+        # The confirmed false negative -- non-English, distribution-list, external
+        # fund, but a specific company + round + confirm-interest ask. IMPORTANT.
+        assert ft.classify_message(REPLIT_SERIES_D, call_fn=_oracle)[0] == "IMPORTANT"
+
+    def test_replit_series_d_reply_is_not_noise(self):
+        # Same-thread follow-up materials carry the same allocation signal ->
+        # IMPORTANT at classify time (a run collapses it as a dedup of the first;
+        # either is acceptable, but it must never be NOISE-dropped).
+        assert ft.classify_message(REPLIT_SERIES_D_REPLY, call_fn=_oracle)[0] == "IMPORTANT"
+
+    def test_non_english_generic_vc_newsletter_is_noise(self):
+        # Guards against language-based over-correction: a non-English digest that
+        # merely mentions companies, with no specific allocation ask, stays NOISE.
+        assert ft.classify_message(NON_ENGLISH_GENERIC_VC_NEWSLETTER, call_fn=_oracle)[0] == "NOISE"
+
+    def test_non_english_self_help_blast_is_noise(self):
+        # John-Kehoe-school marketing blast -> NOISE regardless of language.
+        assert ft.classify_message(NON_ENGLISH_SELF_HELP_BLAST, call_fn=_oracle)[0] == "NOISE"
+
+    def test_rule_generalizes_not_a_hardcoded_sender(self):
+        # The verdict comes from the body signal, not the sender: the SAME external
+        # fund address on a generic digest is NOISE, while a DIFFERENT fund carrying
+        # a specific allocation ask is IMPORTANT. Proves there is no brv.vc hardcode.
+        brv_generic = _msg("repd5", "Venture digest", "ke@brv.vc",
+                           "Uvazhaemye investory! This week's market outlook -- no allocation on offer.")
+        assert ft.classify_message(brv_generic, call_fn=_oracle)[0] == "NOISE"
+        other_fund_alloc = _msg("repd6", "OpenAI secondary", "partner@anotherfund.io",
+                                "We can offer Zirmania a specific allocation in the OpenAI secondary. "
+                                "Please confirm your interest to reserve your participation.")
+        assert ft.classify_message(other_fund_alloc, call_fn=_oracle)[0] == "IMPORTANT"
+
+
+# Permanent keep-set: these 12 must stay IMPORTANT forever. Re-confirmed every run.
 KEEP_SET = [
     _msg("ks1", "Signature requested by YC Safes", "noreply@mail.hellosign.com",
          "Please sign the SAFE for Kinro - investment by Ken Belotsky."),
@@ -799,6 +879,9 @@ KEEP_SET = [
          "Solvonis announces positive topline data from the SVN-002 bridging study."),
     _msg("ks11", "Re: Negev Capital // Dakota", "jkovaleski@dakota.com",
          "Hi Ken, following up on Negev Capital -- can Negev take an allocation? Best, Jordan"),
+    # STATE D round 5: a non-English, distribution-list, external-fund allocation
+    # offer is still deal flow (named company + round + confirm-interest ask).
+    REPLIT_SERIES_D,
 ]
 
 # Permanent noise-set: these must stay NOISE.
@@ -819,6 +902,10 @@ NOISE_SET = [
          "Dear Investor, this week's deals across the platform."),
     _msg("nsx9", "Acme Bio Announces Positive Phase 2 Data", "info@acmebio.com",
          "Acme Bio announces positive topline data from its Phase 2 study."),
+    # STATE D round 5: generic non-English VC marketing carries no specific
+    # allocation ask -> NOISE (language never flips a verdict; do not re-leak).
+    NON_ENGLISH_GENERIC_VC_NEWSLETTER,
+    NON_ENGLISH_SELF_HELP_BLAST,
 ]
 
 

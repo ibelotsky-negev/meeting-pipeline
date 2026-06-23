@@ -208,10 +208,15 @@ IMPORTANT (surface it) -- any of:
 - A REAL PERSON writing TO Ken in a 1:1 message (or a 1:1 reply) with a specific ask --
   including a named individual writing inside an otherwise-marketing or form email. The test is
   "is this addressed to Ken specifically?", not "does it contain a name?".
-- Deal flow / co-invest / investor or partner outreach with real substance: a SPECIFIC funding-
-  round allocation/investment invite (a named company + round + an allocation/participation ask)
-  is IMPORTANT deal flow EVEN when delivered via a syndicate/ESP platform or a no-reply address
-  (e.g. a "Series C invite"). Judge by the specific deal + ask, NOT the delivery channel.
+- Deal flow / co-invest / investor or partner outreach with real substance: a SPECIFIC investment
+  opportunity -- a named company + a round/secondary/allocation + an ask to confirm interest /
+  commit / wire -- is IMPORTANT deal flow. This spans BOTH the biotech thesis and the Zirmania
+  general-tech thesis (AI / software / secondary names like Replit, Ramp, OpenAI -- not only life
+  sciences). It stays IMPORTANT EVEN WHEN it is: delivered via a syndicate/ESP platform or a
+  no-reply address (e.g. a "Series C invite"); written in another language (e.g. a Russian
+  "Uvazhaemye investory" / "Dear investors" allocation offer); sent to an investor distribution
+  list with a generic salutation; or from an external VC / fund / broker. Judge by the specific
+  deal + ask -- NEVER by the delivery channel, the language, the recipient count, or the sender.
 - Portfolio / watchlist investor-relations or governance for a company Ken actually holds or
   tracks (Solvonis/ex-AWAKN, Xylo Bio, Diamond Therapeutics, Filament Health, Reset Pharma,
   PharmAla, BlaBlaCar/Comuto, Estateguru, ...): material IR is IMPORTANT even from info@/no-reply
@@ -228,6 +233,11 @@ Confirmed IMPORTANT examples:
   7. A 1:1 named person with a specific ask: "Re: Negev Capital // Dakota" (Dakota), a Forge
      "Secondary Opportunity in Ramp/Replit" addressed to the Zirmania team, "Update since we
      last spoke", a payment Ken must authorize (Revolut "authorize a card payment").
+  8. A non-English allocation offer to a fund's investor list: a Russian-language "Replit. Series
+     D" -- a named company + a specific round + a "confirm interest" ask at a stated valuation,
+     from an external VC to a distribution list with a "Uvazhaemye investory" / "Dear investors"
+     salutation. IMPORTANT: the specific deal + ask outweigh the language, the list, and the
+     external sender. (Compare: a generic Russian market-outlook digest with NO allocation = NOISE.)
 
 NOISE (leave it in place) -- do NOT surface. This is the large majority:
 - OWN OUTBOUND: anything FROM Ken or an internal Negev/Negevcap/Ariadne/Zirmania/Adres address
@@ -249,15 +259,21 @@ NOISE (leave it in place) -- do NOT surface. This is the large majority:
   (iAngels), "LingoPure Capital Raise" (Constant Contact), "invitation to Meridian by AngelList"
   (product launch), a WilmerHale "Pentagon Adds 65 Entities" mass alert, an off-thesis cold
   "Series A: Disruptive HVAC Hardware" broadcast, AngelList/PharmAla marketing IR blasts,
-  Estateguru/Republic mass updates. EXCEPTION (do NOT NOISE these): a SPECIFIC named-round
-  allocation invite to participate (see IMPORTANT above) -- only GENERIC platform marketing
-  (newsletters, "Dear Investor" digests, event promos, product launches) stays NOISE; and
-  MATERIAL IR from a company Ken holds/tracks (see IMPORTANT above).
+  Estateguru/Republic mass updates. EXCEPTION (do NOT NOISE these): a SPECIFIC investment
+  opportunity -- a named company + a round/secondary/allocation + an action ask (see IMPORTANT
+  above) -- in ANY language and even when sent to a distribution list with a generic "Dear
+  investors" / "Uvazhaemye investory" salutation; and MATERIAL IR from a company Ken holds/tracks
+  (see IMPORTANT above). What STAYS NOISE is GENERIC investor marketing with NO specific allocation
+  ask: newsletters, market-outlook / venture-trend digests, "Dear Investor" round-ups, event/
+  webinar promos, product launches -- INCLUDING non-English ones (a Russian market-outlook blast,
+  or a self-help / "power of the mind" webinar blast, is NOISE). A generic salutation, a
+  non-English language, or a multi-recipient list NEVER by itself flips a verdict -- only the
+  presence or absence of a specific company + allocation + action ask does.
 - Meeting-automation echo: Fireflies, Humantic, Zoom bot join/recap/prep, "Notetaker has
   joined", "Meeting Prep", "Your meeting recap", "Catch up on yesterday".
 - LinkedIn and social notifications (invitations, profile views, job listings, network digests).
-- Newsletters, substacks, webinars/webinar invites, market-outlook blasts, "database inside" or
-  "save 20%" promotions.
+- Newsletters, substacks, webinars/webinar invites, market-outlook blasts (in any language),
+  "database inside" or "save 20%" promotions.
 - OTPs / verification / login codes.
 - Calendly booking notifications ("New Event: ... Zoom call").
 - Receipts, invoices, credentials, automated delivery/confirmation receipts.

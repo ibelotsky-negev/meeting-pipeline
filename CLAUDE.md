@@ -274,7 +274,15 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
   1:1-vs-broadcast and automated-urgency-bait calls stay with the model, and so
   does the syndicate-platform allocation invite (FIX B): a SPECIFIC named-round
   invite is IMPORTANT even via an ESP/no-reply (Concentric Series C), but the ESP
-  domain alone never auto-NOISEs and generic platform marketing stays NOISE.
+  domain alone never auto-NOISEs and generic platform marketing stays NOISE. STATE
+  D (round 5) sharpened this across LANGUAGE / RECIPIENTS / SENDER and BOTH theses:
+  a specific allocation/round/secondary offer (named company + round + confirm-
+  interest ask) is IMPORTANT even when non-English, sent to a "Dear investors"
+  distribution list, or from an external VC -- spanning biotech AND the Zirmania
+  general-tech thesis (e.g. a Russian "Replit. Series D"); only generic VC
+  marketing/newsletters (any language) stay NOISE. The discriminator is "specific
+  company + allocation + action ask", never the language/recipients/sender, and it
+  stays with the model -- NO hardcoded sender.
 - **Dual gate (load-bearing):** a real move requires BOTH `?live=1` AND env
   `FYI_LIVE=1`. Absent either, the run is DRY (classify + log would-move, write no
   ids, move nothing). The daily cron passes `live=True`, so it ships DRY while
