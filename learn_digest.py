@@ -32,9 +32,12 @@ import json
 import html
 import time
 import uuid
+import shutil
 import logging
 import argparse
+import tempfile
 import requests
+import threading
 from datetime import datetime, timezone, timedelta
 
 # Shared Graph helpers (app-only token, retrying GET/POST, html_to_text).
@@ -242,6 +245,13 @@ _LEARN_DATA_DIR = (
 LEARN_PROCESSED_FILE = os.path.join(_LEARN_DATA_DIR, "learn_processed.json")
 LEARN_LOCK_FILE = os.path.join(_LEARN_DATA_DIR, "learn_lock.json")
 LEARN_STATUS_FILE = os.path.join(_LEARN_DATA_DIR, "learn_status.json")
+LEARN_PENDING_STT_FILE = os.path.join(_LEARN_DATA_DIR, "learn_pending_stt.json")
+LEARN_STT_STATUS_FILE = os.path.join(_LEARN_DATA_DIR, "learn_stt_status.json")
+LEARN_STT_MAX_ATTEMPTS = 3
+LEARN_STT_MAX_DURATION_SEC = 3600  # 60 min
+LEARN_STT_MAX_BYTES = 100 * 1024 * 1024  # 100MB
+LEARN_YTDLP_TIMEOUT = int(os.environ.get("LEARN_YTDLP_TIMEOUT", "120"))
+LEARN_STT_API_TIMEOUT = int(os.environ.get("LEARN_STT_API_TIMEOUT", "180"))
 # A backlog run resolves dozens of links and makes many API calls; allow a
 # generous window before a held lock is treated as orphaned.
 LEARN_LOCK_MAX_AGE = int(os.environ.get("LEARN_LOCK_MAX_AGE", str(2 * 3600)))
@@ -317,6 +327,109 @@ def _save_processed_ids(ids):
             json.dump(sorted(ids), f)
     except Exception as e:
         logger.error(f"[learn] Failed to write processed-id store: {e}")
+
+
+# ======================================================================
+#  PENDING X-VIDEO STT STORE (capture during digest, replay separately)
+# ======================================================================
+
+
+def _normalize_x_url(url: str) -> str:
+    u = (url or "").strip().rstrip("/")
+    u = re.sub(r"^https?://(?:www\.)?(?:twitter|x)\.com", "https://x.com", u, flags=re.I)
+    return u.lower()
+
+
+def _load_pending_stt() -> dict:
+    try:
+        with open(LEARN_PENDING_STT_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return {"entries": data}
+        return data if isinstance(data, dict) else {"entries": []}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"entries": []}
+
+
+def _save_pending_stt(data: dict):
+    try:
+        parent = os.path.dirname(LEARN_PENDING_STT_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(LEARN_PENDING_STT_FILE, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+    except Exception as e:
+        logger.error(f"[learn] Failed to write pending STT store: {e}")
+
+
+def _capture_pending_stt(entry: dict):
+    """Record an X post whose video audio could not be transcribed inline."""
+    try:
+        raw_url = (entry.get("source_url") or "").strip()
+        norm = _normalize_x_url(raw_url)
+        if not norm:
+            return
+        data = _load_pending_stt()
+        entries = data.get("entries") or []
+        for e in entries:
+            if _normalize_x_url(e.get("source_url") or "") == norm:
+                if (e.get("status") or "") == "done":
+                    return
+                e["title"] = entry.get("title") or e.get("title") or ""
+                e["date"] = entry.get("date") or e.get("date") or ""
+                e["processed_folder_location"] = (
+                    entry.get("processed_folder_location")
+                    or e.get("processed_folder_location")
+                    or PROCESSED_SUBFOLDER_NAME
+                )
+                _save_pending_stt(data)
+                return
+        entries.append({
+            "id": uuid.uuid4().hex[:8],
+            "source_url": raw_url or norm,
+            "title": entry.get("title") or "",
+            "date": entry.get("date") or "",
+            "processed_folder_location": entry.get("processed_folder_location") or PROCESSED_SUBFOLDER_NAME,
+            "status": "pending",
+            "attempts": 0,
+            "last_error": "",
+            "transcript": "",
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        })
+        data["entries"] = entries
+        _save_pending_stt(data)
+        logger.info(f"[learn] Captured x-video for STT replay: {raw_url[:80]}")
+    except Exception as e:
+        logger.warning(f"[learn] pending STT capture failed: {e}")
+
+
+def _record_stt_failure(entry: dict, data: dict, error: str):
+    entry["attempts"] = int(entry.get("attempts") or 0) + 1
+    entry["last_error"] = (error or "unknown error")[:500]
+    if entry["attempts"] >= LEARN_STT_MAX_ATTEMPTS:
+        entry["status"] = "failed"
+    else:
+        entry["status"] = "pending"
+    _save_pending_stt(data)
+
+
+def write_stt_status(result: dict):
+    try:
+        parent = os.path.dirname(LEARN_STT_STATUS_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(LEARN_STT_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, default=str)
+    except Exception as e:
+        logger.error(f"[learn] Failed to write STT replay status: {e}")
+
+
+def read_stt_status() -> dict:
+    try:
+        with open(LEARN_STT_STATUS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 
 # ======================================================================
@@ -611,48 +724,208 @@ def _parse_grok_responses(data: dict):
     return txt, citations
 
 
-# retained for planned X-video STT (mp4 -> Grok-STT); see Asana backlog
-def _grok_stt(mp4_url: str):
-    """DORMANT: transcribe an mp4's audio via Grok STT (api.x.ai/v1/stt). Kept
-    for a future X-video path but currently UNWIRED -- the Grok x_search
-    resolver does not surface mp4 URLs, so X-video AUDIO is not transcribed (the
-    post is text/context-summarized instead). Wiring real audio transcription
-    needs an mp4 source (X API media variants, or a video extractor)."""
+_VIDEO_WITH_AUDIO_MARKER = re.compile(r"VIDEO_WITH_AUDIO:\s*yes\b", re.I)
+_VIDEO_SIGNAL = re.compile(
+    r"\b(video|attached video|plays inline|mp4|video clip|video media)\b", re.I
+)
+
+
+def _x_post_has_video(text: str) -> bool:
+    if not text:
+        return False
+    if _VIDEO_WITH_AUDIO_MARKER.search(text):
+        return True
+    return bool(_VIDEO_SIGNAL.search(text))
+
+
+def _strip_video_marker(text: str) -> str:
+    if not text:
+        return text
+    return _VIDEO_WITH_AUDIO_MARKER.sub("", text).strip()
+
+
+def _is_transient_ytdlp_error(err: str) -> bool:
+    low = (err or "").lower()
+    return any(x in low for x in ("timeout", "429", "503", "502", "connection", "network"))
+
+
+def extract_x_post_audio(source_url: str, timeout: int = None):
+    """Extract audio from an X post URL via yt-dlp + ffmpeg.
+
+    Returns (audio_path, duration_sec, error_reason, tmpdir). audio_path is None
+    on failure; tmpdir is a temp directory the caller must remove."""
+    timeout = timeout or LEARN_YTDLP_TIMEOUT
+    tmpdir = tempfile.mkdtemp(prefix="learn_stt_")
+    last_err = "unknown yt-dlp error"
+
+    def _work(holder):
+        try:
+            import yt_dlp
+            outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+            ydl_opts = {
+                "format": "bestaudio/best",
+                "outtmpl": outtmpl,
+                "quiet": True,
+                "noplaylist": True,
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "m4a",
+                }],
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(source_url, download=False)
+                if not info:
+                    holder["error"] = "yt-dlp: no media info"
+                    return
+                dur = info.get("duration") or 0
+                if dur and dur > LEARN_STT_MAX_DURATION_SEC:
+                    holder["error"] = (
+                        f"duration {dur}s exceeds cap ({LEARN_STT_MAX_DURATION_SEC}s)"
+                    )
+                    return
+                ydl.download([source_url])
+            files = [
+                os.path.join(tmpdir, f) for f in os.listdir(tmpdir)
+                if os.path.isfile(os.path.join(tmpdir, f))
+            ]
+            if not files:
+                holder["error"] = "yt-dlp: no audio file produced"
+                return
+            path = files[0]
+            size = os.path.getsize(path)
+            if size > LEARN_STT_MAX_BYTES:
+                holder["error"] = f"audio size {size} exceeds cap ({LEARN_STT_MAX_BYTES})"
+                return
+            holder["path"] = path
+            holder["duration"] = dur
+        except Exception as e:
+            holder["error"] = f"yt-dlp: {e}"
+
+    for attempt in range(2):
+        holder = {}
+        t = threading.Thread(target=_work, args=(holder,), daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            last_err = f"yt-dlp timeout after {timeout}s"
+            if attempt < 1:
+                time.sleep(3)
+                continue
+            return None, 0, last_err, tmpdir
+        if holder.get("path"):
+            return holder["path"], holder.get("duration") or 0, None, tmpdir
+        last_err = holder.get("error") or last_err
+        if attempt < 1 and _is_transient_ytdlp_error(last_err):
+            time.sleep(3)
+            continue
+        return None, 0, last_err, tmpdir
+    return None, 0, last_err, tmpdir
+
+
+def _grok_stt_from_file(audio_path: str, timeout: int = None):
+    """Transcribe local audio via Grok STT multipart upload. Returns (text, error)."""
     xai_key = os.environ.get("XAI_API_KEY", "")
-    if not xai_key or not mp4_url:
-        return None
-    headers = {"Authorization": f"Bearer {xai_key}", "Content-Type": "application/json"}
-    try:
-        resp = eps._request_with_retry(
-            "POST", "https://api.x.ai/v1/stt", headers,
-            json_body={"model": "grok-stt", "url": mp4_url},
-        )
-    except Exception as e:
-        logger.warning(f"[learn] Grok STT failed: {e}")
-        return None
-    if resp is None or resp.status_code >= 400:
-        logger.info(f"[learn] Grok STT shape: status={getattr(resp, 'status_code', None)}")
-        return None
-    try:
-        data = resp.json()
-    except Exception:
-        return None
-    return data.get("text") or data.get("transcript") or None
+    if not xai_key:
+        return None, "XAI_API_KEY not set"
+    if not audio_path or not os.path.isfile(audio_path):
+        return None, "audio file missing"
+    timeout = timeout or LEARN_STT_API_TIMEOUT
+    headers = {"Authorization": f"Bearer {xai_key}"}
+    basename = os.path.basename(audio_path)
+    mime = "audio/mp4" if basename.endswith(".m4a") else "audio/mpeg"
+    last_err = None
+    for attempt in range(2):
+        try:
+            with open(audio_path, "rb") as f:
+                resp = requests.post(
+                    "https://api.x.ai/v1/stt",
+                    headers=headers,
+                    data=[("language", "en")],
+                    files={"file": (basename, f, mime)},
+                    timeout=timeout,
+                )
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < 1:
+                last_err = f"STT status {resp.status_code}"
+                time.sleep(3)
+                continue
+            if resp.status_code >= 400:
+                return None, f"STT status {resp.status_code}: {(resp.text or '')[:200]}"
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            text = ((data or {}).get("text") or (data or {}).get("transcript") or "").strip()
+            if not text:
+                return None, "STT empty transcript"
+            return text, None
+        except Exception as e:
+            last_err = f"STT {type(e).__name__}: {e}"
+            if attempt < 1:
+                time.sleep(3)
+                continue
+    return None, last_err or "STT failed"
+
+
+def _grok_stt_from_url(audio_url: str, timeout: int = None):
+    """Transcribe audio at a public URL via Grok STT URL mode. Returns (text, error)."""
+    xai_key = os.environ.get("XAI_API_KEY", "")
+    if not xai_key:
+        return None, "XAI_API_KEY not set"
+    if not audio_url:
+        return None, "audio url missing"
+    timeout = timeout or LEARN_STT_API_TIMEOUT
+    headers = {"Authorization": f"Bearer {xai_key}"}
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                "https://api.x.ai/v1/stt",
+                headers=headers,
+                data=[("url", audio_url), ("language", "en")],
+                timeout=timeout,
+            )
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < 1:
+                last_err = f"STT status {resp.status_code}"
+                time.sleep(3)
+                continue
+            if resp.status_code >= 400:
+                return None, f"STT status {resp.status_code}: {(resp.text or '')[:200]}"
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            text = ((data or {}).get("text") or (data or {}).get("transcript") or "").strip()
+            if not text:
+                return None, "STT empty transcript"
+            return text, None
+        except Exception as e:
+            last_err = f"STT {type(e).__name__}: {e}"
+            if attempt < 1:
+                time.sleep(3)
+                continue
+    return None, last_err or "STT failed"
+
+
+def _grok_stt(mp4_url: str):
+    """Transcribe audio via Grok STT URL mode. Returns transcript text or None."""
+    text, _err = _grok_stt_from_url(mp4_url)
+    return text
 
 
 def resolve_x(url: str) -> dict:
     """Resolve an X post's CONTENT via Grok's Agent Tools API (x_search), using
     only XAI_API_KEY -- no X API bearer token. Returns the post's faithful
     content for the Sonnet summarizer; null-safe graceful degrade to partial on
-    any failure (never fabricated). NOTE: this path text/context-summarizes the
-    post; it does NOT transcribe X-video audio (see _grok_stt, dormant)."""
+    any failure (never fabricated). X-video posts get a visual/text summary here;
+    spoken audio is captured for a separate STT replay pass."""
     model = os.environ.get("LEARN_X_MODEL", "grok-4.20-non-reasoning")
     prompt = (
         "Fetch the X (Twitter) post at this exact URL and report its FULL actual content "
         "faithfully: the author handle, the complete post text, any thread context, a brief "
         "description of any image or video media present, and the post date if shown. Do NOT "
-        "editorialize or add outside information. If you cannot access or find the specific "
-        "post, reply with exactly CANNOT_ACCESS.\nURL: " + url
+        "editorialize or add outside information. If the post contains a video with spoken "
+        "audio, end your reply with exactly: VIDEO_WITH_AUDIO: yes. If you cannot access "
+        "or find the specific post, reply with exactly CANNOT_ACCESS.\nURL: " + url
     )
     try:
         data = _grok_responses_call(prompt, model)
@@ -666,9 +939,18 @@ def resolve_x(url: str) -> dict:
         return _partial("x", f"Grok response parse error: {e}")
     if not text or text.strip().upper().startswith("CANNOT_ACCESS"):
         return _partial("x", "Grok could not access the post (CANNOT_ACCESS)")
-    logger.info(f"[learn] x resolved via Grok x_search ({model}): {len(text)} chars {url[:60]}")
-    return {"text": text[:20000], "kind": "x", "partial": False, "reason": "",
-            "content_date": None, "citations": citations}
+    display_text = _strip_video_marker(text)
+    has_video = _x_post_has_video(text)
+    if has_video:
+        logger.info(f"[learn] x-video detected (audio pending STT replay): {url[:60]}")
+        return {
+            "text": display_text[:20000], "kind": "x", "partial": True,
+            "reason": "x-video audio pending STT replay",
+            "content_date": None, "citations": citations, "needs_stt": True,
+        }
+    logger.info(f"[learn] x resolved via Grok x_search ({model}): {len(display_text)} chars {url[:60]}")
+    return {"text": display_text[:20000], "kind": "x", "partial": False, "reason": "",
+            "content_date": None, "citations": citations, "needs_stt": False}
 
 
 def resolve_item(item: dict) -> dict:
@@ -1212,6 +1494,106 @@ def send_digest_email(subject: str, body: str, content_type: str = "HTML"):
     logger.info(f"[learn] Digest emailed to {', '.join(LEARN_RECIPIENTS)}")
 
 
+def render_stt_replay_email(entries: list) -> str:
+    """HTML body for supplementary X-video transcript email."""
+    parts = ['<div style="font-family:sans-serif;max-width:720px;">']
+    parts.append("<h2>X video transcripts now available</h2>")
+    parts.append("<p>Transcripts for saved X video posts (replay pass):</p>")
+    for e in entries:
+        title = html.escape((e.get("title") or "Untitled").strip())
+        parts.append(f"<h3>{title}</h3>")
+        url = (e.get("source_url") or "").strip()
+        if url:
+            parts.append(f'<p><a href="{html.escape(url)}">{html.escape(url)}</a></p>')
+        tx = (e.get("transcript") or "")[:2000]
+        parts.append(f"<pre style='white-space:pre-wrap'>{html.escape(tx)}</pre>")
+        if len(e.get("transcript") or "") > 2000:
+            parts.append("<p><em>Transcript truncated in email; full text in replay status.</em></p>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def run_stt_replay(dry_run: bool = False, send_email: bool = True) -> dict:
+    """Replay pending X-video STT entries: yt-dlp audio extract -> Grok STT.
+
+    Sequential, idempotent. Failed entries stay pending with attempt counter;
+    permanently failed after LEARN_STT_MAX_ATTEMPTS. dry_run lists work only."""
+    started = datetime.now(timezone.utc)
+    data = _load_pending_stt()
+    entries = [
+        e for e in (data.get("entries") or [])
+        if (e.get("status") or "") == "pending"
+        and int(e.get("attempts") or 0) < LEARN_STT_MAX_ATTEMPTS
+    ]
+    outcomes = []
+    successes = []
+
+    for entry in entries:
+        url = entry.get("source_url") or ""
+        outcome = {
+            "id": entry.get("id"),
+            "source_url": url,
+            "title": entry.get("title"),
+            "status": entry.get("status"),
+        }
+        if dry_run:
+            outcome["dry_run"] = True
+            outcomes.append(outcome)
+            continue
+
+        tmpdir = None
+        try:
+            audio_path, _duration, err, tmpdir = extract_x_post_audio(url)
+            if err or not audio_path:
+                _record_stt_failure(entry, data, err or "no audio extracted")
+                outcome["status"] = entry.get("status")
+                outcome["last_error"] = entry.get("last_error")
+                outcomes.append(outcome)
+                continue
+
+            text, stt_err = _grok_stt_from_file(audio_path)
+            if stt_err or not text:
+                _record_stt_failure(entry, data, stt_err or "empty transcript")
+                outcome["status"] = entry.get("status")
+                outcome["last_error"] = entry.get("last_error")
+                outcomes.append(outcome)
+                continue
+
+            entry["status"] = "done"
+            entry["transcript"] = text[:50000]
+            entry["last_error"] = ""
+            entry["transcribed_at"] = datetime.now(timezone.utc).isoformat()
+            _save_pending_stt(data)
+            outcome["status"] = "done"
+            outcome["transcript_len"] = len(text)
+            successes.append(dict(entry))
+            outcomes.append(outcome)
+        finally:
+            if tmpdir and os.path.isdir(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+
+    sent = False
+    if successes and send_email and not dry_run:
+        local_date = (started + timedelta(hours=ISRAEL_UTC_OFFSET_HOURS)).strftime("%a %d %b %Y")
+        subject = f"[Sara] Read/Learn -- X video transcripts ({len(successes)}) -- {local_date}"
+        body = render_stt_replay_email(successes)
+        send_digest_email(subject, body)
+        sent = True
+
+    result = {
+        "status": "ok",
+        "dry_run": dry_run,
+        "queued": len(entries),
+        "succeeded": len(successes),
+        "outcomes": outcomes,
+        "sent": sent,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_stt_status(result)
+    logger.info(f"[learn] STT replay done: queued={len(entries)} succeeded={len(successes)} sent={sent}")
+    return result
+
+
 # ======================================================================
 #  ASANA ROUTING (keepers with an action -> matching bucket section)
 # ======================================================================
@@ -1539,6 +1921,13 @@ def _learn_run_inner(dry_run: bool, backlog: bool, limit: int = None) -> dict:
     def _resolve_one(i, msg):
         item = build_item(msg)
         resolved = resolve_item(item) if item.get("url") else _partial(item.get("type"), "no link found in message")
+        if resolved.get("needs_stt"):
+            _capture_pending_stt({
+                "source_url": item.get("url") or (resolved.get("citations") or [""])[0],
+                "title": item.get("subject") or "",
+                "date": item.get("received") or "",
+                "processed_folder_location": PROCESSED_SUBFOLDER_NAME,
+            })
         summ = summarize_item(item, resolved)
         summ["message_id"] = item.get("message_id")
         _bump_progress(f"[{item.get('type')}] {(item.get('url') or item.get('subject') or '')[:50]}")

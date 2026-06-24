@@ -2997,6 +2997,56 @@ def learn_status():
     return jsonify(learn_digest.read_status())
 
 
+_learn_stt_trigger_lock = _threading.Lock()
+
+
+@app.route("/learn/stt-replay", methods=["GET", "POST"])
+def learn_stt_replay():
+    """Manually replay pending X-video STT entries (learn_pending_stt.json).
+    ?dry_run=1     -- list pending entries only; no extract/STT/store writes.
+    ?sync=1        -- run inline and return JSON (smoke test / diagnostic).
+    ?send_email=0  -- skip supplementary transcript email on success."""
+    import traceback as _learn_stt_tb
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
+    send_email = request.args.get("send_email", "1").lower() not in ("false", "0", "no")
+
+    if not _learn_stt_trigger_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import learn_digest
+            result = learn_digest.run_stt_replay(dry_run=dry_run, send_email=send_email)
+            return jsonify(result)
+        except Exception as e:
+            logger.error(f"[learn] STT replay sync failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _learn_stt_tb.format_exc()}), 500
+        finally:
+            _learn_stt_trigger_lock.release()
+
+    def _run():
+        try:
+            import learn_digest
+            learn_digest.run_stt_replay(dry_run=dry_run, send_email=send_email)
+            logger.info("[learn] STT replay complete")
+        except Exception as e:
+            logger.error(f"[learn] STT replay failed: {e}", exc_info=True)
+        finally:
+            _learn_stt_trigger_lock.release()
+
+    logger.info(f"[learn] STT replay trigger: dry_run={dry_run} send_email={send_email}")
+    t = _threading.Thread(target=_run, daemon=True)
+    try:
+        t.start()
+    except Exception as e:
+        _learn_stt_trigger_lock.release()
+        logger.error(f"[learn] Failed to start STT replay thread: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": f"could not start replay: {e}"}), 500
+    return jsonify({"status": "started", "dry_run": dry_run, "send_email": send_email})
+
+
 _fyi_trigger_lock = _threading.Lock()
 
 
@@ -3193,7 +3243,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.21.0-learn-finance-priority", "deployed": "2026-06-23"})
+    return jsonify({"version": "2.22.0-learn-x-stt-replay", "deployed": "2026-06-23"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3231,7 +3281,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.21.0-learn-finance-priority", "steps": {}}
+    results = {"version": "2.22.0-learn-x-stt-replay", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

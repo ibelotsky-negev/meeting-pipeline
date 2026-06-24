@@ -140,6 +140,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/corrections/delete` | Deactivate a correction (`?id=`) |
 | `/learn/run` | Manual Read/Learn digest run (`?dry_run=&backlog=&force=&limit=`) |
 | `/learn/status` | Last Read/Learn run outcome + live heartbeat (`live_progress`, `cluster_diag`) |
+| `/learn/stt-replay` | Manual X-video STT replay (`?dry_run=&sync=&send_email=`); reads `/data/learn_pending_stt.json` |
 | `/fyi/run` | Manual FYI Triage run; DRY by default (`?days=N&live=1&backlog=&force=&sync=&email=`) |
 | `/fyi/status` | Last FYI Triage run outcome (scanned/important/moved + per-message decisions) + heartbeat + `fyi_live_env` |
 
@@ -211,9 +212,18 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
   `O_CREAT|O_EXCL` lock at `/data/learn_lock.json` (2h stale-reclaim);
   processed-id dedup at `/data/learn_processed.json`. Mail moved to a read/learn
   "Processed" childfolder, never deleted.
-- Endpoints: `/learn/run` (`?dry_run=&backlog=&force=&limit=`), `/learn/status`.
-  `backlog=1` is the manual "reprocess everything" switch (ignores processed-ids
-  AND the unread filter); default/cron runs are unread-only + skip-already-seen.
+- Endpoints: `/learn/run` (`?dry_run=&backlog=&force=&limit=`), `/learn/status`,
+  `/learn/stt-replay` (`?dry_run=&sync=&send_email=`). `backlog=1` is the manual
+  "reprocess everything" switch (ignores processed-ids AND the unread filter);
+  default/cron runs are unread-only + skip-already-seen.
+- **X-video capture/replay (two-step):** weekly digest **captures** untranscribable
+  X videos to `/data/learn_pending_stt.json` during `resolve_x` (Grok x_search gives
+  visual summary only; `needs_stt` flag). **Replay** is a separate manual step via
+  `/learn/stt-replay`: yt-dlp + ffmpeg extracts audio from the X post URL, Grok STT
+  (`POST api.x.ai/v1/stt` multipart file upload, `XAI_API_KEY`) transcribes, success
+  emails a supplementary transcript digest. Idempotent pending store; 3-attempt cap
+  then `failed`. Status at `/data/learn_stt_status.json`. Requires `yt-dlp` +
+  `ffmpeg` in the container (Dockerfile).
 - X content via the Grok Agent Tools API (`x_search`, `XAI_API_KEY`) -- NO X
   bearer token. Optional resolver keys (XAI_API_KEY, SPOKEN_API_KEY, JINA_API_KEY)
   are read at CALL TIME inside resolvers, never at module scope; an absent key
@@ -330,6 +340,7 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
 | Daily digest owner names blank / 403 | Missing HubSpot crm.objects.owners.read scope | Grant + reconnect HubSpot (granted 2026-06-14) |
 | FYI Triage classifies but never moves | Dual gate not fully open | Set BOTH `?live=1` AND env `FYI_LIVE=1`; absent either it stays DRY by design |
 | FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
+| X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
 
 ## Environment Variables (Railway)
 

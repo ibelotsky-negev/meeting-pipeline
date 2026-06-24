@@ -25,6 +25,8 @@ def learn_files(monkeypatch, tmp_path):
     monkeypatch.setattr(ld, "LEARN_LOCK_FILE", str(tmp_path / "learn_lock.json"))
     monkeypatch.setattr(ld, "LEARN_PROCESSED_FILE", str(tmp_path / "learn_processed.json"))
     monkeypatch.setattr(ld, "LEARN_STATUS_FILE", str(tmp_path / "learn_status.json"))
+    monkeypatch.setattr(ld, "LEARN_PENDING_STT_FILE", str(tmp_path / "learn_pending_stt.json"))
+    monkeypatch.setattr(ld, "LEARN_STT_STATUS_FILE", str(tmp_path / "learn_stt_status.json"))
     return tmp_path
 
 
@@ -487,6 +489,8 @@ class TestResolverKeys:
     def test_grok_stt_degrades_without_key(self, monkeypatch):
         monkeypatch.delenv("XAI_API_KEY", raising=False)
         assert ld._grok_stt("https://video.example/clip.mp4") is None
+        text, err = ld._grok_stt_from_file("/tmp/fake.m4a")
+        assert text is None and "XAI_API_KEY" in (err or "")
 
     def test_spoken_resolves_when_key_present_and_http_mocked(self, monkeypatch):
         monkeypatch.setenv("SPOKEN_API_KEY", "pt_test")
@@ -955,4 +959,158 @@ class TestRoutingAndPriority:
              "has_action": True, "priority": "Medium", "url": ""}
         cap = self._capture(monkeypatch, k)
         assert cap["section_endpoint"] == "/sections/1215899542179143/addTask"
+
+
+# ----------------------------------------------------------------------
+#  14. X-video STT capture + replay
+# ----------------------------------------------------------------------
+
+GROK_VIDEO_RESPONSE = {
+    "output_text": None,
+    "output": [{
+        "type": "message", "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": "Author @hamptonism. Peter Thiel on AI. Attached video plays inline.\nVIDEO_WITH_AUDIO: yes",
+            "annotations": [{"type": "url_citation", "url": "https://x.com/hamptonism/status/1"}],
+        }],
+    }],
+}
+
+
+class TestXVideoSttCapture:
+    def test_x_post_has_video_marker(self):
+        assert ld._x_post_has_video("Some post.\nVIDEO_WITH_AUDIO: yes")
+        assert ld._x_post_has_video("Post with attached video media")
+        assert not ld._x_post_has_video("Plain text only")
+
+    def test_resolve_x_flags_video_and_needs_stt(self, monkeypatch):
+        monkeypatch.setattr(ld, "_grok_responses_call", lambda prompt, model: GROK_VIDEO_RESPONSE)
+        r = ld.resolve_x("https://x.com/hamptonism/status/1")
+        assert r["needs_stt"] is True
+        assert r["partial"] is True
+        assert "pending STT replay" in r["reason"]
+
+    def test_capture_writes_pending_entry(self, learn_files):
+        ld._capture_pending_stt({
+            "source_url": "https://x.com/hamptonism/status/1",
+            "title": "Thiel video",
+            "date": "2026-06-20T10:00:00Z",
+            "processed_folder_location": "Processed",
+        })
+        data = ld._load_pending_stt()
+        assert len(data["entries"]) == 1
+        e = data["entries"][0]
+        assert e["source_url"] == "https://x.com/hamptonism/status/1"
+        assert e["title"] == "Thiel video"
+        assert e["status"] == "pending"
+        assert e["attempts"] == 0
+
+    def test_capture_dedupes_by_source_url(self, learn_files):
+        base = {
+            "source_url": "https://x.com/hamptonism/status/1",
+            "title": "A",
+            "date": "2026-06-20",
+            "processed_folder_location": "Processed",
+        }
+        ld._capture_pending_stt(base)
+        ld._capture_pending_stt({**base, "title": "B"})
+        assert len(ld._load_pending_stt()["entries"]) == 1
+        assert ld._load_pending_stt()["entries"][0]["title"] == "B"
+
+
+class TestXVideoSttReplay:
+    def _seed_pending(self, learn_files, **overrides):
+        entry = {
+            "id": "abc12345",
+            "source_url": "https://x.com/hamptonism/status/1",
+            "title": "Thiel video",
+            "date": "2026-06-20",
+            "processed_folder_location": "Processed",
+            "status": "pending",
+            "attempts": 0,
+            "last_error": "",
+            "transcript": "",
+            "captured_at": "2026-06-20T10:00:00Z",
+        }
+        entry.update(overrides)
+        ld._save_pending_stt({"entries": [entry]})
+        return entry
+
+    def test_replay_success_marks_done(self, learn_files, monkeypatch, tmp_path):
+        self._seed_pending(learn_files)
+        scratch = tmp_path / "ytdlp_scratch"
+        scratch.mkdir()
+        audio = scratch / "clip.m4a"
+        audio.write_bytes(b"fake-audio")
+
+        monkeypatch.setattr(
+            ld, "extract_x_post_audio",
+            lambda url, timeout=None: (str(audio), 30.0, None, str(scratch)),
+        )
+        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda path, timeout=None: ("hello transcript", None))
+        monkeypatch.setattr(ld, "send_digest_email", lambda s, b: None)
+
+        result = ld.run_stt_replay(dry_run=False, send_email=False)
+        assert result["succeeded"] == 1
+        e = ld._load_pending_stt()["entries"][0]
+        assert e["status"] == "done"
+        assert e["transcript"] == "hello transcript"
+
+    def test_stt_failure_increments_attempts(self, learn_files, monkeypatch, tmp_path):
+        self._seed_pending(learn_files)
+        scratch = tmp_path / "ytdlp_scratch"
+        scratch.mkdir()
+        audio = scratch / "clip.m4a"
+        audio.write_bytes(b"fake-audio")
+        monkeypatch.setattr(
+            ld, "extract_x_post_audio",
+            lambda url, timeout=None: (str(audio), 30.0, None, str(scratch)),
+        )
+        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda path, timeout=None: (None, "STT empty transcript"))
+
+        ld.run_stt_replay(dry_run=False, send_email=False)
+        e = ld._load_pending_stt()["entries"][0]
+        assert e["status"] == "pending"
+        assert e["attempts"] == 1
+        assert "STT" in e["last_error"]
+
+    def test_attempts_cap_marks_permanently_failed(self, learn_files, monkeypatch, tmp_path):
+        self._seed_pending(learn_files, attempts=2)
+        scratch = tmp_path / "ytdlp_scratch"
+        scratch.mkdir()
+        audio = scratch / "clip.m4a"
+        audio.write_bytes(b"fake-audio")
+        monkeypatch.setattr(
+            ld, "extract_x_post_audio",
+            lambda url, timeout=None: (str(audio), 30.0, None, str(scratch)),
+        )
+        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda path, timeout=None: (None, "STT timeout"))
+
+        ld.run_stt_replay(dry_run=False, send_email=False)
+        e = ld._load_pending_stt()["entries"][0]
+        assert e["status"] == "failed"
+        assert e["attempts"] == 3
+
+    def test_oversized_video_skipped_with_reason(self, learn_files, monkeypatch, tmp_path):
+        self._seed_pending(learn_files)
+        scratch = str(tmp_path / "ytdlp_scratch")
+        monkeypatch.setattr(
+            ld, "extract_x_post_audio",
+            lambda url, timeout=None: (None, 0, "duration 7200s exceeds cap (3600s)", scratch),
+        )
+
+        ld.run_stt_replay(dry_run=False, send_email=False)
+        e = ld._load_pending_stt()["entries"][0]
+        assert e["status"] == "pending"
+        assert "duration" in e["last_error"]
+        assert e["attempts"] == 1
+
+    def test_dry_run_does_not_write_store(self, learn_files):
+        self._seed_pending(learn_files)
+        result = ld.run_stt_replay(dry_run=True, send_email=False)
+        assert result["queued"] == 1
+        e = ld._load_pending_stt()["entries"][0]
+        assert e["status"] == "pending"
+        assert e["attempts"] == 0
 
