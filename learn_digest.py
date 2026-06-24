@@ -259,6 +259,7 @@ LEARN_LOCK_MAX_AGE = int(os.environ.get("LEARN_LOCK_MAX_AGE", str(2 * 3600)))
 # In-process guard for manual trigger + scheduler in the same process.
 import threading as _threading  # noqa: E402
 _learn_lock = _threading.Lock()
+_pending_stt_lock = _threading.Lock()
 
 
 # ======================================================================
@@ -362,6 +363,15 @@ def _save_pending_stt(data: dict):
         logger.error(f"[learn] Failed to write pending STT store: {e}")
 
 
+def _mutate_pending_stt(mutator):
+    """Atomic load-modify-save for learn_pending_stt.json (thread-safe)."""
+    with _pending_stt_lock:
+        data = _load_pending_stt()
+        mutator(data)
+        _save_pending_stt(data)
+        return data
+
+
 def _capture_pending_stt(entry: dict):
     """Record an X post whose video audio could not be transcribed inline."""
     try:
@@ -369,48 +379,80 @@ def _capture_pending_stt(entry: dict):
         norm = _normalize_x_url(raw_url)
         if not norm:
             return
-        data = _load_pending_stt()
-        entries = data.get("entries") or []
-        for e in entries:
-            if _normalize_x_url(e.get("source_url") or "") == norm:
-                if (e.get("status") or "") == "done":
+
+        def mutate(data):
+            entries = data.get("entries") or []
+            for e in entries:
+                if _normalize_x_url(e.get("source_url") or "") == norm:
+                    if (e.get("status") or "") == "done":
+                        return
+                    e["title"] = entry.get("title") or e.get("title") or ""
+                    e["date"] = entry.get("date") or e.get("date") or ""
+                    e["processed_folder_location"] = (
+                        entry.get("processed_folder_location")
+                        or e.get("processed_folder_location")
+                        or PROCESSED_SUBFOLDER_NAME
+                    )
+                    data["entries"] = entries
                     return
-                e["title"] = entry.get("title") or e.get("title") or ""
-                e["date"] = entry.get("date") or e.get("date") or ""
-                e["processed_folder_location"] = (
-                    entry.get("processed_folder_location")
-                    or e.get("processed_folder_location")
-                    or PROCESSED_SUBFOLDER_NAME
-                )
-                _save_pending_stt(data)
-                return
-        entries.append({
-            "id": uuid.uuid4().hex[:8],
-            "source_url": raw_url or norm,
-            "title": entry.get("title") or "",
-            "date": entry.get("date") or "",
-            "processed_folder_location": entry.get("processed_folder_location") or PROCESSED_SUBFOLDER_NAME,
-            "status": "pending",
-            "attempts": 0,
-            "last_error": "",
-            "transcript": "",
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-        })
-        data["entries"] = entries
-        _save_pending_stt(data)
+            entries.append({
+                "id": uuid.uuid4().hex[:8],
+                "source_url": raw_url or norm,
+                "title": entry.get("title") or "",
+                "date": entry.get("date") or "",
+                "processed_folder_location": (
+                    entry.get("processed_folder_location") or PROCESSED_SUBFOLDER_NAME
+                ),
+                "status": "pending",
+                "attempts": 0,
+                "last_error": "",
+                "transcript": "",
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+            })
+            data["entries"] = entries
+
+        _mutate_pending_stt(mutate)
         logger.info(f"[learn] Captured x-video for STT replay: {raw_url[:80]}")
     except Exception as e:
         logger.warning(f"[learn] pending STT capture failed: {e}")
 
 
-def _record_stt_failure(entry: dict, data: dict, error: str):
-    entry["attempts"] = int(entry.get("attempts") or 0) + 1
-    entry["last_error"] = (error or "unknown error")[:500]
-    if entry["attempts"] >= LEARN_STT_MAX_ATTEMPTS:
-        entry["status"] = "failed"
-    else:
-        entry["status"] = "pending"
-    _save_pending_stt(data)
+def _find_pending_entry(data: dict, entry_id: str, source_url: str):
+    norm = _normalize_x_url(source_url or "")
+    for ent in data.get("entries") or []:
+        if entry_id and ent.get("id") == entry_id:
+            return ent
+        if norm and _normalize_x_url(ent.get("source_url") or "") == norm:
+            return ent
+    return None
+
+
+def _record_stt_failure(entry_id: str, source_url: str, error: str):
+    def mutate(data):
+        ent = _find_pending_entry(data, entry_id, source_url)
+        if not ent:
+            return
+        ent["attempts"] = int(ent.get("attempts") or 0) + 1
+        ent["last_error"] = (error or "unknown error")[:500]
+        if ent["attempts"] >= LEARN_STT_MAX_ATTEMPTS:
+            ent["status"] = "failed"
+        else:
+            ent["status"] = "pending"
+
+    _mutate_pending_stt(mutate)
+
+
+def _mark_stt_success(entry_id: str, source_url: str, text: str):
+    def mutate(data):
+        ent = _find_pending_entry(data, entry_id, source_url)
+        if not ent:
+            return
+        ent["status"] = "done"
+        ent["transcript"] = (text or "")[:50000]
+        ent["last_error"] = ""
+        ent["transcribed_at"] = datetime.now(timezone.utc).isoformat()
+
+    _mutate_pending_stt(mutate)
 
 
 def write_stt_status(result: dict):
@@ -749,6 +791,41 @@ def _is_transient_ytdlp_error(err: str) -> bool:
     return any(x in low for x in ("timeout", "429", "503", "502", "connection", "network"))
 
 
+_AUDIO_EXTS = frozenset({".m4a", ".mp3", ".opus", ".ogg", ".wav", ".aac", ".flac", ".mp4", ".webm", ".mkv"})
+_SKIP_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif", ".vtt", ".json", ".description", ".part"})
+
+
+def _pick_extracted_audio_path(tmpdir: str, info: dict, ydl, outtmpl: str):
+    """Pick the audio file yt-dlp produced; ignore thumbnails and side artifacts."""
+    for req in (info or {}).get("requested_downloads") or []:
+        fp = (req or {}).get("filepath")
+        if fp and os.path.isfile(fp):
+            return fp
+    if info and ydl:
+        try:
+            base = ydl.prepare_filename(info, outtmpl=outtmpl)
+            for ext in (".m4a", ".mp3", ".opus", ".ogg", ".aac"):
+                candidate = os.path.splitext(base)[0] + ext
+                if os.path.isfile(candidate):
+                    return candidate
+        except Exception:
+            pass
+    audio_files = []
+    for f in os.listdir(tmpdir):
+        path = os.path.join(tmpdir, f)
+        if not os.path.isfile(path):
+            continue
+        ext = os.path.splitext(f)[1].lower()
+        if ext in _SKIP_EXTS:
+            continue
+        if ext in _AUDIO_EXTS:
+            audio_files.append(path)
+    if not audio_files:
+        return None
+    audio_files.sort(key=lambda p: (0 if p.lower().endswith(".m4a") else 1, -os.path.getsize(p)))
+    return audio_files[0]
+
+
 def extract_x_post_audio(source_url: str, timeout: int = None):
     """Extract audio from an X post URL via yt-dlp + ffmpeg.
 
@@ -783,21 +860,17 @@ def extract_x_post_audio(source_url: str, timeout: int = None):
                         f"duration {dur}s exceeds cap ({LEARN_STT_MAX_DURATION_SEC}s)"
                     )
                     return
-                ydl.download([source_url])
-            files = [
-                os.path.join(tmpdir, f) for f in os.listdir(tmpdir)
-                if os.path.isfile(os.path.join(tmpdir, f))
-            ]
-            if not files:
-                holder["error"] = "yt-dlp: no audio file produced"
-                return
-            path = files[0]
-            size = os.path.getsize(path)
-            if size > LEARN_STT_MAX_BYTES:
-                holder["error"] = f"audio size {size} exceeds cap ({LEARN_STT_MAX_BYTES})"
-                return
-            holder["path"] = path
-            holder["duration"] = dur
+                info = ydl.extract_info(source_url, download=True)
+                path = _pick_extracted_audio_path(tmpdir, info, ydl, outtmpl)
+                if not path:
+                    holder["error"] = "yt-dlp: no audio file produced"
+                    return
+                size = os.path.getsize(path)
+                if size > LEARN_STT_MAX_BYTES:
+                    holder["error"] = f"audio size {size} exceeds cap ({LEARN_STT_MAX_BYTES})"
+                    return
+                holder["path"] = path
+                holder["duration"] = (info or {}).get("duration") or dur
         except Exception as e:
             holder["error"] = f"yt-dlp: {e}"
 
@@ -1519,78 +1592,105 @@ def run_stt_replay(dry_run: bool = False, send_email: bool = True) -> dict:
     Sequential, idempotent. Failed entries stay pending with attempt counter;
     permanently failed after LEARN_STT_MAX_ATTEMPTS. dry_run lists work only."""
     started = datetime.now(timezone.utc)
-    data = _load_pending_stt()
-    entries = [
-        e for e in (data.get("entries") or [])
-        if (e.get("status") or "") == "pending"
-        and int(e.get("attempts") or 0) < LEARN_STT_MAX_ATTEMPTS
-    ]
+    with _pending_stt_lock:
+        data = _load_pending_stt()
+        entries = [
+            dict(e) for e in (data.get("entries") or [])
+            if (e.get("status") or "") == "pending"
+            and int(e.get("attempts") or 0) < LEARN_STT_MAX_ATTEMPTS
+        ]
     outcomes = []
     successes = []
+    email_error = None
 
-    for entry in entries:
-        url = entry.get("source_url") or ""
-        outcome = {
-            "id": entry.get("id"),
-            "source_url": url,
-            "title": entry.get("title"),
-            "status": entry.get("status"),
+    try:
+        for entry in entries:
+            url = entry.get("source_url") or ""
+            entry_id = entry.get("id") or ""
+            outcome = {
+                "id": entry_id,
+                "source_url": url,
+                "title": entry.get("title"),
+                "status": entry.get("status"),
+            }
+            if dry_run:
+                outcome["dry_run"] = True
+                outcomes.append(outcome)
+                continue
+
+            tmpdir = None
+            try:
+                audio_path, _duration, err, tmpdir = extract_x_post_audio(url)
+                if err or not audio_path:
+                    _record_stt_failure(entry_id, url, err or "no audio extracted")
+                    with _pending_stt_lock:
+                        fresh = _find_pending_entry(_load_pending_stt(), entry_id, url) or {}
+                    outcome["status"] = fresh.get("status", entry.get("status"))
+                    outcome["last_error"] = fresh.get("last_error", err)
+                    outcomes.append(outcome)
+                    continue
+
+                text, stt_err = _grok_stt_from_file(audio_path)
+                if stt_err or not text:
+                    _record_stt_failure(entry_id, url, stt_err or "empty transcript")
+                    with _pending_stt_lock:
+                        fresh = _find_pending_entry(_load_pending_stt(), entry_id, url) or {}
+                    outcome["status"] = fresh.get("status", entry.get("status"))
+                    outcome["last_error"] = fresh.get("last_error", stt_err)
+                    outcomes.append(outcome)
+                    continue
+
+                _mark_stt_success(entry_id, url, text)
+                with _pending_stt_lock:
+                    fresh = _find_pending_entry(_load_pending_stt(), entry_id, url) or {}
+                outcome["status"] = "done"
+                outcome["transcript_len"] = len(text)
+                successes.append(dict(fresh))
+                outcomes.append(outcome)
+            finally:
+                if tmpdir and os.path.isdir(tmpdir):
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+
+        sent = False
+        if successes and send_email and not dry_run:
+            local_date = (started + timedelta(hours=ISRAEL_UTC_OFFSET_HOURS)).strftime("%a %d %b %Y")
+            subject = f"[Sara] Read/Learn -- X video transcripts ({len(successes)}) -- {local_date}"
+            body = render_stt_replay_email(successes)
+            try:
+                send_digest_email(subject, body)
+                sent = True
+            except Exception as e:
+                email_error = str(e)
+                logger.error(f"[learn] STT replay email failed (transcripts saved): {e}", exc_info=True)
+
+        result = {
+            "status": "ok",
+            "dry_run": dry_run,
+            "queued": len(entries),
+            "succeeded": len(successes),
+            "outcomes": outcomes,
+            "sent": sent,
+            "email_error": email_error,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
         }
-        if dry_run:
-            outcome["dry_run"] = True
-            outcomes.append(outcome)
-            continue
-
-        tmpdir = None
-        try:
-            audio_path, _duration, err, tmpdir = extract_x_post_audio(url)
-            if err or not audio_path:
-                _record_stt_failure(entry, data, err or "no audio extracted")
-                outcome["status"] = entry.get("status")
-                outcome["last_error"] = entry.get("last_error")
-                outcomes.append(outcome)
-                continue
-
-            text, stt_err = _grok_stt_from_file(audio_path)
-            if stt_err or not text:
-                _record_stt_failure(entry, data, stt_err or "empty transcript")
-                outcome["status"] = entry.get("status")
-                outcome["last_error"] = entry.get("last_error")
-                outcomes.append(outcome)
-                continue
-
-            entry["status"] = "done"
-            entry["transcript"] = text[:50000]
-            entry["last_error"] = ""
-            entry["transcribed_at"] = datetime.now(timezone.utc).isoformat()
-            _save_pending_stt(data)
-            outcome["status"] = "done"
-            outcome["transcript_len"] = len(text)
-            successes.append(dict(entry))
-            outcomes.append(outcome)
-        finally:
-            if tmpdir and os.path.isdir(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
-
-    sent = False
-    if successes and send_email and not dry_run:
-        local_date = (started + timedelta(hours=ISRAEL_UTC_OFFSET_HOURS)).strftime("%a %d %b %Y")
-        subject = f"[Sara] Read/Learn -- X video transcripts ({len(successes)}) -- {local_date}"
-        body = render_stt_replay_email(successes)
-        send_digest_email(subject, body)
-        sent = True
-
-    result = {
-        "status": "ok",
-        "dry_run": dry_run,
-        "queued": len(entries),
-        "succeeded": len(successes),
-        "outcomes": outcomes,
-        "sent": sent,
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-    }
+    except Exception as e:
+        logger.error(f"[learn] STT replay failed: {e}", exc_info=True)
+        result = {
+            "status": "error",
+            "error": str(e),
+            "dry_run": dry_run,
+            "queued": len(entries),
+            "succeeded": len(successes),
+            "outcomes": outcomes,
+            "sent": False,
+            "email_error": email_error,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
     write_stt_status(result)
-    logger.info(f"[learn] STT replay done: queued={len(entries)} succeeded={len(successes)} sent={sent}")
+    logger.info(
+        f"[learn] STT replay done: queued={len(entries)} succeeded={len(successes)} "
+        f"sent={result.get('sent')} email_error={email_error}"
+    )
     return result
 
 

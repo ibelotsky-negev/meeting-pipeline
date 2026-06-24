@@ -1114,3 +1114,67 @@ class TestXVideoSttReplay:
         assert e["status"] == "pending"
         assert e["attempts"] == 0
 
+    def test_replay_success_writes_status_when_email_fails(
+        self, learn_files, monkeypatch, tmp_path,
+    ):
+        self._seed_pending(learn_files)
+        scratch = tmp_path / "ytdlp_scratch"
+        scratch.mkdir()
+        audio = scratch / "clip.m4a"
+        audio.write_bytes(b"fake-audio")
+        monkeypatch.setattr(
+            ld, "extract_x_post_audio",
+            lambda url, timeout=None: (str(audio), 30.0, None, str(scratch)),
+        )
+        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda path, timeout=None: ("hello transcript", None))
+
+        def boom(subject, body):
+            raise RuntimeError("smtp down")
+
+        monkeypatch.setattr(ld, "send_digest_email", boom)
+        result = ld.run_stt_replay(dry_run=False, send_email=True)
+        assert result["status"] == "ok"
+        assert result["succeeded"] == 1
+        assert result["sent"] is False
+        assert "smtp down" in (result.get("email_error") or "")
+        status = ld.read_stt_status()
+        assert status["succeeded"] == 1
+        assert ld._load_pending_stt()["entries"][0]["status"] == "done"
+
+
+class TestPendingSttConcurrency:
+    def test_concurrent_capture_preserves_all_entries(self, learn_files):
+        def capture(i):
+            ld._capture_pending_stt({
+                "source_url": f"https://x.com/user/status/{i}",
+                "title": f"video {i}",
+                "date": "2026-06-20",
+                "processed_folder_location": "Processed",
+            })
+
+        threads = [threading.Thread(target=capture, args=(i,)) for i in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        entries = ld._load_pending_stt()["entries"]
+        assert len(entries) == 12
+        urls = {ld._normalize_x_url(e["source_url"]) for e in entries}
+        assert len(urls) == 12
+
+
+class TestPickExtractedAudio:
+    def test_prefers_m4a_over_thumbnail(self, tmp_path):
+        (tmp_path / "thumb.jpg").write_bytes(b"thumb")
+        m4a = tmp_path / "clip.m4a"
+        m4a.write_bytes(b"audio" * 200)
+        (tmp_path / "other.mp3").write_bytes(b"x")
+        picked = ld._pick_extracted_audio_path(str(tmp_path), {}, None, "")
+        assert picked == str(m4a)
+
+    def test_uses_requested_downloads_filepath(self, tmp_path):
+        audio = tmp_path / "from_ytdlp.m4a"
+        audio.write_bytes(b"audio")
+        info = {"requested_downloads": [{"filepath": str(audio)}]}
+        assert ld._pick_extracted_audio_path(str(tmp_path), info, None, "") == str(audio)
+
