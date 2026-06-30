@@ -399,7 +399,7 @@ def run_biweekly(dry_run: bool = False, start_override: datetime = None,
 
         markdown = distill_business_update(pulses, start_dt, end_dt)
         html_body = render_html(markdown)
-        subject = (f"Business Update -- Negev Labs Team. Period: "
+        subject = (f"Business Update -- Palomar Labs Team. Period: "
                    f"{start_dt.strftime('%b %d')} - {end_dt.strftime('%b %d, %Y')}")
 
         sent = False
