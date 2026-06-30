@@ -484,6 +484,31 @@ class TestMoveSafety:
             ft.move_to_fyi("msg-1", SRC_NOTIF, {SRC_NOTIF, SRC_MKTG})
         assert post.call_count == 0
 
+    def test_move_marks_unread_before_moving(self, fyi_files, monkeypatch):
+        ft._folder_id_cache.update({ft.DEST_FOLDER_NAME: FYI_ID})
+        calls = []
+        monkeypatch.setattr(ft, "_graph_patch", lambda url, body: calls.append(("patch", url, body)))
+        monkeypatch.setattr(ft.eps, "graph_post", lambda url, body: calls.append(("post", url, body)) or {})
+        ok = ft.move_to_fyi("msg-1", FYI_ID, {SRC_NOTIF, SRC_MKTG})
+        assert ok is True
+        # mark-unread happens FIRST, targets the message, sets isRead False
+        assert calls[0][0] == "patch" and calls[1][0] == "post"
+        assert calls[0][1].endswith("/messages/msg-1")
+        assert calls[0][2] == {"isRead": False}
+        assert calls[1][1].endswith("/messages/msg-1/move")
+
+    def test_move_succeeds_even_if_mark_unread_fails(self, fyi_files, monkeypatch):
+        ft._folder_id_cache.update({ft.DEST_FOLDER_NAME: FYI_ID})
+
+        def boom(url, body):
+            raise RuntimeError("graph 500 on PATCH")
+        posted = {}
+        monkeypatch.setattr(ft, "_graph_patch", boom)
+        monkeypatch.setattr(ft.eps, "graph_post", lambda url, body: posted.update(url=url) or {})
+        ok = ft.move_to_fyi("msg-1", FYI_ID, {SRC_NOTIF, SRC_MKTG})
+        assert ok is True  # cosmetic mark-unread failure must not fail the move
+        assert posted["url"].endswith("/messages/msg-1/move")
+
     def test_resolve_map_rejects_dest_equal_to_source(self, fyi_files, monkeypatch):
         # If the FYI folder somehow resolves to the same id as a source, abort.
         clash = "SAME"

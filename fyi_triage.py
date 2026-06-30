@@ -672,14 +672,37 @@ def classify_message(msg: dict, call_fn=None) -> tuple:
 # ======================================================================
 
 
+def _graph_patch(url: str, body: dict):
+    """PATCH a Graph resource via the shared retrying client (app-only token)."""
+    headers = {"Authorization": f"Bearer {eps.get_graph_token()}", "Content-Type": "application/json"}
+    return eps._request_with_retry("PATCH", url, headers, json_body=body)
+
+
+def _mark_unread(message_id: str):
+    """Best-effort: flag a message unread so a moved item stands out in 2: FYI at
+    its original received date. Graph preserves both the read flag and
+    receivedDateTime across a move, so marking unread first lands the relocated
+    copy unread at its original date. A failure here is purely cosmetic and must
+    never fail the move."""
+    try:
+        _graph_patch(f"{eps.MS_GRAPH_BASE}/users/{MAILBOX}/messages/{message_id}", {"isRead": False})
+    except Exception as e:
+        logger.warning(f"[fyi] mark-unread failed {message_id[:24]}...: {e}")
+
+
 def move_to_fyi(message_id: str, dest_id: str, source_ids: set) -> bool:
     """Move one message to the FYI folder via Graph POST /messages/{id}/move with
-    {destinationId}. Asserts the destination is the resolved FYI folder (and not a
-    source) first. Best effort -- returns True on success, False on failure (never
-    raises, so one bad move does not abort the run)."""
+    {destinationId}, marking it unread first so it surfaces in 2: FYI at its
+    original received date. Asserts the destination is the resolved FYI folder
+    (and not a source) first. Best effort -- returns True on success, False on
+    failure (never raises, so one bad move does not abort the run)."""
     if not message_id:
         return False
     _assert_safe_move(dest_id, source_ids)
+    # Mark unread BEFORE the move: Graph preserves the read flag + received date
+    # across a move, so the relocated copy lands unread at its original date.
+    # Reuses message_id (proven in the move URL); best-effort, never blocks move.
+    _mark_unread(message_id)
     url = f"{eps.MS_GRAPH_BASE}/users/{MAILBOX}/messages/{message_id}/move"
     try:
         eps.graph_post(url, {"destinationId": dest_id})

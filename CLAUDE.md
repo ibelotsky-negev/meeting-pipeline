@@ -322,7 +322,7 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
   nothing (so a later backfill still sees everything). `backlog=1` ignores the store.
 - **Safety:** only ever moves FROM the two named sources TO "2: FYI"
   (`_assert_safe_move` guards every move: dest must be the resolved FYI id and not
-  a source). Never deletes/modifies anything else; idempotent. State files on
+  a source). Moved messages are flagged UNREAD so they resurface in "2: FYI" at their original received date; nothing else is deleted or modified; idempotent. State files on
   `/data`: `fyi_processed.json`, `fyi_lock.json`, `fyi_status.json`.
 
 ## Common Failure Modes
