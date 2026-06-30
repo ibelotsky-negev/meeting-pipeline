@@ -134,6 +134,34 @@ def test_force_bypasses_recent_send(status_path):
     assert bwu.should_run_biweekly(now=NOW, force=True) is True
 
 
+# Parity gate (default fires on ODD ISO weeks). These pin the behavior that a
+# manual mid-cycle send can no longer poison -- the regression that silently
+# skipped the 2026-06-29 scheduled run.
+_ODD_WEEK_MON = datetime(2026, 6, 29, 4, 15, tzinfo=timezone.utc)   # ISO week 27 (odd)
+_EVEN_WEEK_MON = datetime(2026, 6, 22, 4, 15, tzinfo=timezone.utc)  # ISO week 26 (even)
+
+
+def test_fires_on_parity_week_even_after_recent_backfill(status_path):
+    # The exact June 29 regression: a manual backfill sent 13 days earlier must
+    # NOT skip the odd-week scheduled run.
+    bwu.write_status({"status": "ok", "sent": True,
+                      "completed_at": datetime(2026, 6, 16, 16, 0, tzinfo=timezone.utc).isoformat()})
+    assert bwu.should_run_biweekly(now=_ODD_WEEK_MON) is True
+
+
+def test_skips_on_off_parity_week(status_path):
+    # Even ISO week is the in-between week -> never fires, regardless of history.
+    assert bwu.should_run_biweekly(now=_EVEN_WEEK_MON) is False
+
+
+def test_recent_send_suppresses_even_on_parity_week(status_path):
+    # A send within the gap floor (e.g. a manual catch-up 3 days ago) suppresses
+    # a duplicate on the very next parity Monday.
+    bwu.write_status({"status": "ok", "sent": True,
+                      "completed_at": (_ODD_WEEK_MON - timedelta(days=3)).isoformat()})
+    assert bwu.should_run_biweekly(now=_ODD_WEEK_MON) is False
+
+
 # ----------------------------------------------------------------------
 #  render_html
 # ----------------------------------------------------------------------

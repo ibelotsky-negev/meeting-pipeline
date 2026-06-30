@@ -53,10 +53,16 @@ BIWEEKLY_RECIPIENTS = [
 # so use the pulse extract tier (sonnet) rather than haiku.
 DISTILL_MODEL = os.environ.get("BIWEEKLY_MODEL", "claude-sonnet-4-6")
 
-# Every-other-week cadence gate: a scheduled run is skipped unless at least this
-# many days have passed since the last successful send. 13 (not 14) absorbs
-# small scheduler drift while still skipping the in-between week.
-BIWEEKLY_MIN_DAYS = int(os.environ.get("BIWEEKLY_MIN_DAYS", "13"))
+# Every-other-week cadence gate. The scheduled job runs every Monday; it fires
+# only on Mondays whose ISO week number has the configured parity (default odd =
+# 1), which is deterministic and -- unlike a "days since last send" gate -- is
+# NOT poisoned by a manual/backfill send landing mid-cycle (that bug skipped the
+# 2026-06-29 run because a Tue backfill left only ~12.5 days before the Monday).
+# A small floor suppresses a duplicate when a send already went out within the
+# last few days (manual catch-up, or the rare year-boundary W53->W1 where two
+# odd weeks fall back-to-back).
+BIWEEKLY_ISO_PARITY = int(os.environ.get("BIWEEKLY_ISO_PARITY", "1"))  # 1=odd weeks, 0=even
+BIWEEKLY_MIN_GAP_DAYS = int(os.environ.get("BIWEEKLY_MIN_GAP_DAYS", "10"))
 
 DEFAULT_WINDOW_DAYS = 14
 
@@ -336,19 +342,24 @@ def read_status() -> dict:
 
 
 def should_run_biweekly(now: datetime = None, force: bool = False) -> bool:
-    """Gate for the weekly Monday cron so it fires every OTHER week: run only if
-    at least BIWEEKLY_MIN_DAYS have passed since the last successful send. Dry
-    runs do not anchor the cadence (they record sent=False)."""
+    """Gate for the weekly Monday cron so it fires every OTHER week. Fires when
+    the current ISO week has the configured parity (default odd) AND no send has
+    gone out within the last BIWEEKLY_MIN_GAP_DAYS. The parity check is what
+    makes the cadence deterministic and immune to a manual/backfill send shifting
+    the anchor; the gap floor only suppresses a near-duplicate (recent manual
+    catch-up, or back-to-back odd weeks at the year boundary). Dry runs record
+    sent=False and never suppress (they are not real sends)."""
     if force:
         return True
     now = now or datetime.now(timezone.utc)
+    if now.isocalendar()[1] % 2 != BIWEEKLY_ISO_PARITY:
+        return False  # off-parity week -> this is the in-between week
     status = read_status()
-    if status.get("status") != "ok" or not status.get("sent"):
-        return True  # never sent successfully -> allow
-    last = _parse_iso(status.get("completed_at"))
-    if last is None:
-        return True
-    return (now - last) >= timedelta(days=BIWEEKLY_MIN_DAYS)
+    if status.get("status") == "ok" and status.get("sent"):
+        last = _parse_iso(status.get("completed_at"))
+        if last is not None and (now - last) < timedelta(days=BIWEEKLY_MIN_GAP_DAYS):
+            return False  # a send already went out very recently -> don't duplicate
+    return True
 
 
 # ======================================================================
