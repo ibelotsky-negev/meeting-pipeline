@@ -143,6 +143,8 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/learn/stt-replay` | Manual X-video STT replay (`?dry_run=&sync=&send_email=`); reads `/data/learn_pending_stt.json` |
 | `/fyi/run` | Manual FYI Triage run; DRY by default (`?days=N&live=1&backlog=&force=&sync=&email=`) |
 | `/fyi/status` | Last FYI Triage run outcome (scanned/important/moved + per-message decisions) + heartbeat + `fyi_live_env` |
+| `/transcribe-email/run` | Email-to-transcript: scan Sara's inbox for team mail with x.com links, reply with transcript+summary (`?dry_run=&sync=&limit=`) |
+| `/transcribe-email/status` | Last x-transcribe-email scan outcome (scanned/replied + per-message links) |
 
 ## Architecture Notes
 
@@ -159,6 +161,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Daily Pipeline Digest:** daily 06:45 IST (03:45 UTC), compiles every change + new activity in the NL 2026 Fundraise HubSpot pipeline over the trailing window (default 24h, resilient to missed runs), narrates deltas rather than state, applies Negev operating rules (stale-deal / overdue-task / wire-watch flags), and emails Ken a single morning brief (`daily_pipeline_digest.py`). See the daily-pipeline-digest Module section.
 - **Read/Learn Digest:** Friday 06:00 Asia/Jerusalem, drains Ken's Outlook "read/learn" folder, resolves each saved link, Opus cluster+curate against a Ken's-needs profile, emails one HTML digest + creates Asana keeper tasks (`learn_digest.py`). See the Read/Learn Digest Module section.
 - **FYI Triage:** daily 06:00 Asia/Jerusalem, scans the two high-volume auto-filed folders "4: notification" + "8: marketing", classifies each message IMPORTANT vs NOISE with Sonnet (reading the body, not just the from-address), and MOVES the important ones to "2: FYI". Dual-gated (`?live=1` AND env `FYI_LIVE=1`) -- ships DRY, auto-promotes to live once Ken sets `FYI_LIVE` (`fyi_triage.py`). See the FYI Triage Module section + ROLLOUT.md.
+- **X-transcribe-email:** any internal teammate emails Sara (`sara@negevlabs.com`) an x.com/twitter.com post link; a 15-min inbox scan transcribes each X video (reuses `learn_digest.extract_x_post_audio` + `_grok_stt_from_file`), summarizes with Claude, and REPLIES to the sender with a structured summary in the body + the full transcript as a `.md` attachment per link (`x_transcribe_email.py`). See the x-transcribe-email Module section.
 
 ## email-pipeline-sync Module
 
@@ -330,6 +333,31 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
   a source). Moved messages are flagged UNREAD so they resurface in "2: FYI" at their original received date; nothing else is deleted or modified; idempotent. State files on
   `/data`: `fyi_processed.json`, `fyi_lock.json`, `fyi_status.json`.
 
+## x-transcribe-email Module
+
+Standalone module (`x_transcribe_email.py`) -- lets any internal teammate get an X-video
+transcript by emailing Sara a link. Imported lazily by app.py (route + cron handlers only),
+never at module load. Reuses deployed machinery, no duplication: `email_pipeline_sync` Graph
+helpers (app-only token, graph_get / graph_post, html_to_text); `learn_digest`
+`extract_x_post_audio` + `_grok_stt_from_file` (the 2.22.0 STT path) + `_call_claude_text` +
+`SUMMARY_MODEL`; `config.is_internal_email` (the team allow-list).
+
+- **Trigger:** any inbox message from an INTERNAL sender carrying an x.com/twitter.com
+  **status** link. Links are read from `uniqueBody` ONLY, so a link quoted in a reply's
+  thread history never re-fires; profile / non-status X links are ignored.
+- **Flow:** per link -> `extract_x_post_audio` (yt-dlp+ffmpeg, 60-min cap) ->
+  `_grok_stt_from_file` (xAI Grok STT) -> Claude summary (TITLE/TL;DR/KEY POINTS/NOTABLE
+  QUOTES) -> reply to the sender via `sendMail` with the summary in the HTML body + one `.md`
+  transcript attachment per link. A link that cannot be transcribed is reported honestly in
+  the reply (specific reason), never faked.
+- **Safety:** Sara's own outbound is skipped (loop guard); external senders are ignored (and
+  marked processed so they are not reconsidered); per-email link cap `XTE_MAX_LINKS` (default
+  5). Idempotent via processed message-ids at `/data/x_transcribe_email.json`; a reply-send
+  failure is NOT marked processed so it retries. Status at `/data/x_transcribe_email_status.json`.
+- **Scheduler:** every 15 min (`XTE_INTERVAL_MINUTES`) via APScheduler (`x_transcribe_email_run`),
+  sharing `_xte_trigger_lock` with the manual route so a scheduled scan never overlaps
+  `/transcribe-email/run`. CLI: `python x_transcribe_email.py [--dry-run] [--limit N]`.
+
 ## Common Failure Modes
 
 | Symptom | Cause | Fix |
@@ -347,6 +375,7 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
 | FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
 | X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
 | Read/Learn digest silently empty ("no unread items") | Saved items are forwarded-to-self and arrive READ; pre-2.23.0 runs were unread-only and skipped them | Fixed @2.23.0: normal runs use a trailing `LEARN_LOOKBACK_DAYS` window, read/unread agnostic. For older-than-window backlog use `/learn/run?backlog=1` |
+| Email-to-transcript never replies | Sender not on an internal domain, or no x.com **status** link in the new (unquoted) body | Send from an `INTERNAL_DOMAINS` address with a real `/status/` link in the message body (not just quoted); check `/transcribe-email/status` |
 
 ## Environment Variables (Railway)
 
@@ -355,6 +384,8 @@ Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_AP
 Read/Learn: optional `LEARN_LOOKBACK_DAYS` (trailing window for normal/cron runs, default 14; read/unread agnostic), `LEARN_CONCURRENCY`, `LEARN_CURRENCY_CHECK`, resolver keys `XAI_API_KEY` / `SPOKEN_API_KEY` / `JINA_API_KEY` (read at call time; absent = degrade, never fabricate).
 
 FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY` / `FYI_BROADCAST_DOMAINS` (broker/ESP blast domains -> deterministic NOISE) / `FYI_HELD_DOMAINS` + `FYI_HELD_NAMES` (tracked holdings -> material IR is deterministic IMPORTANT) and `INTERNAL_DOMAINS` (own-outbound -> deterministic NOISE).
+
+x-transcribe-email: reuses `BOT_SENDER_EMAIL` (Sara's mailbox), `XAI_API_KEY` (STT), `CLAUDE_API_KEY` (summary), `INTERNAL_DOMAINS` (sender allow-list); optional `XTE_INTERVAL_MINUTES` (scan cadence, default 15), `XTE_MAX_MESSAGES` (scan window, default 25), `XTE_MAX_LINKS` (per-email cap, default 5), `XTE_SUMMARY_MODEL`.
 
 ## Current Known Issues
 

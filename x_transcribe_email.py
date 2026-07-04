@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""
+x-transcribe-email -- email Sara an x.com link, get the transcript + summary back.
+
+Any INTERNAL team member emails sara@negevlabs.com an x.com / twitter.com post
+link. Sara scans her inbox (scheduled, and via /transcribe-email/run), transcribes
+each X video, summarizes it, and REPLIES to the sender with a structured summary
+in the body and the full transcript attached as a .md file (one per link).
+
+Reuses existing, deployed machinery -- single source of truth, no duplication:
+- email_pipeline_sync (eps): Graph app-only token, graph_get / graph_post, html_to_text.
+- learn_digest (ld): extract_urls, classify_url, extract_x_post_audio,
+  _grok_stt_from_file, _call_claude_text, SUMMARY_MODEL (the 2.22.0 STT path).
+- config.is_internal_email: the team allow-list.
+
+Safety / robustness:
+- Only INTERNAL senders are served; Sara's own mail is skipped (loop guard).
+- Links are read from uniqueBody ONLY -- a link quoted in a reply's thread history
+  does NOT re-trigger; only links the sender typed in THIS message count.
+- Idempotent via processed message-ids at /data/x_transcribe_email.json.
+- Per-email link cap (cost guard); the 60-min duration + size caps live inside
+  learn_digest.extract_x_post_audio.
+- Never fabricates: a link that cannot be transcribed is reported honestly in the
+  reply with the specific reason.
+
+Author: Negev Labs
+"""
+
+import os
+import re
+import json
+import html
+import base64
+import shutil
+import logging
+import threading
+from datetime import datetime, timezone
+
+import email_pipeline_sync as eps
+import learn_digest as ld
+import config
+
+logger = logging.getLogger("x-transcribe-email")
+
+# ======================================================================
+#  CONFIG
+# ======================================================================
+
+SARA_MAILBOX = os.environ.get("BOT_SENDER_EMAIL", "sara@negevlabs.com")
+
+_DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+STORE_PATH = os.path.join(_DATA_DIR, "x_transcribe_email.json")
+STATUS_PATH = os.path.join(_DATA_DIR, "x_transcribe_email_status.json")
+
+# Inbox scan window (most recent N messages) and per-email link cap (cost guard).
+XTE_MAX_MESSAGES = int(os.environ.get("XTE_MAX_MESSAGES", "25"))
+XTE_MAX_LINKS = int(os.environ.get("XTE_MAX_LINKS", "5"))
+XTE_SUMMARY_MODEL = os.environ.get("XTE_SUMMARY_MODEL", ld.SUMMARY_MODEL)
+
+# In-process guard so the scheduled scan and a manual trigger never overlap.
+_run_lock = threading.Lock()
+
+_STATUS_LINK_RE = re.compile(r"/status/(\d+)")
+
+
+# ======================================================================
+#  STORE
+# ======================================================================
+
+
+def _load() -> dict:
+    try:
+        with open(STORE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"processed_ids": []}
+    except Exception as e:
+        logger.warning(f"[xte] could not read store ({e}); starting empty")
+        return {"processed_ids": []}
+    data.setdefault("processed_ids", [])
+    return data
+
+
+def _save(data: dict):
+    try:
+        os.makedirs(os.path.dirname(STORE_PATH), exist_ok=True)
+        with open(STORE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, default=str, indent=2)
+    except Exception as e:
+        logger.warning(f"[xte] could not write store: {e}")
+
+
+def _write_status(result: dict):
+    try:
+        os.makedirs(os.path.dirname(STATUS_PATH), exist_ok=True)
+        with open(STATUS_PATH, "w", encoding="utf-8") as f:
+            json.dump(result, f, default=str, indent=2)
+    except Exception as e:
+        logger.warning(f"[xte] could not write status: {e}")
+
+
+def read_status() -> dict:
+    try:
+        with open(STATUS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+# ======================================================================
+#  LINK DETECTION
+# ======================================================================
+
+
+def find_x_links(body_html: str) -> list:
+    """Return de-duped x.com / twitter.com POST (status) links found in the given
+    HTML. Reuses learn_digest.extract_urls (handles both hrefs and plain text)
+    and keeps only status links -- profile / non-post X links are not videos."""
+    out, seen = [], set()
+    for u in ld.extract_urls(body_html or ""):
+        if ld.classify_url(u) != "x":
+            continue
+        if not _STATUS_LINK_RE.search(u):
+            continue
+        norm = ld._normalize_x_url(u)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(u)
+    return out
+
+
+# ======================================================================
+#  TRANSCRIBE + SUMMARIZE (reuse learn_digest)
+# ======================================================================
+
+
+def transcribe_link(url: str) -> dict:
+    """Transcribe one X post's video audio. Returns a result dict; never raises.
+    ok=False carries a specific, honest error reason (no fabrication)."""
+    result = {"url": url, "ok": False, "error": "", "transcript": "", "chars": 0}
+    tmpdir = None
+    try:
+        audio_path, _duration, err, tmpdir = ld.extract_x_post_audio(url)
+        if err or not audio_path:
+            result["error"] = err or "no audio could be extracted from this post"
+            return result
+        text, stt_err = ld._grok_stt_from_file(audio_path)
+        if stt_err or not text:
+            result["error"] = stt_err or "speech-to-text returned an empty transcript"
+            return result
+        result["ok"] = True
+        result["transcript"] = text
+        result["chars"] = len(text)
+        return result
+    except Exception as e:
+        logger.warning(f"[xte] transcribe failed {url[:70]}: {e}")
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+    finally:
+        if tmpdir and os.path.isdir(tmpdir):
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+_SUMMARY_INSTRUCTIONS = (
+    "You are Sara. Summarize the transcript of a video from an X (Twitter) post for the "
+    "colleague who asked. Return PLAIN TEXT (no markdown symbols) in EXACTLY this shape:\n"
+    "TITLE: <=10-word title\n"
+    "TL;DR: one or two sentences with the real takeaway\n"
+    "KEY POINTS:\n- point (3 to 7 bullets, concrete: names, numbers, claims)\n"
+    "NOTABLE QUOTES:\n- \"verbatim line\" (include this section ONLY if a quote is genuinely worth keeping)\n\n"
+    "Be faithful to what was actually said; pull real specifics; never invent. The transcript "
+    "may be machine-generated and misrender proper nouns -- silently correct the obvious ones.\n\n"
+)
+
+
+def summarize_transcript(url: str, transcript: str) -> str:
+    """Claude summary of the transcript in the fixed TITLE/TL;DR/KEY POINTS shape.
+    Returns '' on failure (caller still sends the transcript)."""
+    prompt = _SUMMARY_INSTRUCTIONS + f"Source: {url}\n\nTranscript:\n{transcript[:14000]}"
+    try:
+        return (ld._call_claude_text(prompt, XTE_SUMMARY_MODEL, max_tokens=1200) or "").strip()
+    except Exception as e:
+        logger.warning(f"[xte] summarize failed {url[:70]}: {e}")
+        return ""
+
+
+def _parse_title(summary: str, fallback: str) -> str:
+    for line in (summary or "").splitlines():
+        if line.strip().upper().startswith("TITLE:"):
+            t = line.split(":", 1)[1].strip()
+            if t:
+                return t
+    return fallback
+
+
+# ======================================================================
+#  RENDER + SEND
+# ======================================================================
+
+
+def _summary_to_html(summary: str) -> str:
+    """Escape + lightly format the labeled summary text into readable HTML
+    (bold section labels, real bullet lists). The TITLE line is dropped -- it is
+    surfaced as the section heading instead."""
+    labels = ("TL;DR:", "KEY POINTS:", "NOTABLE QUOTES:")
+    parts, bullets = [], []
+
+    def flush():
+        if bullets:
+            parts.append("<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>")
+            bullets.clear()
+
+    for raw in (summary or "").splitlines():
+        line = raw.strip()
+        if not line or line.upper().startswith("TITLE:"):
+            continue
+        esc = html.escape(line)
+        if line.startswith("- ") or line.startswith("* "):
+            bullets.append(html.escape(line[2:].strip()))
+            continue
+        flush()
+        upper = line.upper()
+        if any(upper.startswith(lbl) for lbl in labels):
+            parts.append(f"<p><b>{esc}</b></p>")
+        else:
+            parts.append(f"<p>{esc}</p>")
+    flush()
+    return "".join(parts)
+
+
+def _status_id(url: str) -> str:
+    m = _STATUS_LINK_RE.search(url or "")
+    return m.group(1) if m else "post"
+
+
+def _transcript_md(title: str, url: str, transcript: str) -> str:
+    return (
+        f"# Transcript -- {title}\n\n"
+        f"- Source: {url}\n"
+        f"- Transcribed by: Sara (xAI Grok STT)\n\n"
+        f"---\n\n{transcript}\n"
+    )
+
+
+def _attachment(name: str, text: str) -> dict:
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": name,
+        "contentType": "text/markdown",
+        "contentBytes": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+    }
+
+
+def render_reply(results: list, truncated: int = 0) -> str:
+    """HTML body for the reply: one section per link (summary or honest failure)."""
+    parts = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;line-height:1.5;max-width:720px;">']
+    n_ok = sum(1 for r in results if r["ok"])
+    parts.append(f"<p>Here {'is' if len(results) == 1 else 'are'} the transcript"
+                 f"{'' if len(results) == 1 else 's'} you asked for "
+                 f"({n_ok}/{len(results)} transcribed). Full text is attached as .md.</p>")
+    for r in results:
+        title = html.escape(r.get("title") or r["url"])
+        url = html.escape(r["url"])
+        parts.append(f'<h3 style="margin-bottom:2px;">{title}</h3>')
+        parts.append(f'<p style="margin-top:0;"><a href="{url}">{url}</a></p>')
+        if r["ok"]:
+            body = _summary_to_html(r.get("summary") or "")
+            parts.append(body or "<p>(summary unavailable; see attached transcript)</p>")
+        else:
+            parts.append('<p style="color:#b45309;"><b>Could not transcribe this one.</b> '
+                         f'{html.escape(r.get("error") or "unknown reason")}. '
+                         "If it should have a video, try re-sending in a moment "
+                         "(X extraction is occasionally flaky).</p>")
+        parts.append('<hr style="border:none;border-top:1px solid #eee;margin:14px 0;">')
+    if truncated:
+        parts.append(f"<p><em>{truncated} additional link(s) in your email were not processed "
+                     f"(max {XTE_MAX_LINKS} per email).</em></p>")
+    parts.append("<p style='color:#888;'>-- Sara</p></div>")
+    return "".join(parts)
+
+
+def send_reply(to_addr: str, subject: str, html_body: str, attachments: list):
+    message = {
+        "subject": subject,
+        "body": {"contentType": "HTML", "content": html_body},
+        "toRecipients": [{"emailAddress": {"address": to_addr}}],
+    }
+    if attachments:
+        message["attachments"] = attachments
+    eps.graph_post(f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/sendMail",
+                   {"message": message, "saveToSentItems": True})
+
+
+# ======================================================================
+#  MAIN SCAN
+# ======================================================================
+
+
+def _process_message(m: dict) -> dict:
+    """Transcribe every X link in one message and reply to its sender.
+    Returns an outcome dict; assumes the caller already gated sender + links."""
+    sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "")
+    subject = m.get("subject") or ""
+    body_html = (m.get("uniqueBody") or {}).get("content", "")
+    links = find_x_links(body_html)
+    truncated = max(0, len(links) - XTE_MAX_LINKS)
+    links = links[:XTE_MAX_LINKS]
+
+    results = []
+    for url in links:
+        r = transcribe_link(url)
+        if r["ok"]:
+            r["summary"] = summarize_transcript(url, r["transcript"])
+            r["title"] = _parse_title(r["summary"], url)
+        else:
+            r["title"] = url
+        results.append(r)
+
+    attachments = [
+        _attachment(f"transcript_{_status_id(r['url'])}.md",
+                    _transcript_md(r["title"], r["url"], r["transcript"]))
+        for r in results if r["ok"]
+    ]
+    first_title = next((r["title"] for r in results if r["ok"]), "X video")
+    subj = ("Re: " + subject) if subject.strip() else f"Transcript: {first_title}"
+    send_reply(sender, subj, render_reply(results, truncated), attachments)
+
+    return {"from": sender, "subject": subject, "replied": True,
+            "links": [{"url": r["url"], "ok": r["ok"], "chars": r.get("chars", 0),
+                       "error": r.get("error", "")} for r in results]}
+
+
+def run(dry_run: bool = False, limit: int = None) -> dict:
+    """Scan Sara's inbox for internal mail carrying X links and reply with the
+    transcript(s) + summary. Idempotent (processed message ids). dry_run lists
+    what would be transcribed without extracting, calling STT, or replying."""
+    started = datetime.now(timezone.utc)
+    store = _load()
+    processed = set(store.get("processed_ids") or [])
+    limit = limit or XTE_MAX_MESSAGES
+
+    url = f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/mailFolders/inbox/messages"
+    params = {
+        "$select": "id,subject,from,receivedDateTime,uniqueBody,internetMessageId",
+        "$top": str(limit),
+        "$orderby": "receivedDateTime desc",
+    }
+    resp = eps.graph_get(url, params=params)
+    messages = resp.get("value") or []
+
+    outcomes, replied = [], 0
+    for m in messages:
+        mid = m.get("internetMessageId") or m.get("id") or ""
+        if not mid or mid in processed:
+            continue
+        sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "")
+        # Loop guard: never act on Sara's own outbound.
+        if sender.strip().lower() == SARA_MAILBOX.strip().lower():
+            continue
+        # Links are read from uniqueBody so a quoted link in a reply never re-fires.
+        links = find_x_links((m.get("uniqueBody") or {}).get("content", ""))
+        if not links:
+            continue  # not a transcription request -- leave for other handlers
+        if not config.is_internal_email(sender):
+            logger.info(f"[xte] ignoring X-link mail from external sender {sender}")
+            processed.add(mid)  # do not reconsider every run
+            continue
+
+        if dry_run:
+            outcomes.append({"from": sender, "subject": m.get("subject") or "",
+                             "would_transcribe": links[:XTE_MAX_LINKS], "dry_run": True})
+            continue
+
+        try:
+            outcomes.append(_process_message(m))
+            processed.add(mid)
+            replied += 1
+        except Exception as e:
+            # Reply/transcribe failed at the message level -> do NOT mark processed
+            # so the next run retries it.
+            logger.error(f"[xte] processing failed for {sender}: {e}", exc_info=True)
+            outcomes.append({"from": sender, "subject": m.get("subject") or "",
+                             "replied": False, "error": f"{type(e).__name__}: {e}"})
+
+    if not dry_run:
+        store["processed_ids"] = sorted(processed)[-1000:]
+        _save(store)
+
+    result = {"status": "ok", "dry_run": dry_run, "scanned": len(messages),
+              "replied": replied, "outcomes": outcomes,
+              "finished_at": datetime.now(timezone.utc).isoformat(),
+              "started_at": started.isoformat()}
+    _write_status(result)
+    logger.info(f"[xte] scan done: scanned={len(messages)} replied={replied} dry_run={dry_run}")
+    return result
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Email Sara an x.com link -> transcript + summary reply")
+    ap.add_argument("--dry-run", action="store_true", help="list would-transcribe links; no STT, no reply")
+    ap.add_argument("--limit", type=int, default=None, help="inbox scan window (most recent N messages)")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    print(json.dumps(run(dry_run=args.dry_run, limit=args.limit), indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

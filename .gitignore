@@ -8,3 +8,5 @@ __pycache__/
 teams_env.txt
 email_pipeline_sync.db
 .env
+x_transcribe_email.json
+x_transcribe_email_status.json

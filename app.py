@@ -3116,6 +3116,64 @@ def fyi_status():
     return jsonify(fyi_triage.read_status())
 
 
+_xte_trigger_lock = _threading.Lock()
+
+
+@app.route("/transcribe-email/run", methods=["GET", "POST"])
+def transcribe_email_run():
+    """Manually scan Sara's inbox for internal mail carrying x.com links and
+    reply with the transcript(s) + summary (x_transcribe_email module).
+    ?dry_run=1  -- list would-transcribe links; no STT, no reply.
+    ?sync=1     -- run inline and return the result/traceback as JSON.
+    ?limit=N    -- inbox scan window (most recent N messages)."""
+    import traceback as _xte_tb
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
+    limit = request.args.get("limit", type=int)
+    if not _xte_trigger_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import x_transcribe_email
+            result = x_transcribe_email.run(dry_run=dry_run, limit=limit)
+            return jsonify(result)
+        except Exception as e:
+            logger.error(f"[xte] Sync run failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _xte_tb.format_exc()}), 500
+        finally:
+            _xte_trigger_lock.release()
+
+    def _run():
+        try:
+            import x_transcribe_email
+            x_transcribe_email.run(dry_run=dry_run, limit=limit)
+            logger.info("[xte] Manual run complete")
+        except Exception as e:
+            logger.error(f"[xte] Manual run failed: {e}", exc_info=True)
+        finally:
+            _xte_trigger_lock.release()
+
+    logger.info(f"[xte] Trigger: dry_run={dry_run} limit={limit} -- launching background thread")
+    t = _threading.Thread(target=_run, daemon=True)
+    try:
+        t.start()
+    except Exception as e:
+        _xte_trigger_lock.release()  # never orphan the trigger lock if the thread won't start
+        logger.error(f"[xte] Failed to start run thread: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": f"could not start run: {e}"}), 500
+    return jsonify({"status": "started", "dry_run": dry_run, "limit": limit})
+
+
+@app.route("/transcribe-email/status", methods=["GET"])
+def transcribe_email_status():
+    """Last x-transcribe-email scan outcome (scanned/replied counts + per-message
+    links with ok/error), or empty if it has not run yet."""
+    import x_transcribe_email
+    return jsonify(x_transcribe_email.read_status())
+
+
 _biweekly_lock = _threading.Lock()
 
 
@@ -3243,7 +3301,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.23.0-learn-read-window", "deployed": "2026-07-04"})
+    return jsonify({"version": "2.24.0-x-transcribe-email", "deployed": "2026-07-04"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3281,7 +3339,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.23.0-learn-read-window", "steps": {}}
+    results = {"version": "2.24.0-x-transcribe-email", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4109,6 +4167,24 @@ def fyi_daily_run():
         logger.error(f"[fyi] Failed: {e}", exc_info=True)
 
 
+def x_transcribe_email_run():
+    """Scheduled scan of Sara's mailbox for x.com links to transcribe + reply
+    (x_transcribe_email module). Shares the manual trigger lock so a scheduled
+    scan and a manual /transcribe-email/run never overlap."""
+    if not _xte_trigger_lock.acquire(blocking=False):
+        logger.warning("[xte] Skipped scheduled scan -- already running")
+        return
+    try:
+        import x_transcribe_email
+        result = x_transcribe_email.run()
+        if result.get("replied"):
+            logger.info(f"[xte] Replied to {result['replied']} transcription request(s)")
+    except Exception as e:
+        logger.error(f"[xte] Scheduled scan failed: {e}", exc_info=True)
+    finally:
+        _xte_trigger_lock.release()
+
+
 _scheduler = None  # module-level so diagnostic endpoints can inspect it
 
 
@@ -4190,6 +4266,16 @@ def start_scheduler():
         id="fyi_triage_daily",
         replace_existing=True,
         misfire_grace_time=3600,
+    )
+    # X-transcribe-email: scan Sara's mailbox every 15min for internal mail with
+    # x.com links and reply with transcript + summary. Shares _xte_trigger_lock
+    # so a scheduled scan never overlaps a manual /transcribe-email/run.
+    _scheduler.add_job(
+        x_transcribe_email_run,
+        trigger="interval",
+        minutes=int(os.environ.get("XTE_INTERVAL_MINUTES", "15")),
+        id="x_transcribe_email",
+        replace_existing=True,
     )
     # Renewal job: every 45min, renews if expiry < 30min away (Graph max is 59min for this resource)
     _scheduler.add_job(
