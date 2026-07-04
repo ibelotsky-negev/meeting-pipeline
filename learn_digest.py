@@ -185,6 +185,16 @@ LEARN_CLUSTER_TIMEOUT = int(os.environ.get("LEARN_CLUSTER_TIMEOUT", "180"))
 # fast-moving (default) | off | all -- which clusters get the live web check.
 LEARN_CURRENCY_CHECK = os.environ.get("LEARN_CURRENCY_CHECK", "fast-moving")
 
+# Trailing window (days) for a normal (non-backlog) run. Saved items received
+# within this many days are processed REGARDLESS of read/unread state. Ken
+# forwards most saves to himself, so they arrive already READ -- the old
+# unread-only filter silently skipped the whole queue (the 2026-07 empty-digest
+# bug). Dedup is the processed-ID store + the move-to-Processed step, NOT the
+# read flag. The window bounds the scan to recent saves so a pre-existing
+# historical backlog is not swept in one shot; backlog=1 is the escape hatch
+# that ignores both this window and the processed-ID store.
+LEARN_LOOKBACK_DAYS = int(os.environ.get("LEARN_LOOKBACK_DAYS", "14"))
+
 # Optional keys (XAI_API_KEY, SPOKEN_API_KEY, JINA_API_KEY) are read at CALL TIME
 # inside each resolver via os.environ.get -- never at module top level, never via
 # os.environ[...] indexing. An absent key logs a warning and degrades that item to
@@ -1830,17 +1840,23 @@ def create_triage_task(keeper: dict) -> str:
 
 def fetch_unread(folder_id: str = LEARN_FOLDER_ID, processed_ids: set = None, backlog: bool = False,
                  limit: int = None) -> list:
-    """Fetch messages from the read/learn folder by ID. Normal runs fetch UNREAD
-    only and skip IDs already in learn_processed.json. A backlog run (backlog=True)
-    is the manual 'reprocess everything' switch: it fetches the ENTIRE folder (not
-    just unread) AND ignores the processed-ID store, so already-seen items are
-    re-processed from scratch. We do NOT chunk -- the clustering pass must see the
-    whole set at once. limit (if set) caps the number returned (diagnostic knob)."""
+    """Fetch messages from the read/learn folder by ID. Normal runs fetch items
+    received within the trailing LEARN_LOOKBACK_DAYS window REGARDLESS of
+    read/unread state, and skip IDs already in learn_processed.json. (Saved items
+    are typically forwarded to self and arrive READ, so an unread-only filter
+    silently skipped the whole queue -- dedup is the processed-ID store + the
+    move-to-Processed step, not the read flag.) A backlog run (backlog=True) is
+    the manual 'reprocess everything' switch: it fetches the ENTIRE folder (no
+    window) AND ignores the processed-ID store, so already-seen and older items
+    are re-processed from scratch. We do NOT chunk -- the clustering pass must see
+    the whole set at once. limit (if set) caps the number returned (diagnostic knob)."""
     processed_ids = processed_ids or set()
     base = f"{eps.MS_GRAPH_BASE}/users/{MAILBOX}/mailFolders/{folder_id}/messages"
     params = {"$select": "id,subject,from,receivedDateTime,body,webLink", "$top": "50"}
     if not backlog:
-        params["$filter"] = "isRead eq false"  # normal run: unread only
+        # Trailing-window filter (read/unread agnostic); backlog=True omits it.
+        cutoff = datetime.now(timezone.utc) - timedelta(days=LEARN_LOOKBACK_DAYS)
+        params["$filter"] = f"receivedDateTime ge {cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')}"
     url = base
     messages, pages = [], 0
     while url and pages < 25:

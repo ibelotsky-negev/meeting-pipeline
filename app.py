@@ -3243,7 +3243,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.22.3-palomar-rename", "deployed": "2026-06-30"})
+    return jsonify({"version": "2.23.0-learn-read-window", "deployed": "2026-07-04"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3281,7 +3281,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.22.3-palomar-rename", "steps": {}}
+    results = {"version": "2.23.0-learn-read-window", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

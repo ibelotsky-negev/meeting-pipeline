@@ -606,6 +606,33 @@ class TestFetchLimit:
         assert len(ld.fetch_unread(limit=2)) == 2
         assert len(ld.fetch_unread()) == 5
 
+
+class TestFetchWindow:
+    """A normal run filters by a trailing receivedDateTime window (read/unread
+    agnostic); a backlog run omits any $filter so the whole folder is fetched."""
+
+    def _capture(self, monkeypatch):
+        seen = {}
+        page = {"value": [{"id": "m1", "subject": "x"}]}
+
+        def _get(url, params=None):
+            seen["params"] = params or {}
+            return page
+        monkeypatch.setattr(ld.eps, "graph_get", _get)
+        return seen
+
+    def test_normal_run_uses_recency_window_not_read_flag(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        ld.fetch_unread()
+        flt = seen["params"].get("$filter", "")
+        assert flt.startswith("receivedDateTime ge ")  # window, not read state
+        assert "isRead" not in flt  # read items are no longer skipped
+
+    def test_backlog_run_has_no_filter(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        ld.fetch_unread(backlog=True)
+        assert "$filter" not in seen["params"]
+
     def test_backlog_true_reprocesses_seen_ids(self, monkeypatch):
         page = {"value": [{"id": "seen-1", "subject": "old"}, {"id": "fresh-2", "subject": "new"}]}
         monkeypatch.setattr(ld.eps, "graph_get", lambda url, params=None: page)

@@ -214,8 +214,13 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
   "Processed" childfolder, never deleted.
 - Endpoints: `/learn/run` (`?dry_run=&backlog=&force=&limit=`), `/learn/status`,
   `/learn/stt-replay` (`?dry_run=&sync=&send_email=`). `backlog=1` is the manual
-  "reprocess everything" switch (ignores processed-ids AND the unread filter);
-  default/cron runs are unread-only + skip-already-seen.
+  "reprocess everything" switch (ignores the processed-ids store AND the recency
+  window); default/cron runs process items received within the trailing
+  `LEARN_LOOKBACK_DAYS` window (default 14) **regardless of read/unread state**,
+  skipping already-seen ids. (Was unread-only through 2.22.x -- saved items are
+  forwarded-to-self and arrive READ, so the unread filter silently skipped the
+  whole queue and produced empty digests; dedup is the processed-id store +
+  move-to-Processed, not the read flag. Fixed @2.23.0.)
 - **X-video capture/replay (two-step):** weekly digest **captures** untranscribable
   X videos to `/data/learn_pending_stt.json` during `resolve_x` (Grok x_search gives
   visual summary only; `needs_stt` flag). **Replay** is a separate manual step via
@@ -341,10 +346,13 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
 | FYI Triage classifies but never moves | Dual gate not fully open | Set BOTH `?live=1` AND env `FYI_LIVE=1`; absent either it stays DRY by design |
 | FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
 | X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
+| Read/Learn digest silently empty ("no unread items") | Saved items are forwarded-to-self and arrive READ; pre-2.23.0 runs were unread-only and skipped them | Fixed @2.23.0: normal runs use a trailing `LEARN_LOOKBACK_DAYS` window, read/unread agnostic. For older-than-window backlog use `/learn/run?backlog=1` |
 
 ## Environment Variables (Railway)
 
 Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_API_KEY`, `ASANA_API_KEY`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`, `MS_GRAPH_TENANT_ID`, `HUBSPOT_OWNER_MAP`, `BOT_SENDER_EMAIL=sara@negevlabs.com`, `ASANA_PROJECT_GID=1213263339592202`, `ASANA_WORKSPACE_GID=597593980065511`
+
+Read/Learn: optional `LEARN_LOOKBACK_DAYS` (trailing window for normal/cron runs, default 14; read/unread agnostic), `LEARN_CONCURRENCY`, `LEARN_CURRENCY_CHECK`, resolver keys `XAI_API_KEY` / `SPOKEN_API_KEY` / `JINA_API_KEY` (read at call time; absent = degrade, never fabricate).
 
 FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY` / `FYI_BROADCAST_DOMAINS` (broker/ESP blast domains -> deterministic NOISE) / `FYI_HELD_DOMAINS` + `FYI_HELD_NAMES` (tracked holdings -> material IR is deterministic IMPORTANT) and `INTERNAL_DOMAINS` (own-outbound -> deterministic NOISE).
 
