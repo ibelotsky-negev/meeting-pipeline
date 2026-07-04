@@ -61,6 +61,10 @@ XTE_SUMMARY_MODEL = os.environ.get("XTE_SUMMARY_MODEL", ld.SUMMARY_MODEL)
 _run_lock = threading.Lock()
 
 _STATUS_LINK_RE = re.compile(r"/status/(\d+)")
+# Bare domain + navigation pages that are not a shareable post -> ignored.
+_X_NONPOST = re.compile(
+    r"^https?://(?:www\.|mobile\.)?(?:twitter|x)\.com/?"
+    r"(?:home|explore|notifications|messages|settings|search|compose|i/grok)?/?$", re.I)
 
 
 # ======================================================================
@@ -113,14 +117,16 @@ def read_status() -> dict:
 
 
 def find_x_links(body_html: str) -> list:
-    """Return de-duped x.com / twitter.com POST (status) links found in the given
-    HTML. Reuses learn_digest.extract_urls (handles both hrefs and plain text)
-    and keeps only status links -- profile / non-post X links are not videos."""
+    """Return de-duped x.com / twitter.com content links found in the HTML.
+    Reuses learn_digest.extract_urls (handles both hrefs and plain text). ANY X
+    link the sender includes is returned (not just /status/), so a link with no
+    video still earns an honest "no video found" reply; only the bare domain and
+    navigation pages (home/search/settings/...) are ignored."""
     out, seen = [], set()
     for u in ld.extract_urls(body_html or ""):
         if ld.classify_url(u) != "x":
             continue
-        if not _STATUS_LINK_RE.search(u):
+        if _X_NONPOST.match(u):
             continue
         norm = ld._normalize_x_url(u)
         if norm in seen:
@@ -252,13 +258,27 @@ def _attachment(name: str, text: str) -> dict:
     }
 
 
+def _failure_message(error: str) -> str:
+    """Turn a per-link failure reason into a clear sentence for the reply."""
+    low = (error or "").lower()
+    if any(k in low for k in ("no video", "no audio", "no downloadable", "no media", "no transcribable")):
+        return "No video was found at this link, so there was nothing to transcribe."
+    if any(k in low for k in ("timeout", "guest token", "429", "502", "503", "504", "temporar")):
+        return "Could not fetch the video just now (temporary issue) -- try re-sending in a moment."
+    return "Could not transcribe this link: " + (error or "unknown reason")
+
+
 def render_reply(results: list, truncated: int = 0) -> str:
     """HTML body for the reply: one section per link (summary or honest failure)."""
     parts = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;line-height:1.5;max-width:720px;">']
     n_ok = sum(1 for r in results if r["ok"])
-    parts.append(f"<p>Here {'is' if len(results) == 1 else 'are'} the transcript"
-                 f"{'' if len(results) == 1 else 's'} you asked for "
-                 f"({n_ok}/{len(results)} transcribed). Full text is attached as .md.</p>")
+    if n_ok == 0:
+        parts.append("<p>I couldn't get a transcript from your "
+                     f"{'link' if len(results) == 1 else 'links'}:</p>")
+    else:
+        parts.append(f"<p>Here {'is' if len(results) == 1 else 'are'} the transcript"
+                     f"{'' if len(results) == 1 else 's'} you asked for "
+                     f"({n_ok}/{len(results)} transcribed). Full text is attached as .md.</p>")
     for r in results:
         title = html.escape(r.get("title") or r["url"])
         url = html.escape(r["url"])
@@ -268,10 +288,7 @@ def render_reply(results: list, truncated: int = 0) -> str:
             body = _summary_to_html(r.get("summary") or "")
             parts.append(body or "<p>(summary unavailable; see attached transcript)</p>")
         else:
-            parts.append('<p style="color:#b45309;"><b>Could not transcribe this one.</b> '
-                         f'{html.escape(r.get("error") or "unknown reason")}. '
-                         "If it should have a video, try re-sending in a moment "
-                         "(X extraction is occasionally flaky).</p>")
+            parts.append(f'<p style="color:#b45309;"><b>{html.escape(_failure_message(r.get("error")))}</b></p>')
         parts.append('<hr style="border:none;border-top:1px solid #eee;margin:14px 0;">')
     if truncated:
         parts.append(f"<p><em>{truncated} additional link(s) in your email were not processed "

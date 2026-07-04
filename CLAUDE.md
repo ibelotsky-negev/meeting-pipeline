@@ -343,8 +343,9 @@ helpers (app-only token, graph_get / graph_post, html_to_text); `learn_digest`
 `SUMMARY_MODEL`; `config.is_internal_email` (the team allow-list).
 
 - **Trigger:** any inbox message from an INTERNAL sender carrying an x.com/twitter.com
-  **status** link. Links are read from `uniqueBody` ONLY, so a link quoted in a reply's
-  thread history never re-fires; profile / non-status X links are ignored.
+  link (any content link, not just /status/; only the bare domain + nav pages are ignored).
+  Links are read from `uniqueBody` ONLY, so a link quoted in a reply's thread history never
+  re-fires. A link with no downloadable video still earns an honest "no video found" reply.
 - **Flow:** per link -> `extract_x_post_audio` (yt-dlp+ffmpeg, 60-min cap) ->
   `_grok_stt_from_file` (xAI Grok STT) -> Claude summary (TITLE/TL;DR/KEY POINTS/NOTABLE
   QUOTES) -> reply to the sender via `sendMail` with the summary in the HTML body + one `.md`
@@ -375,7 +376,7 @@ helpers (app-only token, graph_get / graph_post, html_to_text); `learn_digest`
 | FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
 | X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
 | Read/Learn digest silently empty ("no unread items") | Saved items are forwarded-to-self and arrive READ; pre-2.23.0 runs were unread-only and skipped them | Fixed @2.23.0: normal runs use a trailing `LEARN_LOOKBACK_DAYS` window, read/unread agnostic. For older-than-window backlog use `/learn/run?backlog=1` |
-| Email-to-transcript never replies | Sender not on an internal domain, or no x.com **status** link in the new (unquoted) body | Send from an `INTERNAL_DOMAINS` address with a real `/status/` link in the message body (not just quoted); check `/transcribe-email/status` |
+| Email-to-transcript never replies | Sender not on an internal domain, or no x.com link in the new (unquoted) body | Send from an `INTERNAL_DOMAINS` address with an x.com link in the body (not just quoted); a link with no video still gets a "no video found" reply. Check `/transcribe-email/status` |
 
 ## Environment Variables (Railway)
 

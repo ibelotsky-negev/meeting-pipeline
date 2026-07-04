@@ -48,15 +48,17 @@ def _capture_sends(monkeypatch):
 # ----------------------------------------------------------------------
 
 class TestLinkDetection:
-    def test_finds_status_links_excludes_profile_and_youtube(self):
+    def test_finds_x_links_includes_profile_excludes_youtube_and_nav(self):
         html = ('see https://x.com/i/status/111 and '
                 '<a href="https://twitter.com/a/status/222">x</a> '
-                'profile https://x.com/someone yt https://youtube.com/watch?v=z')
+                'profile https://x.com/someone yt https://youtube.com/watch?v=z '
+                'nav https://x.com/home')
         links = xte.find_x_links(html)
         assert any("111" in u for u in links)
         assert any("222" in u for u in links)
+        assert any(u.rstrip("/").endswith("someone") for u in links)   # profile now included -> no-video reply
         assert not any("youtube" in u for u in links)
-        assert not any(u.rstrip("/").endswith("someone") for u in links)
+        assert not any(u.rstrip("/").endswith("x.com/home") for u in links)  # nav page ignored
 
     def test_dedups_same_link_case_and_slash(self):
         html = "a https://x.com/i/status/111 b https://X.com/i/status/111/ c"
@@ -92,9 +94,16 @@ class TestSummaryRendering:
         ]
         body = xte.render_reply(results, truncated=1)
         assert "Good one" in body
-        assert "Could not transcribe" in body and "no audio" in body
+        assert "No video was found" in body   # clear no-video wording
         assert "max" in body  # truncation notice
         assert "1/2 transcribed" in body
+
+    def test_render_reply_all_failed_says_no_video(self):
+        results = [{"url": "https://x.com/someone", "ok": False,
+                    "title": "https://x.com/someone", "error": "no video could be found in this post"}]
+        body = xte.render_reply(results)
+        assert "couldn't get a transcript" in body.lower()
+        assert "No video was found" in body
 
 
 # ----------------------------------------------------------------------
