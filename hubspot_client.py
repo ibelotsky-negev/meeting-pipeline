@@ -24,7 +24,15 @@ def hubspot_request(method: str, endpoint: str, data: dict = None, params: dict 
     }
     url = f"{HUBSPOT_BASE}{endpoint}"
     resp = requests.request(method, url, json=data, params=params, headers=headers, timeout=30)
-    resp.raise_for_status()
+    if not resp.ok:
+        # Surface HubSpot's response body -- raise_for_status() hides the actual
+        # validation reason behind a bare "400 ... for url" message, which made
+        # meeting-log 400s undiagnosable. Include the body (truncated) instead.
+        detail = (resp.text or "")[:500]
+        raise requests.HTTPError(
+            f"{resp.status_code} {resp.reason} for {method} {endpoint}: {detail}",
+            response=resp,
+        )
     return resp.json() if resp.content else {}
 
 def find_hubspot_contact(email: str) -> Optional[dict]:
