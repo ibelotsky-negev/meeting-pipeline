@@ -1,7 +1,7 @@
 ---
 description: Fresh-research sweep on any topic across web news, Reddit, and X (Twitter), filtered to the last 30 days (window override in the argument).
 argument-hint: <topic> [, last N days]
-allowed-tools: WebSearch, WebFetch, Task
+allowed-tools: WebSearch, WebFetch, Task, Bash
 ---
 
 # Last 30 Days -- fresh-signal research
@@ -40,11 +40,20 @@ tool calls in one turn).
    - Hit each platform deliberately:
      - **Web / news:** general queries + `site:` for relevant outlets.
      - **Reddit:** `site:reddit.com <topic>` (and specific subreddits if known).
-     - **X / Twitter:** `site:x.com OR site:twitter.com <topic>` and
-       `<topic> (twitter OR X)` -- X search coverage via web is partial, so
-       also look for reporting that quotes or embeds recent posts.
-   - `WebFetch` the most promising 3-8 results to read the actual content, not
-     just snippets.
+     - **X / Twitter (PRIMARY -- true timeline depth):** call the Grok
+       `x_search` helper for real X-timeline access (not web-scoped snippets):
+
+       ```bash
+       python x_search_cli.py "<topic>" --days <N>
+       ```
+
+       This reads X directly via Grok (`XAI_API_KEY`), date-scoped to the
+       window, and returns dated posts + handles + a signal summary + citations.
+       If it errors (e.g. `XAI_API_KEY not set` or an xAI outage), report the X
+       section as unavailable and FALL BACK to web-scoped X search
+       (`site:x.com OR site:twitter.com <topic>`) -- never fabricate posts.
+   - `WebFetch` the most promising 3-8 web/news/Reddit results to read the
+     actual content, not just snippets.
 
 3. **Freshness filter (mandatory).** Discard anything you cannot confirm falls
    inside the window. For each kept item, note its **publication/post date**.
@@ -68,7 +77,8 @@ Produce a tight briefing (skimmable, dated, cited):
 - **What's new (dated).** Chronological or by-theme; every item carries its
   date and a source link. Mark `[confirmed]` vs `[rumor/unverified]`.
 - **Signals by platform.** What web/news vs Reddit vs X are each saying, and
-  where they diverge (sentiment, what the crowd cares about).
+  where they diverge (sentiment, what the crowd cares about). For X, use the
+  `x_search` helper output (dated posts + handles), not just web snippets.
 - **So what.** 2-4 bullets of implications / trends / what to watch next.
 - **Gaps.** What you could NOT find fresh coverage on (say so plainly; never
   fabricate to fill a gap).
