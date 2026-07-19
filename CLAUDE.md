@@ -226,12 +226,23 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
   move-to-Processed, not the read flag. Fixed @2.23.0.)
 - **X-video capture/replay (two-step):** weekly digest **captures** untranscribable
   X videos to `/data/learn_pending_stt.json` during `resolve_x` (Grok x_search gives
-  visual summary only; `needs_stt` flag). **Replay** is a separate manual step via
-  `/learn/stt-replay`: yt-dlp + ffmpeg extracts audio from the X post URL, Grok STT
-  (`POST api.x.ai/v1/stt` multipart file upload, `XAI_API_KEY`) transcribes, success
-  emails a supplementary transcript digest. Idempotent pending store; 3-attempt cap
-  then `failed`. Status at `/data/learn_stt_status.json`. Requires `yt-dlp` +
-  `ffmpeg` in the container (Dockerfile).
+  visual summary only; `needs_stt` flag). **Replay** runs AUTOMATICALLY after the
+  weekly digest (`learn_weekly_run` chains `run_stt_replay` @2.25.0 -- drains this
+  week's captures plus any stranded from prior weeks; no-op on an empty queue) and is
+  ALSO available manually via `/learn/stt-replay` (`?sync=1` runs inline + returns per-
+  entry outcomes; a `dry_run` list-only call REWRITES the status file, clobbering the
+  last live result). Replay: yt-dlp + ffmpeg extracts audio from the X post URL, Grok
+  STT (`POST api.x.ai/v1/stt` multipart file upload, `XAI_API_KEY`) transcribes,
+  success emails a supplementary transcript digest. Idempotent pending store;
+  3-attempt cap then `failed`. Status at `/data/learn_stt_status.json`. Requires
+  `yt-dlp` + `ffmpeg` in the container (Dockerfile). LIMIT (not a bug): Grok's
+  `VIDEO_WITH_AUDIO` detection over-fires -- it flags posts as `needs_stt` that have
+  no NATIVE downloadable video (yt-dlp: "No video could be found in this tweet" /
+  "No video formats found") or exceed the 60-min `LEARN_STT_MAX_DURATION_SEC` cap;
+  those never transcribe and cycle to `failed`. Since @2.25.0 the digest no longer
+  DISCARDS the Grok visual/text summary for such posts -- `summarize_item` keeps it,
+  prefixed `[x-video audio pending STT replay]`, instead of "content not retrieved"
+  (gated on a new `content_retrieved` flag, honored by `render_digest_html`).
 - X content via the Grok Agent Tools API (`x_search`, `XAI_API_KEY`) -- NO X
   bearer token. Optional resolver keys (XAI_API_KEY, SPOKEN_API_KEY, JINA_API_KEY)
   are read at CALL TIME inside resolvers, never at module scope; an absent key
@@ -376,6 +387,7 @@ helpers (app-only token, graph_get / graph_post, html_to_text); `learn_digest`
 | FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
 | X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
 | Read/Learn digest silently empty ("no unread items") | Saved items are forwarded-to-self and arrive READ; pre-2.23.0 runs were unread-only and skipped them | Fixed @2.23.0: normal runs use a trailing `LEARN_LOOKBACK_DAYS` window, read/unread agnostic. For older-than-window backlog use `/learn/run?backlog=1` |
+| Read/Learn X-video shows "content not retrieved" / STT never arrives | Post has no NATIVE downloadable video (Grok VIDEO_WITH_AUDIO over-fired), or video > 60-min cap; yt-dlp can't fetch it | Expected for those posts -- @2.25.0 the digest now surfaces Grok's visual/text summary (prefixed `[x-video audio pending STT replay]`) instead of discarding it; unfetchable entries cycle to `failed` after 3 attempts. Only genuinely-short native X clips transcribe |
 | Email-to-transcript never replies | Sender not on an internal domain, or no x.com link in the new (unquoted) body | Send from an `INTERNAL_DOMAINS` address with an x.com link in the body (not just quoted); a link with no video still gets a "no video found" reply. Check `/transcribe-email/status` |
 
 ## Environment Variables (Railway)
