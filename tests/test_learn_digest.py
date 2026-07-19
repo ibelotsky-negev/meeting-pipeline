@@ -1013,10 +1013,23 @@ class TestXVideoSttCapture:
 
     def test_resolve_x_flags_video_and_needs_stt(self, monkeypatch):
         monkeypatch.setattr(ld, "_grok_responses_call", lambda prompt, model: GROK_VIDEO_RESPONSE)
+        monkeypatch.setattr(ld, "_probe_x_native_video", lambda url, timeout=None: (True, 42, ""))
         r = ld.resolve_x("https://x.com/hamptonism/status/1")
         assert r["needs_stt"] is True
         assert r["partial"] is True
         assert "pending STT replay" in r["reason"]
+
+    def test_resolve_x_video_no_native_surfaces_summary_no_stt(self, monkeypatch):
+        # Grok says video-with-audio, but yt-dlp finds no native clip -> do NOT
+        # queue STT; surface Grok's summary instead (partial, needs_stt False).
+        monkeypatch.setattr(ld, "_grok_responses_call", lambda prompt, model: GROK_VIDEO_RESPONSE)
+        monkeypatch.setattr(ld, "_probe_x_native_video",
+                            lambda url, timeout=None: (False, 0, "No video could be found in this tweet"))
+        r = ld.resolve_x("https://x.com/hamptonism/status/1")
+        assert r["needs_stt"] is False
+        assert r["partial"] is True
+        assert "not natively downloadable" in r["reason"]
+        assert r["text"]  # Grok visual/text content is preserved, not discarded
 
     def test_capture_writes_pending_entry(self, learn_files):
         ld._capture_pending_stt({
@@ -1249,3 +1262,51 @@ class TestPartialWithContentSurfaced:
                   "action": "", "partial": True, "content_retrieved": False}
         html = ld.render_digest_html([{"topic": "T", "superseded": [], "keepers": [keeper]}])
         assert "content not retrieved" in html
+
+
+# ----------------------------------------------------------------------
+#  Important video keepers become Asana "watch" tasks (Video to watch
+#  section) even without an explicit action; detection is tightened so
+#  no-native-video X posts are not stranded in the STT queue.
+# ----------------------------------------------------------------------
+
+class TestVideoWatchTasks:
+    def test_is_watchable_video_true_for_high_med_video(self):
+        assert ld._is_watchable_video({"type": "x", "priority": "High"}) is True
+        assert ld._is_watchable_video({"type": "youtube", "priority": "Medium"}) is True
+
+    def test_is_watchable_video_false_for_low_or_nonvideo(self):
+        assert ld._is_watchable_video({"type": "x", "priority": "Low"}) is False
+        assert ld._is_watchable_video({"type": "article", "priority": "High"}) is False
+        assert ld._is_watchable_video({"type": "podcast", "priority": "High"}) is False
+
+    def test_watch_task_routes_to_video_section_and_prefixes_title(self, monkeypatch):
+        calls = []
+        def fake(method, endpoint, data=None):
+            calls.append((method, endpoint, data))
+            if endpoint == "/tasks":
+                return {"gid": "T1"}
+            return {}
+        monkeypatch.setattr(ld.asana_client, "asana_request", fake)
+        gid = ld.create_triage_task(
+            {"title": "Peter Thiel clip", "type": "x", "priority": "High",
+             "url": "https://x.com/i/status/1", "why": "w", "summary": "s"},
+            watch=True)
+        assert gid == "T1"
+        # task created with a "Watch: " prefixed name
+        create = [c for c in calls if c[1] == "/tasks"][0]
+        assert create[2]["name"].startswith("Watch: ")
+        # added to the manual "Video to watch" section, not a topic bucket
+        add = [c for c in calls if "/addTask" in c[1]][0]
+        assert add[1] == f"/sections/{ld.VIDEO_TO_WATCH_SECTION_GID}/addTask"
+
+    def test_non_watch_task_still_topic_routed(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(ld.asana_client, "asana_request",
+                            lambda m, e, data=None: calls.append((m, e, data)) or (
+                                {"gid": "T2"} if e == "/tasks" else {}))
+        ld.create_triage_task(
+            {"title": "Biotech deal tool", "type": "article", "priority": "High",
+             "topic": "Negev Labs biotech", "url": "https://e/1", "why": "w", "summary": "s"})
+        add = [c for c in calls if "/addTask" in c[1]][0]
+        assert f"/sections/{ld.VIDEO_TO_WATCH_SECTION_GID}/" not in add[1]

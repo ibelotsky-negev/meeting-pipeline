@@ -261,6 +261,7 @@ LEARN_STT_MAX_ATTEMPTS = 3
 LEARN_STT_MAX_DURATION_SEC = 3600  # 60 min
 LEARN_STT_MAX_BYTES = 100 * 1024 * 1024  # 100MB
 LEARN_YTDLP_TIMEOUT = int(os.environ.get("LEARN_YTDLP_TIMEOUT", "120"))
+LEARN_STT_PROBE_TIMEOUT = int(os.environ.get("LEARN_STT_PROBE_TIMEOUT", "45"))
 LEARN_STT_API_TIMEOUT = int(os.environ.get("LEARN_STT_API_TIMEOUT", "180"))
 # A backlog run resolves dozens of links and makes many API calls; allow a
 # generous window before a held lock is treated as orphaned.
@@ -905,6 +906,45 @@ def extract_x_post_audio(source_url: str, timeout: int = None):
     return None, 0, last_err, tmpdir
 
 
+def _probe_x_native_video(url: str, timeout: int = None):
+    """Cheap yt-dlp metadata probe (no download): does this X post have a NATIVE
+    downloadable video within the duration cap? Returns (ok, duration, reason).
+
+    Lets resolve_x avoid stranding STT captures for posts Grok flags as video-
+    with-audio that have no fetchable native clip (linked/quoted video, GIF) or
+    exceed LEARN_STT_MAX_DURATION_SEC. Any failure -> ok=False with a reason
+    (never raises); an unfetchable post then surfaces its Grok summary instead
+    of queueing for an STT pass that could never succeed."""
+    timeout = timeout or LEARN_STT_PROBE_TIMEOUT
+    holder = {}
+
+    def _work(h):
+        try:
+            import yt_dlp
+            opts = {"quiet": True, "noplaylist": True, "skip_download": True,
+                    "format": "bestaudio/best"}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if not info:
+                h["reason"] = "no media info"
+                return
+            dur = info.get("duration") or 0
+            if dur and dur > LEARN_STT_MAX_DURATION_SEC:
+                h["reason"] = f"duration {int(dur)}s over {LEARN_STT_MAX_DURATION_SEC}s cap"
+                return
+            h["ok"] = True
+            h["duration"] = dur
+        except Exception as e:
+            h["reason"] = str(e)[:200]
+
+    t = threading.Thread(target=_work, args=(holder,), daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        return False, 0, f"probe timeout after {timeout}s"
+    return bool(holder.get("ok")), holder.get("duration") or 0, holder.get("reason") or ""
+
+
 def _grok_stt_from_file(audio_path: str, timeout: int = None):
     """Transcribe local audio via Grok STT multipart upload. Returns (text, error)."""
     xai_key = os.environ.get("XAI_API_KEY", "")
@@ -1025,11 +1065,24 @@ def resolve_x(url: str) -> dict:
     display_text = _strip_video_marker(text)
     has_video = _x_post_has_video(text)
     if has_video:
-        logger.info(f"[learn] x-video detected (audio pending STT replay): {url[:60]}")
+        # Grok VIDEO_WITH_AUDIO over-fires: it flags posts as video-with-audio
+        # that have no NATIVE downloadable clip (linked/quoted video, GIF) or
+        # exceed the duration cap. Probe with yt-dlp before committing the item
+        # to the STT queue so those posts are not stranded there forever.
+        native_ok, _dur, probe_reason = _probe_x_native_video(url)
+        if native_ok:
+            logger.info(f"[learn] x-video native audio present (queueing STT): {url[:60]}")
+            return {
+                "text": display_text[:20000], "kind": "x", "partial": True,
+                "reason": "x-video audio pending STT replay",
+                "content_date": None, "citations": citations, "needs_stt": True,
+            }
+        logger.info(f"[learn] x-video not natively fetchable ({probe_reason}); "
+                    f"surfacing Grok summary instead: {url[:60]}")
         return {
             "text": display_text[:20000], "kind": "x", "partial": True,
-            "reason": "x-video audio pending STT replay",
-            "content_date": None, "citations": citations, "needs_stt": True,
+            "reason": f"x-video not natively downloadable ({probe_reason or 'no native video'})",
+            "content_date": None, "citations": citations, "needs_stt": False,
         }
     logger.info(f"[learn] x resolved via Grok x_search ({model}): {len(display_text)} chars {url[:60]}")
     return {"text": display_text[:20000], "kind": "x", "partial": False, "reason": "",
@@ -1804,10 +1857,28 @@ def _section_for_bucket(bucket: str) -> str:
     return ASANA_SECTIONS.get(_normalize_bucket(bucket), ASANA_SECTIONS[DEFAULT_BUCKET])
 
 
-def create_triage_task(keeper: dict) -> str:
-    """Create a task in 'Read/Learn Triage', routed to its section
-    deterministically (route_section) with Priority set at creation. Returns
-    the task GID or '' on failure (never raises)."""
+# "Video to watch" is a manual section the auto-router never targets. An
+# important video keeper with no explicit action is filed here as a "watch"
+# task so a clip worth Ken's time is never left in the digest email only. GID
+# verified live against project 1215897524719950 on 2026-07-19.
+VIDEO_TO_WATCH_SECTION_GID = "1215909647377755"
+_VIDEO_KEEPER_TYPES = ("x", "youtube")
+
+
+def _is_watchable_video(keeper: dict) -> bool:
+    """A curated video keeper worth an explicit Asana 'watch' task even without
+    a concrete action: an X or YouTube item at High/Medium priority. Low-priority
+    (tangential/promotional) video keepers stay in the digest email only."""
+    if (keeper.get("type") or "").lower() not in _VIDEO_KEEPER_TYPES:
+        return False
+    return _normalize_priority(keeper.get("priority")) in ("High", "Medium")
+
+
+def create_triage_task(keeper: dict, watch: bool = False) -> str:
+    """Create a task in 'Read/Learn Triage'. Action keepers route to their topic
+    section deterministically (route_section); a watch=True video keeper routes
+    to the manual 'Video to watch' section (title prefixed 'Watch: '). Priority
+    is set at creation. Returns the task GID or '' on failure (never raises)."""
     try:
         notes_lines = [keeper.get("summary") or "", ""]
         if keeper.get("url"):  # source link; omitted when no URL could be extracted (never fabricated)
@@ -1818,8 +1889,11 @@ def create_triage_task(keeper: dict) -> str:
         if keeper.get("action"):
             notes_lines.append("Action: " + keeper["action"])
         priority = _normalize_priority(keeper.get("priority"))
+        name = keeper.get("title") or "Read/Learn item"
+        if watch and not name.lower().startswith("watch:"):
+            name = "Watch: " + name
         data = {
-            "name": (keeper.get("title") or "Read/Learn item")[:250],
+            "name": name[:250],
             "notes": "\n".join(notes_lines),
             "projects": [ASANA_PROJECT_GID_LEARN],
             # Priority set at creation (Part B). Guard: never the duplicate
@@ -1833,9 +1907,9 @@ def create_triage_task(keeper: dict) -> str:
         task_gid = (task or {}).get("gid")
         if not task_gid:
             return ""
-        section_gid = route_section(keeper)
+        section_gid = VIDEO_TO_WATCH_SECTION_GID if watch else route_section(keeper)
         asana_client.asana_request("POST", f"/sections/{section_gid}/addTask", {"task": task_gid})
-        logger.info(f"[learn] Asana task {task_gid} -> section {section_gid} (priority={priority})")
+        logger.info(f"[learn] Asana task {task_gid} -> section {section_gid} (priority={priority}, watch={watch})")
         return task_gid
     except Exception as e:
         logger.error(f"[learn] Asana task creation failed: {e}")
@@ -2093,11 +2167,17 @@ def _learn_run_inner(dry_run: bool, backlog: bool, limit: int = None) -> dict:
     else:
         send_digest_email(subject, body)
         sent = True
-        # Asana tasks for keepers that carry an action.
+        # Asana tasks for keepers: action items keep topic routing; important
+        # video keepers with no explicit action become explicit "watch" tasks in
+        # the manual 'Video to watch' section so a clip worth Ken's time is never
+        # left in the digest email only.
         for c in curated:
             for k in c.get("keepers", []):
                 if k.get("has_action"):
                     if create_triage_task(k):
+                        tasks_created += 1
+                elif _is_watchable_video(k):
+                    if create_triage_task(k, watch=True):
                         tasks_created += 1
         # Post-process: mark ALL processed (keepers + skipped) read + move.
         processed_folder = ensure_processed_subfolder()

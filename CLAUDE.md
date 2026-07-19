@@ -236,10 +236,14 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
   success emails a supplementary transcript digest. Idempotent pending store;
   3-attempt cap then `failed`. Status at `/data/learn_stt_status.json`. Requires
   `yt-dlp` + `ffmpeg` in the container (Dockerfile). LIMIT (not a bug): Grok's
-  `VIDEO_WITH_AUDIO` detection over-fires -- it flags posts as `needs_stt` that have
-  no NATIVE downloadable video (yt-dlp: "No video could be found in this tweet" /
-  "No video formats found") or exceed the 60-min `LEARN_STT_MAX_DURATION_SEC` cap;
-  those never transcribe and cycle to `failed`. Since @2.25.0 the digest no longer
+  `VIDEO_WITH_AUDIO` detection over-fires -- it flags posts as video-with-audio that
+  have no NATIVE downloadable video (yt-dlp: "No video could be found in this tweet"
+  / "No video formats found") or exceed the 60-min `LEARN_STT_MAX_DURATION_SEC` cap.
+  Since 2.26.0 `resolve_x` gates `needs_stt` behind a cheap yt-dlp metadata probe
+  (`_probe_x_native_video`, `LEARN_STT_PROBE_TIMEOUT` default 45s): only a post with
+  a fetchable native clip within the cap is queued for STT; a post with no native
+  video surfaces Grok's summary (needs_stt False, reason "not natively downloadable")
+  instead of being stranded. A queued clip that still fails cycles to `failed`. Since @2.25.0 the digest no longer
   DISCARDS the Grok visual/text summary for such posts -- `summarize_item` keeps it,
   prefixed `[x-video audio pending STT replay]`, instead of "content not retrieved"
   (gated on a new `content_retrieved` flag, honored by `render_digest_html`).
@@ -247,8 +251,8 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
   bearer token. Optional resolver keys (XAI_API_KEY, SPOKEN_API_KEY, JINA_API_KEY)
   are read at CALL TIME inside resolvers, never at module scope; an absent key
   degrades that item to "content not retrieved" and never fabricates.
-- **Asana output** -> "Read/Learn Triage" project `1215897524719950`. Keeper
-  tasks (only `has_action` keepers) route to a section **deterministically** via
+- **Asana output** -> "Read/Learn Triage" project `1215897524719950`. Two task
+  paths (2.26.0): (a) `has_action` keepers -> a topic section **deterministically** via
   `route_section()` -- a FIRST-MATCH-WINS keyword table (`_ROUTING_RULES`) keyed
   off the cluster topic + keeper subject/title/summary, with NO extra LLM call
   (the LLM `bucket` tag is now informational only). Order: Health -> Negev Labs
@@ -260,8 +264,14 @@ Claude client, send-email, the Pulse-style atomic lock pattern.
   and only a meeting-pipeline-parallel build goes to Sara. Sara Pipeline = convention (b): only items paralleling
   the Sara meeting-pipeline (OpenClaw/post-meeting/transcript/CoS builds + self-
   referential Sara infra); general Claude tooling (Cowork/Obsidian/PKM) falls
-  through to General/Reference. The router NEVER targets the manual-only sections
-  (Untitled, Video to watch, Drop -- Not important).
+  through to General/Reference. `route_section()` itself NEVER targets the manual
+  sections (Untitled, Video to watch, Drop -- Not important). (b) Since 2.26.0 an
+  actionless video keeper that is important -- `_is_watchable_video`: type x/youtube
+  AND priority High/Medium -- is filed as an explicit "Watch: ..." task in the
+  **Video to watch** section (GID `1215909647377755`, hardcoded, verified live
+  2026-07-19) so a clip worth Ken's time is never left in the digest email only;
+  Low-priority / non-video keepers with no action create no task. This is the ONLY
+  automated path into a manual section.
 - **Priority** custom field set at creation: the Opus curate output emits a
   per-keeper High/Med/Low (rubric in the prompt); single-item/fallback keepers
   default Medium (Low if content-not-retrieved). A DETERMINISTIC floor
