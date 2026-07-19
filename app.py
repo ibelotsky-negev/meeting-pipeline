@@ -3301,7 +3301,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.24.2-hubspot-error-body", "deployed": "2026-07-04"})
+    return jsonify({"version": "2.25.0-learn-stt-autoreplay", "deployed": "2026-07-19"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3339,7 +3339,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.24.2-hubspot-error-body", "steps": {}}
+    results = {"version": "2.25.0-learn-stt-autoreplay", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4140,12 +4140,23 @@ def learn_weekly_run():
     """Scheduled weekly Read/Learn digest (learn_digest module).
 
     Dedup + single-send is enforced inside learn_digest.run_learn via its atomic
-    O_CREAT|O_EXCL run lock, so no extra lock is needed here."""
+    O_CREAT|O_EXCL run lock, so no extra lock is needed here. After the digest we
+    drain any pending X-video STT captures (this week's freshly-captured clips plus
+    any stranded from prior weeks), replacing the old manual-only /learn/stt-replay
+    step so captured clips are transcribed automatically."""
     try:
         logger.info("[learn] Starting scheduled weekly Read/Learn digest")
         import learn_digest
         learn_digest.run_learn()
         logger.info("[learn] Weekly Read/Learn digest complete")
+        # Auto-drain pending X-video STT captures. No-op (succeeded=0, sent=False)
+        # when the pending queue is empty, so this is safe to run every week.
+        try:
+            stt = learn_digest.run_stt_replay(send_email=True)
+            if stt.get("succeeded"):
+                logger.info(f"[learn] STT replay transcribed {stt['succeeded']} X-video(s)")
+        except Exception as e:
+            logger.error(f"[learn] STT replay after digest failed: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"[learn] Failed: {e}", exc_info=True)
 

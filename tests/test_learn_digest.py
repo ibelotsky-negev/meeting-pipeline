@@ -1205,3 +1205,47 @@ class TestPickExtractedAudio:
         info = {"requested_downloads": [{"filepath": str(audio)}]}
         assert ld._pick_extracted_audio_path(str(tmp_path), info, None, "") == str(audio)
 
+
+
+# ----------------------------------------------------------------------
+#  X-video content is surfaced (not discarded) while its spoken transcript
+#  is pending STT replay -- partial-but-retrieved items are summarized.
+# ----------------------------------------------------------------------
+
+class TestPartialWithContentSurfaced:
+    def test_summarize_partial_xvideo_surfaces_content_and_flags_pending(self):
+        # resolve_x returns partial=True (needs_stt) but WITH the Grok visual/text
+        # description. That content must be summarized, not thrown away.
+        item = {"subject": "Fable loops", "url": "https://x.com/u/status/7", "type": "x"}
+        resolved = {"text": "Author explains a Fable agent loop over a task queue.",
+                    "kind": "x", "partial": True, "reason": "x-video audio pending STT replay",
+                    "content_date": None, "citations": ["https://x.com/i/status/7"]}
+        summ = ld.summarize_item(
+            item, resolved,
+            call_fn=lambda p, m: '{"summary": "A loop over a task queue.", "confidence": "medium"}')
+        assert summ["content_retrieved"] is True
+        assert "content not retrieved" not in summ["summary"]
+        assert summ["summary"].startswith("[x-video audio pending STT replay] ")
+        assert "task queue" in summ["summary"]
+
+    def test_summarize_no_content_still_reports_not_retrieved(self):
+        item = {"subject": "Cost optimization", "url": "https://x.com/i/status/8", "type": "x"}
+        resolved = ld._partial("x", "Grok could not access the post (CANNOT_ACCESS)")
+        summ = ld.summarize_item(item, resolved, call_fn=lambda p, m: "{}")
+        assert summ["content_retrieved"] is False
+        assert summ["summary"].startswith("content not retrieved -- from title/sender only")
+        assert "CANNOT_ACCESS" in summ["summary"]
+
+    def test_render_omits_not_retrieved_banner_when_content_retrieved(self):
+        keeper = {"title": "Best", "url": "https://x.com/i/status/7", "summary": "s",
+                  "why": "w", "bucket": "General/Reference", "has_action": False,
+                  "action": "", "partial": True, "content_retrieved": True}
+        html = ld.render_digest_html([{"topic": "T", "superseded": [], "keepers": [keeper]}])
+        assert "content not retrieved" not in html
+
+    def test_render_shows_not_retrieved_banner_when_no_content(self):
+        keeper = {"title": "Best", "url": "https://x.com/i/status/8", "summary": "s",
+                  "why": "w", "bucket": "General/Reference", "has_action": False,
+                  "action": "", "partial": True, "content_retrieved": False}
+        html = ld.render_digest_html([{"topic": "T", "superseded": [], "keepers": [keeper]}])
+        assert "content not retrieved" in html

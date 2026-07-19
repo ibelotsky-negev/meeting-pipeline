@@ -1120,8 +1120,10 @@ def summarize_item(item: dict, resolved: dict, call_fn=None) -> dict:
     """Produce the per-item summary that feeds clustering + curation.
 
     Returns: title, type, url, subject, content_date, tools[], specifics[],
-    summary, confidence, partial. A partial/unfetched item is summarized from
-    its title/sender only and never fabricated."""
+    summary, confidence, partial. An item with NO retrieved content is summarized
+    from its title/sender only; an item with partial content (e.g. an X-video
+    whose spoken transcript is pending STT) is summarized from what was retrieved,
+    flagged with its pending reason. Never fabricated."""
     call_fn = call_fn or _call_claude_text
     subject = (item.get("subject") or "").strip()
     # Source URL for the digest/Asana link. Prefer the resolver's citation (X
@@ -1137,9 +1139,10 @@ def summarize_item(item: dict, resolved: dict, call_fn=None) -> dict:
         "title": subject or url, "type": kind, "url": url, "subject": subject,
         "content_date": resolved.get("content_date"), "tools": [], "specifics": [],
         "summary": "", "confidence": "low", "partial": partial,
+        "content_retrieved": bool(content),
     }
 
-    if partial or not content:
+    if not content:
         base["summary"] = "content not retrieved -- from title/sender only"
         if resolved.get("reason"):
             base["summary"] += f" ({resolved['reason']})"
@@ -1168,6 +1171,12 @@ def summarize_item(item: dict, resolved: dict, call_fn=None) -> dict:
     base["specifics"] = parsed.get("specifics") or []
     base["summary"] = (parsed.get("summary") or "").strip() or "(no summary produced)"
     base["confidence"] = parsed.get("confidence") or "medium"
+    # Partial-but-retrieved (e.g. an X-video where Grok returned the visual/text
+    # description but the spoken transcript is still pending STT replay): keep the
+    # summary of what we DID get, and prefix the pending reason so the reader knows
+    # a fuller transcript is coming from the replay pass.
+    if partial and resolved.get("reason"):
+        base["summary"] = f"[{resolved['reason']}] " + base["summary"]
     return base
 
 
@@ -1523,7 +1532,7 @@ def render_digest_html(curated: list) -> str:
             title, url = _esc(k.get("title")), _esc(k.get("url"))
             link = f'<a href="{url}" style="color:#2b6cb0;text-decoration:none;">{title}</a>' if url else title
             parts.append(f'<div style="margin-top:10px;font-weight:bold;">{link}</div>')
-            if k.get("partial"):
+            if k.get("partial") and not k.get("content_retrieved"):
                 parts.append('<div style="color:#b7791f;font-size:12px;">content not retrieved -- from title/sender only</div>')
             parts.append(f'<div style="margin-top:3px;">{_esc(k.get("summary"))}</div>')
             if k.get("why"):
