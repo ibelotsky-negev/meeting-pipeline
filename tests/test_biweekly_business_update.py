@@ -30,6 +30,7 @@ def archive_dir(monkeypatch, tmp_path):
 def status_path(monkeypatch, tmp_path):
     p = tmp_path / "biweekly_status.json"
     monkeypatch.setattr(bwu, "STATUS_PATH", str(p))
+    monkeypatch.setattr(bwu, "HISTORY_PATH", str(tmp_path / "biweekly_history.json"))
     return p
 
 
@@ -270,6 +271,68 @@ def test_run_biweekly_window_override(monkeypatch, status_path):
                      end_override=datetime(2026, 6, 14, tzinfo=timezone.utc))
     assert seen["s"] == datetime(2026, 6, 1, tzinfo=timezone.utc)
     assert seen["e"] == datetime(2026, 6, 14, tzinfo=timezone.utc)
+
+
+# ----------------------------------------------------------------------
+#  incremental history (do not re-report prior updates)
+# ----------------------------------------------------------------------
+
+
+def _win(s, e):
+    return {"start": s.isoformat(), "end": e.isoformat()}
+
+
+def test_previous_update_selects_latest_prior(status_path):
+    d = datetime
+    bwu.append_history(_win(d(2026, 6, 1, tzinfo=timezone.utc), d(2026, 6, 14, tzinfo=timezone.utc)),
+                       "JUNE 1-14 UPDATE", "2026-06-16T00:00:00+00:00")
+    bwu.append_history(_win(d(2026, 6, 15, tzinfo=timezone.utc), d(2026, 6, 28, tzinfo=timezone.utc)),
+                       "JUNE 15-28 UPDATE", "2026-06-30T00:00:00+00:00")
+    # For a window starting Jun 29, the Jun 15-28 update is the prior one.
+    prev = bwu.previous_update_markdown(d(2026, 6, 29, tzinfo=timezone.utc))
+    assert prev == "JUNE 15-28 UPDATE"
+
+
+def test_previous_update_ignores_overlapping_and_future(status_path):
+    d = datetime
+    bwu.append_history(_win(d(2026, 6, 15, tzinfo=timezone.utc), d(2026, 6, 28, tzinfo=timezone.utc)),
+                       "JUNE 15-28 UPDATE", "2026-06-30T00:00:00+00:00")
+    # A window that ends AFTER our start (overlaps/future) must not be picked.
+    prev = bwu.previous_update_markdown(d(2026, 6, 20, tzinfo=timezone.utc))
+    assert prev is None
+
+
+def test_previous_update_none_when_empty(status_path):
+    assert bwu.previous_update_markdown(datetime(2026, 7, 1, tzinfo=timezone.utc)) is None
+
+
+def test_append_history_trims_to_keep(status_path, monkeypatch):
+    monkeypatch.setattr(bwu, "HISTORY_KEEP", 3)
+    d = datetime
+    for i in range(5):
+        bwu.append_history(_win(d(2026, 1, 1, tzinfo=timezone.utc), d(2026, 1, 1 + i, tzinfo=timezone.utc)),
+                           f"UPDATE {i}", "2026-01-10T00:00:00+00:00")
+    hist = bwu._load_history()
+    assert len(hist) == 3
+    assert [h["markdown"] for h in hist] == ["UPDATE 2", "UPDATE 3", "UPDATE 4"]
+
+
+def test_run_biweekly_success_appends_history(monkeypatch, status_path):
+    monkeypatch.setattr(bwu, "select_pulses", lambda s, e: [{"filename": "w.json"}])
+    monkeypatch.setattr(bwu, "distill_business_update", lambda p, s, e: "## Update\n\n- item")
+    monkeypatch.setattr(bwu, "send_update_email", lambda *a, **k: None)
+    bwu.run_biweekly(start_override=datetime(2026, 6, 15, tzinfo=timezone.utc),
+                     end_override=datetime(2026, 6, 28, tzinfo=timezone.utc))
+    hist = bwu._load_history()
+    assert len(hist) == 1
+    assert "Update" in hist[0]["markdown"]
+
+
+def test_run_biweekly_dry_run_does_not_append_history(monkeypatch, status_path):
+    monkeypatch.setattr(bwu, "select_pulses", lambda s, e: [{"filename": "w.json"}])
+    monkeypatch.setattr(bwu, "distill_business_update", lambda p, s, e: "## Update\n\n- item")
+    bwu.run_biweekly(dry_run=True)
+    assert bwu._load_history() == []
 
 
 # ----------------------------------------------------------------------

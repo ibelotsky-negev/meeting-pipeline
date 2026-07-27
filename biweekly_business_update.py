@@ -75,6 +75,18 @@ STATUS_PATH = (
                       "biweekly_business_update_status.json")
 )
 
+# Rolling archive of past updates so each new update can be made INCREMENTAL --
+# report only what changed since the previous update, rather than re-narrating
+# still-true items (a rename, a closed financing) that prior updates already
+# covered. Lives on the volume next to the status file.
+HISTORY_PATH = (
+    "/data/biweekly_history.json"
+    if os.path.isdir("/data")
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "biweekly_history.json")
+)
+HISTORY_KEEP = int(os.environ.get("BIWEEKLY_HISTORY_KEEP", "12"))
+
 
 # ======================================================================
 #  TIME HELPERS
@@ -147,7 +159,7 @@ def select_pulses(start_dt: datetime, end_dt: datetime, archive_dir: str = None)
 # the dense, technical weekly pulse into a plain-language business update written
 # in Ken's own voice (first person, narrative, numbered moves -- see the email
 # style Ken approved).
-DISTILL_SYSTEM_PROMPT = """You are writing as Ken Belotsky, lead of Negev Labs, sending a periodic business status update to the internal Negev Labs team. Write the EMAIL BODY in Ken's voice -- first person plural ("we"), confident, direct, specific. This is a finished email the team reads as-is.
+DISTILL_SYSTEM_PROMPT = """You are writing as Ken Belotsky, lead of Palomar Labs (formerly Negev Labs), sending a periodic business status update to the internal Palomar Labs team. Write the EMAIL BODY in Ken's voice -- first person plural ("we"), confident, direct, specific. This is a finished email the team reads as-is.
 
 Distill the weekly pulse report(s) provided into ONLY the significant business moves of the period, told as a short narrative. Strip all technical and scientific detail.
 
@@ -163,6 +175,7 @@ STRIP (never include -- not even in passing, not even inside a narrative sentenc
 
 RULES:
 - Merge items that appear in more than one pulse; report the NET state over the whole period.
+- INCREMENTAL: this is a recurring update. If an "ALREADY REPORTED IN THE PREVIOUS UPDATE" section is provided, treat everything in it as already communicated to the team -- do NOT re-report it. Surface a topic only if there is genuinely NEW progress or a material change this period, framed as the new development. A one-time announcement from an earlier update (a company rename, a closed financing round) is NOT news again -- omit it unless there is a concrete new development on it this period.
 - Never upgrade status: "committed" is not "wired", "in diligence" is not "closed".
 - Drop internal pulse tags ([CONFIRMED], [ADVANCING], [AT RISK]) and any [Recording] links.
 - No filler, no hedging. Banned openers: "Just checking in", "I just wanted to", "I hope this finds you well".
@@ -196,10 +209,27 @@ def distill_business_update(pulses: list, start_dt: datetime, end_dt: datetime) 
     source = "\n\n".join(sections)
 
     period_label = f"{start_dt.strftime('%B %d')} - {end_dt.strftime('%B %d, %Y')}"
+
+    # Make the update INCREMENTAL: give the model the previous update so it does
+    # not re-report items the team has already seen (only genuinely new progress).
+    prior_block = ""
+    try:
+        prev = previous_update_markdown(start_dt)
+    except Exception as e:
+        prev = None
+        logger.warning(f"Could not load previous update (non-fatal): {e}")
+    if prev:
+        prior_block = (
+            "\n\nALREADY REPORTED IN THE PREVIOUS UPDATE (the team has already seen "
+            "all of this -- do NOT repeat any of it as a news item; include a topic "
+            "only if there is genuinely NEW progress or a material change since, and "
+            "frame it as the new development, not a restatement):\n" + prev)
+
     user_prompt = (
         f"Period covered: {period_label}\n"
         f"Source: {len(pulses)} weekly pulse report(s) below.\n\n"
-        f"{source}\n\n"
+        f"{source}"
+        f"{prior_block}\n\n"
         f"Produce the biweekly business update for {period_label} now. Markdown only."
     )
 
@@ -336,6 +366,46 @@ def read_status() -> dict:
         return {"status": "error", "error": f"could not read status: {e}"}
 
 
+def _load_history() -> list:
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.warning(f"Could not read biweekly history: {e}")
+        return []
+
+
+def append_history(window: dict, markdown: str, completed_at: str):
+    """Record a sent update so later runs can diff against it. Best effort --
+    a history-write failure never breaks the run."""
+    hist = _load_history()
+    hist.append({"window": window, "markdown": markdown, "completed_at": completed_at})
+    hist = hist[-HISTORY_KEEP:]
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(hist, f, default=str, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not write biweekly history: {e}")
+
+
+def previous_update_markdown(start_dt: datetime) -> str:
+    """Markdown of the most recent archived update whose window ended on or before
+    this window's start -- the true 'previous update' to make this one
+    incremental against. Returns None when there is no prior update."""
+    prior = []
+    for h in _load_history():
+        end = _parse_iso((h.get("window") or {}).get("end"))
+        if end is not None and end <= start_dt:
+            prior.append((end, h.get("markdown") or ""))
+    if not prior:
+        return None
+    prior.sort(key=lambda t: t[0])
+    return prior[-1][1] or None
+
+
 # ======================================================================
 #  CADENCE GATE
 # ======================================================================
@@ -418,6 +488,8 @@ def run_biweekly(dry_run: bool = False, start_override: datetime = None,
             "subject": subject, "markdown": markdown, "body": html_body,
         }
         write_status(status)
+        if sent:
+            append_history(window, markdown, status["completed_at"])
         return status
     except Exception as e:
         tb = _tb.format_exc()
