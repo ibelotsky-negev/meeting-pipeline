@@ -11,6 +11,7 @@
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -57,12 +58,22 @@ def stub_folders(monkeypatch):
     return mapping
 
 
+def _iso_hours_ago(hours):
+    """Received-time for a message that must land INSIDE the run window.
+    Recency is measured against wall-clock now, so a fixture that has to
+    survive the guard MUST use a relative offset: a hardcoded calendar date
+    silently rots into a stale-drop once it ages past the window, turning the
+    test it belongs to into a false failure (this bit the dedup test on
+    2026-07-25). Tests asserting the stale path hardcode a date on purpose --
+    those sit far in the past and only get safer as time passes."""
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _msg(mid, subject, sender, body="", folder_received=None):
     if folder_received is None:
         # Default to "recent" so messages survive the recency guard in any
         # reasonable window; tests that exercise recency pass an explicit date.
-        from datetime import datetime, timezone, timedelta
-        folder_received = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        folder_received = _iso_hours_ago(1)
     return {
         "id": mid, "subject": subject,
         "from": {"emailAddress": {"address": sender}},
@@ -710,13 +721,14 @@ class TestRunDedup:
                 "Kubasov invited you to Relay"]
         msgs = [_msg(f"kub{i}", s, "invites@relayfi.com",
                      "Alexander Kubasov invited you to set up Relay banking.",
-                     folder_received=f"2026-06-2{i}T10:00:00Z") for i, s in enumerate(subs)]
+                     folder_received=_iso_hours_ago(i + 1)) for i, s in enumerate(subs)]
         monkeypatch.setattr(ft, "fetch_messages",
                             lambda fid, s, processed_ids=None, backlog=False, limit=None:
                             (msgs, False) if fid == SRC_NOTIF else ([], False))
         monkeypatch.setattr(ft, "classify_message", lambda m, call_fn=None: ("IMPORTANT", "invite"))
         monkeypatch.setattr(ft, "move_to_fyi", MagicMock(return_value=True))
         res = ft.run_fyi(dry_run=True, days=30)  # wide window so recency keeps all 5
+        assert res["dropped_stale"] == 0, "recency guard must not eat the dedup fixture"
         important = [d for d in res["decisions"] if d["decision"] == "IMPORTANT"]
         assert len(important) == 1, important
 
