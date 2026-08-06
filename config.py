@@ -50,7 +50,7 @@ NOTIFY_VIA = os.environ.get("NOTIFY_VIA", "email")  # "email" (per-organizer), "
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared ops channel for admin visibility
 BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@palomar-labs.com (shared mailbox)
-BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
+BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Palomar Chief of Staff")
 # Internal domains -- emails outside these domains are never sent notifications
 INTERNAL_DOMAINS = [d.strip().lower() for d in os.environ.get("INTERNAL_DOMAINS", "negevlabs.com,negevcap.com,ariadnebio.com,zirmania.com,palomar-labs.com").split(",") if d.strip()]
 # HubSpot owner map: maps organizer email -- HubSpot owner ID
