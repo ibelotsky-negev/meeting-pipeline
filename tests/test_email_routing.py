@@ -11,6 +11,14 @@ class TestNormalizeTeamEmail:
     def test_negevcap_alias_maps_to_negevlabs(self):
         assert app_module.normalize_team_email("kostia@negevcap.com") == "ka@negevlabs.com"
 
+    def test_palomar_labs_aliases_map_to_negevlabs(self):
+        # Negev Labs -> Palomar Labs rename (2026-08-06): team also sends
+        # from @palomar-labs.com now; canonical identity stays @negevlabs.com.
+        assert app_module.normalize_team_email("ken@palomar-labs.com") == "bk@negevlabs.com"
+        assert app_module.normalize_team_email("shlomi@palomar-labs.com") == "shlomi@negevlabs.com"
+        assert app_module.normalize_team_email("kostia@palomar-labs.com") == "ka@negevlabs.com"
+        assert app_module.normalize_team_email("dan@palomar-labs.com") == "dan@negevlabs.com"
+
     def test_case_insensitive_and_strips_whitespace(self):
         assert app_module.normalize_team_email("  Shlomi@AriadneBio.COM ") == "shlomi@negevlabs.com"
 
@@ -29,6 +37,9 @@ class TestIsInternalEmail:
 
     def test_case_insensitive(self):
         assert app_module.is_internal_email("BK@NegevLabs.COM")
+
+    def test_palomar_labs_domain_is_internal(self):
+        assert app_module.is_internal_email("ken@palomar-labs.com")
 
     def test_external_domains_not_matched(self):
         assert not app_module.is_internal_email("user@gmail.com")
@@ -49,6 +60,12 @@ class TestResolveHubspotOwner:
 
     def test_shlomi_alias_email_resolves_via_normalization(self):
         assert app_module.resolve_hubspot_owner("shlomi@ariadnebio.com") == "31267643"
+
+    def test_shlomi_palomar_labs_alias_resolves_via_normalization(self):
+        assert app_module.resolve_hubspot_owner("shlomi@palomar-labs.com") == "31267643"
+
+    def test_ken_palomar_labs_alias_resolves_via_normalization(self):
+        assert app_module.resolve_hubspot_owner("ken@palomar-labs.com") == "241153249"
 
     def test_kostia_no_seat_falls_back_to_ken(self, monkeypatch):
         api_calls = []

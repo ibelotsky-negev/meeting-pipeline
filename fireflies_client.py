@@ -43,10 +43,19 @@ def get_recent_transcripts(since_minutes: int = 30) -> list:
         try:
             ds = t.get("dateString", "")
             if isinstance(ds, (int, float)):
-                t_date = datetime.fromtimestamp(ds / 1000 if ds > 1e12 else ds, tz=timezone.utc)
+                t_start = datetime.fromtimestamp(ds / 1000 if ds > 1e12 else ds, tz=timezone.utc)
             else:
-                t_date = datetime.fromisoformat(str(ds).replace("Z", "+00:00"))
-            if t_date >= cutoff:
+                t_start = datetime.fromisoformat(str(ds).replace("Z", "+00:00"))
+            # Gate on meeting END time (start + duration), not start time.
+            # A poll window is meant to catch "transcript became available
+            # recently" -- filtering on start alone silently drops any
+            # meeting longer than the window itself, because by the time
+            # Fireflies finishes processing it the start timestamp has
+            # already scrolled out of the lookback (bit an 86-min meeting
+            # on 2026-08-05: never picked up by webhook OR poll).
+            duration_min = t.get("duration") or 0
+            t_end = t_start + timedelta(minutes=duration_min)
+            if t_end >= cutoff:
                 recent.append(t)
         except (ValueError, TypeError, OSError):
             continue

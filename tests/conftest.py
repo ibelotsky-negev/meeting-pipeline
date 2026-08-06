@@ -20,7 +20,7 @@ os.environ["DATA_DIR"] = _TEST_DATA_DIR
 os.environ["RUN_SCHEDULER"] = "0"
 # Production-like domain config (Railway INTERNAL_DOMAINS includes these)
 os.environ["INTERNAL_DOMAINS"] = (
-    "negevlabs.com,negevcap.com,ariadnebio.com,adres.bio,zirmania.onmicrosoft.com"
+    "negevlabs.com,negevcap.com,ariadnebio.com,adres.bio,zirmania.onmicrosoft.com,palomar-labs.com"
 )
 os.environ["HUBSPOT_OWNER_MAP"] = (
     '{"bk@negevlabs.com":"241153249",'

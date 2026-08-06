@@ -52,7 +52,7 @@ TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared 
 BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@negevlabs.com (shared mailbox)
 BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
 # Internal domains -- emails outside these domains are never sent notifications
-INTERNAL_DOMAINS = [d.strip().lower() for d in os.environ.get("INTERNAL_DOMAINS", "negevlabs.com,negevcap.com,ariadnebio.com,zirmania.com").split(",") if d.strip()]
+INTERNAL_DOMAINS = [d.strip().lower() for d in os.environ.get("INTERNAL_DOMAINS", "negevlabs.com,negevcap.com,ariadnebio.com,zirmania.com,palomar-labs.com").split(",") if d.strip()]
 # HubSpot owner map: maps organizer email -- HubSpot owner ID
 # Supports two formats:
 #   JSON:   {"bk@negevlabs.com":"241153249","shlomi@negevlabs.com":"241153250"}
@@ -102,6 +102,14 @@ EMAIL_ALIAS_MAP = {
     "kostia@negevcap.com": "ka@negevlabs.com",
     "dan@ariadnebio.com": "dan@negevlabs.com",
     "bk@ariadnebio.com": "bk@negevlabs.com",
+    # Negev Labs -> Palomar Labs rename (2026-08-06): team now also sends from
+    # @palomar-labs.com. Canonical identity stays @negevlabs.com everywhere
+    # downstream (HubSpot owner map, Asana, TEAM_MEMBER_NAMES) -- only the
+    # alias resolves. See INTERNAL_DOMAINS below for the matching domain add.
+    "ken@palomar-labs.com": "bk@negevlabs.com",
+    "shlomi@palomar-labs.com": "shlomi@negevlabs.com",
+    "kostia@palomar-labs.com": "ka@negevlabs.com",
+    "dan@palomar-labs.com": "dan@negevlabs.com",
 }
 # Also load from env var for runtime updates without redeploy
 EMAIL_ALIAS_MAP_RAW = os.environ.get("EMAIL_ALIAS_MAP", "")

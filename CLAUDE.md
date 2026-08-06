@@ -18,7 +18,9 @@ Sara is a post-meeting intelligence pipeline for Negev Labs (biotech venture stu
 | Dan Jeffries | dan@negevlabs.com | 31299775 | |
 | Kostia Adamsky | ka@negevlabs.com | N/A | No HubSpot seat |
 
-Internal domains: `negevlabs.com`, `negevcap.com`, `ariadnebio.com`, `adres.bio`, `zirmania.onmicrosoft.com` (must match INTERNAL_DOMAINS env var on Railway)
+Negev Labs -> Palomar Labs rename (2026-08-06): the team also sends/organizes from `ken@`, `shlomi@`, `dan@`, `kostia@palomar-labs.com` now. Canonical identity everywhere downstream (HubSpot owner map, Asana, TEAM_MEMBER_NAMES) stays the `@negevlabs.com` addresses above -- `EMAIL_ALIAS_MAP` in [config.py](config.py) resolves the new addresses to them.
+
+Internal domains: `negevlabs.com`, `negevcap.com`, `ariadnebio.com`, `adres.bio`, `zirmania.onmicrosoft.com`, `palomar-labs.com` (must match INTERNAL_DOMAINS env var on Railway)
 
 ## Module Layout
 
@@ -395,6 +397,7 @@ helpers (app-only token, graph_get / graph_post, html_to_text); `learn_digest`
 | Daily digest owner names blank / 403 | Missing HubSpot crm.objects.owners.read scope | Grant + reconnect HubSpot (granted 2026-06-14) |
 | FYI Triage classifies but never moves | Dual gate not fully open | Set BOTH `?live=1` AND env `FYI_LIVE=1`; absent either it stays DRY by design |
 | FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
+| Meeting never got a Phase-1 email (no webhook log line for its transcript id) | Poll's fallback window used to gate on meeting START time only ([fireflies_client.py](fireflies_client.py) `get_recent_transcripts`); a meeting longer than the window (default 15 min) had its start timestamp scroll out of the cutoff before the transcript was ready, and if the webhook also missed it the meeting was silently never processed | Fixed @2.27.0 -- window now gates on end time (start + duration). If a meeting still slips through, replay it manually via `/process/<transcript_id>` |
 | X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
 | Read/Learn digest silently empty ("no unread items") | Saved items are forwarded-to-self and arrive READ; pre-2.23.0 runs were unread-only and skipped them | Fixed @2.23.0: normal runs use a trailing `LEARN_LOOKBACK_DAYS` window, read/unread agnostic. For older-than-window backlog use `/learn/run?backlog=1` |
 | Read/Learn X-video shows "content not retrieved" / STT never arrives | Post has no NATIVE downloadable video (Grok VIDEO_WITH_AUDIO over-fired), or video > 60-min cap; yt-dlp can't fetch it | Expected for those posts -- @2.25.0 the digest now surfaces Grok's visual/text summary (prefixed `[x-video audio pending STT replay]`) instead of discarding it; unfetchable entries cycle to `failed` after 3 attempts. Only genuinely-short native X clips transcribe |
