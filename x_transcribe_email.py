@@ -46,7 +46,7 @@ logger = logging.getLogger("x-transcribe-email")
 #  CONFIG
 # ======================================================================
 
-SARA_MAILBOX = os.environ.get("BOT_SENDER_EMAIL", "sara@negevlabs.com")
+SARA_MAILBOX = os.environ.get("BOT_SENDER_EMAIL", "sara@palomar-labs.com")
 
 _DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
 STORE_PATH = os.path.join(_DATA_DIR, "x_transcribe_email.json")

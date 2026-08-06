@@ -42,7 +42,7 @@ CORRECTIONS_PATH = (
 )
 
 # Mailbox Sara sends from and receives replies in.
-SARA_MAILBOX = os.environ.get("BOT_SENDER_EMAIL", "sara@negevlabs.com")
+SARA_MAILBOX = os.environ.get("BOT_SENDER_EMAIL", "sara@palomar-labs.com")
 
 # Only these senders may submit corrections (prompt-injection guard -- Sara's
 # mailbox can receive external mail). Comma-separated; defaults to Ken.

@@ -163,7 +163,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Daily Pipeline Digest:** daily 06:45 IST (03:45 UTC), compiles every change + new activity in the NL 2026 Fundraise HubSpot pipeline over the trailing window (default 24h, resilient to missed runs), narrates deltas rather than state, applies Negev operating rules (stale-deal / overdue-task / wire-watch flags), and emails Ken a single morning brief (`daily_pipeline_digest.py`). See the daily-pipeline-digest Module section.
 - **Read/Learn Digest:** Friday 06:00 Asia/Jerusalem, drains Ken's Outlook "read/learn" folder, resolves each saved link, Opus cluster+curate against a Ken's-needs profile, emails one HTML digest + creates Asana keeper tasks (`learn_digest.py`). See the Read/Learn Digest Module section.
 - **FYI Triage:** daily 06:00 Asia/Jerusalem, scans the two high-volume auto-filed folders "4: notification" + "8: marketing", classifies each message IMPORTANT vs NOISE with Sonnet (reading the body, not just the from-address), and MOVES the important ones to "2: FYI". Dual-gated (`?live=1` AND env `FYI_LIVE=1`) -- ships DRY, auto-promotes to live once Ken sets `FYI_LIVE` (`fyi_triage.py`). See the FYI Triage Module section + ROLLOUT.md.
-- **X-transcribe-email:** any internal teammate emails Sara (`sara@negevlabs.com`) an x.com/twitter.com post link; a 15-min inbox scan transcribes each X video (reuses `learn_digest.extract_x_post_audio` + `_grok_stt_from_file`), summarizes with Claude, and REPLIES to the sender with a structured summary in the body + the full transcript as a `.md` attachment per link (`x_transcribe_email.py`). See the x-transcribe-email Module section.
+- **X-transcribe-email:** any internal teammate emails Sara (`sara@palomar-labs.com`) an x.com/twitter.com post link; a 15-min inbox scan transcribes each X video (reuses `learn_digest.extract_x_post_audio` + `_grok_stt_from_file`), summarizes with Claude, and REPLIES to the sender with a structured summary in the body + the full transcript as a `.md` attachment per link (`x_transcribe_email.py`). See the x-transcribe-email Module section.
 
 ## email-pipeline-sync Module
 
@@ -405,7 +405,7 @@ helpers (app-only token, graph_get / graph_post, html_to_text); `learn_digest`
 
 ## Environment Variables (Railway)
 
-Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_API_KEY`, `ASANA_API_KEY`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`, `MS_GRAPH_TENANT_ID`, `HUBSPOT_OWNER_MAP`, `BOT_SENDER_EMAIL=sara@negevlabs.com`, `ASANA_PROJECT_GID=1213263339592202`, `ASANA_WORKSPACE_GID=597593980065511`
+Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_API_KEY`, `ASANA_API_KEY`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`, `MS_GRAPH_TENANT_ID`, `HUBSPOT_OWNER_MAP`, `BOT_SENDER_EMAIL=sara@palomar-labs.com`, `ASANA_PROJECT_GID=1213263339592202`, `ASANA_WORKSPACE_GID=597593980065511`
 
 Read/Learn: optional `LEARN_LOOKBACK_DAYS` (trailing window for normal/cron runs, default 14; read/unread agnostic), `LEARN_CONCURRENCY`, `LEARN_CURRENCY_CHECK`, resolver keys `XAI_API_KEY` / `SPOKEN_API_KEY` / `JINA_API_KEY` (read at call time; absent = degrade, never fabricate).
 

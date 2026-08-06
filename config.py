@@ -49,7 +49,7 @@ APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8080")  # Your d
 NOTIFY_VIA = os.environ.get("NOTIFY_VIA", "email")  # "email" (per-organizer), "teams" (shared ops channel), or "email,teams" for both
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL", "")  # Optional: shared ops channel for admin visibility
-BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@negevlabs.com (shared mailbox)
+BOT_SENDER_EMAIL = os.environ.get("BOT_SENDER_EMAIL", "")  # e.g. sara@palomar-labs.com (shared mailbox)
 BOT_SENDER_NAME = os.environ.get("BOT_SENDER_NAME", "Sara - Negev Chief of Staff")
 # Internal domains -- emails outside these domains are never sent notifications
 INTERNAL_DOMAINS = [d.strip().lower() for d in os.environ.get("INTERNAL_DOMAINS", "negevlabs.com,negevcap.com,ariadnebio.com,zirmania.com,palomar-labs.com").split(",") if d.strip()]
@@ -159,7 +159,7 @@ SUBSCRIPTION_FILE = os.path.join(DATA_DIR, "graph_subscription.json")
 # ======================================================================
 
 PULSE_RECIPIENTS = ["bk@negevlabs.com", "vu@negevcap.com"]
-PULSE_SENDER = "sara@negevlabs.com"
+PULSE_SENDER = "sara@palomar-labs.com"
 PULSE_DOMAINS = ["negevlabs.com", "ariadnebio.com"]
 PULSE_ARCHIVE_DIR = os.path.join(DATA_DIR, "pulse")
 PULSE_LOOKBACK_DAYS = 7
