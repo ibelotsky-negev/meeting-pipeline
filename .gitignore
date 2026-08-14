@@ -5,6 +5,7 @@ __pycache__/
 .claude/worktrees/
 .claude/.loop_state.json
 .claude/settings.local.json
+.superpowers/
 teams_env.txt
 email_pipeline_sync.db
 .env
