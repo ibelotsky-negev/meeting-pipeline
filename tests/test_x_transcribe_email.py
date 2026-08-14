@@ -93,22 +93,31 @@ class TestLinkDetection:
         assert kinds.get("https://open.spotify.com/episode/xyz") == "podcast"
         assert not any("example.com" in u for u, _ in pairs)   # articles are not requests
 
-    def test_keeps_x_profile_but_drops_nav_pages(self):
-        html = 'profile https://x.com/someone nav https://x.com/home'
+    def test_drops_x_profile_and_nav_pages(self):
+        """REVERSAL (was test_keeps_x_profile_but_drops_nav_pages): a profile
+        URL used to be returned so it earned an honest "no video found" reply.
+        It is now dropped like any other container -- see
+        TestContainerUrlsAreNotRequests for why."""
+        html = ('profile https://x.com/someone nav https://x.com/home '
+                'post https://x.com/i/status/111')
         pairs = xte.find_media_links(html)
-        assert any(u.rstrip("/").endswith("someone") for u, _ in pairs)  # -> honest no-video reply
+        assert not any(u.rstrip("/").endswith("someone") for u, _ in pairs)
         assert not any(u.rstrip("/").endswith("x.com/home") for u, _ in pairs)
+        assert [u for u, _ in pairs] == ["https://x.com/i/status/111"]   # the post survives
 
     def test_dedups_x_by_normalized_url(self):
         html = "a https://x.com/i/status/111 b https://X.com/i/status/111/ c"
         assert len(xte.find_media_links(html)) == 1
 
     def test_dedups_youtube_by_case_and_trailing_slash(self):
-        html = "a https://youtu.be/AbC/ b https://youtu.be/AbC c"
+        # The id has to be one _youtube_id actually parses (6+ chars): a URL
+        # with no parseable video id is now a container and is dropped.
+        html = "a https://youtu.be/AbCdefg/ b https://youtu.be/AbCdefg c"
         assert len(xte.find_media_links(html)) == 1
 
     def test_preserves_first_seen_order(self):
-        html = "yt https://www.youtube.com/watch?v=one then x https://x.com/i/status/222"
+        html = ("yt https://www.youtube.com/watch?v=oneVideoId "
+                "then x https://x.com/i/status/222")
         pairs = xte.find_media_links(html)
         assert [k for _, k in pairs] == ["youtube", "x"]
 
@@ -132,12 +141,12 @@ class TestLinkDetection:
         pairs = xte.find_media_links(html)
         assert len(pairs) == 1  # collapsed by extract_urls case-insensitive dedup
 
-    def test_youtube_unparseable_id_still_processed(self):
-        # If video ID extraction fails, fall back to lexical form so no crash
-        html = 'invalid https://youtube.com/foo/bar/baz'
-        pairs = xte.find_media_links(html)
-        assert len(pairs) == 1
-        assert pairs[0][1] == "youtube"
+    def test_youtube_unparseable_id_is_dropped(self):
+        """REVERSAL (was test_youtube_unparseable_id_still_processed): a
+        YouTube URL with no parseable video id used to be kept and handed on.
+        It cannot name a single video, so it is now dropped like any other
+        container -- see TestContainerUrlsAreNotRequests."""
+        assert xte.find_media_links('invalid https://youtube.com/foo/bar/baz') == []
 
     def test_podcast_case_variant_ids_collapse_upstream_in_extract_urls(self):
         # Case-variant URLs are deduplicated by ld.extract_urls (learn_digest.py:554,
@@ -518,7 +527,7 @@ class TestSourceWiring:
                                                                 "error": "nope", "transcript": "",
                                                                 "chars": 0, "source": ""})
         _mock_inbox(monkeypatch, [_msg("k1", "bk@negevlabs.com", "mixed",
-                                       "https://x.com/i/status/111 https://youtu.be/abc")])
+                                       "https://x.com/i/status/111 https://youtu.be/abcdefghijk")])
         _capture_graph(monkeypatch)
         xte.run()
         assert seen == ["x", "youtube"]
@@ -1176,6 +1185,172 @@ class TestAutoReplyHyphenForm:
     def test_precedence_list_is_still_a_real_message(self):
         assert not xte.is_auto_reply({"internetMessageHeaders": [
             {"name": "Precedence", "value": "list"}]})
+
+
+# ----------------------------------------------------------------------
+#  Task 9 -- a container URL is not a transcription request
+# ----------------------------------------------------------------------
+
+class TestContainerUrlsAreNotRequests:
+    """A CONTAINER url -- one naming a channel, profile, playlist or show
+    rather than a single item -- produces no entry at all, exactly like an
+    article URL.
+
+    This REVERSES the original spec decision that ANY X link is returned "so a
+    link with no video still earns an honest no-video reply". That rationale
+    assumed the only way to reach Sara was to deliberately email her a link.
+    Ordinary mail and follow-up questions now flow through the same gate (and
+    Sara's inbox is shared with sara_corrections.py), so a container URL in a
+    signature dropped the question and sent an unsolicited reply. The
+    already-cached-link gate cannot help: a container URL can NEVER be cached
+    -- a channel cannot transcribe, a profile has no video, a show is always
+    unsupported -- so it could never self-heal."""
+
+    @pytest.mark.parametrize("url", [
+        "https://x.com/palomarlabs",                        # profile
+        "https://twitter.com/someone",
+        "https://x.com/home",                               # nav page
+        "https://www.youtube.com/@palomarlabs",             # handle
+        "https://www.youtube.com/c/SomeName",
+        "https://www.youtube.com/user/SomeName",
+        "https://www.youtube.com/channel/UCabcdefghij",
+        "https://www.youtube.com/playlist?list=PLabcdefgh",
+        "https://open.spotify.com/show/abc123",
+        "https://open.spotify.com/playlist/abc123",
+    ])
+    def test_container_url_yields_no_entry(self, url):
+        assert xte.find_media_links(f"see {url} thanks") == []
+
+    @pytest.mark.parametrize("url", [
+        "https://x.com/i/status/123",
+        "https://x.com/someone/status/456",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://youtu.be/dQw4w9WgXcQ",
+        "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+        "https://open.spotify.com/episode/abc123",           # still an item
+    ])
+    def test_single_item_url_is_still_detected(self, url):
+        assert [u for u, _ in xte.find_media_links(f"see {url} thanks")] == [url]
+
+    def test_spotify_show_gets_no_reply_at_all(self, xte_files, monkeypatch):
+        """The /show/ page is a container: silence, not the unsupported reply."""
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("sh1", "bk@negevlabs.com", "listen",
+                                       "https://open.spotify.com/show/abc123")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 0
+        assert calls == []
+
+    def test_spotify_episode_still_gets_the_unsupported_reply(self, xte_files, monkeypatch):
+        """The item URL keeps its honest "podcasts not supported yet" reply --
+        the reversal drops containers, not detected items."""
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("ep1", "bk@negevlabs.com", "listen",
+                                       "https://open.spotify.com/episode/abc123")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 1
+        assert "not supported yet" in _sent_bodies(calls)[0]
+
+    def test_followup_with_an_uncached_profile_link_is_answered_not_transcribed(
+            self, xte_files, monkeypatch):
+        """END TO END. The gate added in the previous wave only recognized an
+        ALREADY-CACHED link, and a profile URL can never be cached -- so a
+        signature carrying one dropped the question and sent an off-topic
+        failure reply instead of answering."""
+        _cached("CONV-A", "https://x.com/i/status/1")
+        monkeypatch.setattr(xte, "answer_question",
+                            lambda q, links: "ANSWER: margins are 80 percent")
+        seen = []
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": seen.append(u) or {
+                                "url": u, "ok": False, "error": "nope",
+                                "transcript": "", "chars": 0, "source": ""})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        body = ('<p>what did he say about pricing?</p>'
+                '<p>--<br>Ken Belotsky, Palomar Labs<br>'
+                '<a href="https://x.com/palomarlabs">follow us on X</a></p>')
+        _mock_inbox(monkeypatch, [_followup_msg("cu1", "bk@negevlabs.com", "CONV-A", body)])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert seen == []                                  # never transcribed
+        assert res["replied"] == 1
+        assert res["outcomes"][0].get("followup") is True  # answered, not transcribed
+        assert "margins are 80 percent" in _sent_bodies(calls)[0]
+        assert not _sent_attachments(calls)
+        assert xte._load_threads()["CONV-A"]["questions"] == 1
+
+    def test_ordinary_mail_carrying_only_container_links_gets_no_reply(
+            self, xte_files, monkeypatch):
+        """END TO END. Sara's inbox is SHARED -- sara_corrections.py scans the
+        same folder, so team replies to Pulse/biweekly/digest reports are
+        routine traffic in the same 25-message window. An ordinary email whose
+        only links are a signature's channel/profile/show must earn NO reply:
+        assert zero Graph calls, not merely replied == 0."""
+        seen = []
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": seen.append(u) or {
+                                "url": u, "ok": False, "error": "nope",
+                                "transcript": "", "chars": 0, "source": ""})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        body = ('<p>Correction for the Pulse: Ariadne has no lead investor gap.</p>'
+                '<p>--<br>Ken Belotsky, Palomar Labs<br>'
+                '<a href="https://www.youtube.com/@palomarlabs">our channel</a> | '
+                '<a href="https://x.com/palomarlabs">X</a> | '
+                '<a href="https://open.spotify.com/show/abc123">our show</a></p>')
+        _mock_inbox(monkeypatch, [_msg("od1", "bk@negevlabs.com", "Re: Weekly Pulse", body)])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert calls == []                                 # no unsolicited reply, at all
+        assert res["replied"] == 0
+        assert seen == []
+
+
+class TestYouTubeLiveAndLegacyForms:
+    """REGRESSION FIX. ld._youtube_video_id covers only youtu.be/, v=,
+    /shorts/ and /embed/, so youtube.com/live/<id> and youtube.com/v/<id>
+    resolve to no id -- yet both are single videos that transcribed fine
+    BEFORE this branch, and /live/ is the address-bar form for livestreams and
+    premieres. Dropping every id-less YouTube URL would have swallowed them
+    silently, which is worse than the wrong-reason refusal. learn_digest is
+    shared and off-limits, so xte resolves them locally."""
+
+    LIVE = "https://www.youtube.com/live/dQw4w9WgXcQ"
+    LEGACY = "https://www.youtube.com/v/dQw4w9WgXcQ"
+
+    @pytest.mark.parametrize("url", [LIVE, LEGACY])
+    def test_detected_as_a_youtube_item(self, url):
+        assert xte.find_media_links(f"watch {url} now") == [(url, "youtube")]
+
+    @pytest.mark.parametrize("url", [LIVE, LEGACY])
+    def test_reaches_the_transcription_path(self, monkeypatch, url):
+        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: "caption text")
+        r = xte.transcribe_link(url, "youtube")
+        assert r["ok"] and r["transcript"] == "caption text"
+
+    @pytest.mark.parametrize("url", [LIVE, LEGACY])
+    def test_id_is_used_for_the_attachment_name(self, url):
+        assert xte._status_id(url) == "dQw4w9WgXcQ"
+
+    def test_live_form_is_the_same_video_as_the_watch_form(self):
+        """One local resolver, so the dedup / already-cached key agrees with
+        detection instead of falling back to the lexical form."""
+        assert (xte._link_key(self.LIVE)
+                == xte._link_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+
+    def test_live_url_transcribes_end_to_end(self, xte_files, monkeypatch):
+        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: "live caption text")
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: Stream\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("lv1", "bk@negevlabs.com", "stream", self.LIVE)])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 1
+        atts = _sent_attachments(calls)
+        assert atts[0]["name"] == "transcript_dQw4w9WgXcQ.md"
+        assert "live caption text" in base64.b64decode(atts[0]["contentBytes"]).decode("utf-8")
 
 
 class TestModuleHygiene:

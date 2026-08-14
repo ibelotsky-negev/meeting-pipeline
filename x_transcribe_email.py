@@ -27,6 +27,11 @@ Safety / robustness:
   skipped (loop guard).
 - Links are read from uniqueBody ONLY -- a link quoted in a reply's thread history
   does NOT re-trigger; only links the sender typed in THIS message count.
+- Only single ITEMS count as a request. A CONTAINER url -- channel, profile,
+  playlist or show -- yields no entry at all (_is_container_url), so ordinary
+  mail carrying one in a signature earns no reply and a follow-up question is
+  still answered as one. Sara's inbox is SHARED (sara_corrections.py scans the
+  same folder), so ordinary team mail is routine traffic here.
 - uniqueBody still keeps the sender's SIGNATURE, so a message whose every link is
   one this conversation already transcribed counts as a follow-up question, not a
   new request (_has_new_link) -- otherwise a signature link would hijack the
@@ -90,11 +95,17 @@ XTE_SUMMARY_MODEL = os.environ.get("XTE_SUMMARY_MODEL", ld.SUMMARY_MODEL)
 # vu@negevcap.com.
 XTE_TEAM_EXTRA = [a.strip().lower() for a in os.environ.get("XTE_TEAM_EXTRA", "").split(",") if a.strip()]
 
+# The one X-post marker: a shareable post always carries /status/<id>. Any
+# other path is a profile or a navigation page -- a CONTAINER, not an item
+# (see _is_container_url). Subsumes the old _X_NONPOST bare-domain/nav list.
 _STATUS_LINK_RE = re.compile(r"/status/(\d+)")
-# Bare domain + navigation pages that are not a shareable post -> ignored.
-_X_NONPOST = re.compile(
-    r"^https?://(?:www\.|mobile\.)?(?:twitter|x)\.com/?"
-    r"(?:home|explore|notifications|messages|settings|search|compose|i/grok)?/?$", re.I)
+# Podcast container shapes. An /episode/ URL is an ITEM and stays detected --
+# it still earns the honest "podcasts not supported yet" reply.
+_PODCAST_CONTAINER_RE = re.compile(r"/(?:show|playlist)/", re.I)
+# The two single-video YouTube forms ld._youtube_video_id does NOT cover:
+# /live/<id> (the address-bar form for livestreams and premieres) and the
+# legacy /v/<id>. See _youtube_id.
+_YT_EXTRA_ID_RE = re.compile(r"youtube\.com/(?:live|v)/([A-Za-z0-9_-]{6,})", re.I)
 
 
 # ======================================================================
@@ -241,6 +252,64 @@ def remember_thread(conversation_id: str, results: list):
 _SUPPORTED_KINDS = ("x", "youtube", "podcast")
 
 
+def _youtube_id(url: str):
+    """The SINGLE notion of "the YouTube video id" inside this module. Used by
+    the container check, transcribe_link's non-video guard, _link_key's identity
+    and _status_id's attachment name, so all four agree on what a video is.
+
+    Delegates to the shared ld._youtube_video_id FIRST (youtu.be/, v=, /shorts/,
+    /embed/), then recognizes the two single-video forms its regex does not
+    cover: /live/<id> and the legacy /v/<id>. learn_digest is deployed and
+    shared with the Read/Learn digest, so its regex is deliberately NOT widened
+    from here -- both forms transcribed fine before container URLs started being
+    dropped, and /live/ is what the address bar shows for a livestream or
+    premiere, so dropping them silently would be worse than the old
+    wrong-reason refusal.
+
+    Never raises: a lookup failure degrades to None (no id -> refused as a
+    container), never an exception in the middle of a scan."""
+    u = url or ""
+    try:
+        vid = ld._youtube_video_id(u)
+    except Exception as e:
+        logger.warning(f"[xte] youtube id parse failed {str(u)[:70]}: {e}")
+        vid = None
+    if vid:
+        return vid
+    m = _YT_EXTRA_ID_RE.search(u)
+    return m.group(1) if m else None
+
+
+def _is_container_url(url: str, kind: str) -> bool:
+    """True when a URL names a CHANNEL, PROFILE, PLAYLIST or SHOW rather than a
+    single item. find_media_links drops these entirely, exactly like an article
+    URL -- they are not transcription requests.
+
+    This REVERSES the original decision that ANY X link is returned "so a link
+    with no video still earns an honest no-video reply". That was safe while the
+    only way to reach Sara was to deliberately email her a link. Ordinary mail
+    and follow-up questions now flow through this same gate (and Sara's inbox is
+    SHARED -- sara_corrections.py scans the same folder), so a signature's
+    channel/profile/show link dropped the question and sent an unsolicited
+    reply. The already-cached-link gate in _has_new_link cannot rescue these: a
+    container URL can NEVER be cached -- a channel cannot transcribe, a profile
+    has no video, a show is always unsupported -- so it could never self-heal.
+
+    Never raises: an unparseable URL counts as NOT a container, so a real
+    request is never silently swallowed."""
+    u = url or ""
+    try:
+        if kind == "x":
+            return not _STATUS_LINK_RE.search(u)   # a post always carries /status/<id>
+        if kind == "youtube":
+            return not _youtube_id(u)              # no video id -> channel / playlist / handle
+        if kind == "podcast":
+            return bool(_PODCAST_CONTAINER_RE.search(u))
+    except Exception as e:
+        logger.warning(f"[xte] container check failed {u[:70]}: {e}")
+    return False
+
+
 def _link_key(url: str, kind: str = None) -> str:
     """Normalized identity for one media link -- the SINGLE definition of "the
     same link", used both to de-dup within a message and to decide whether a
@@ -259,7 +328,7 @@ def _link_key(url: str, kind: str = None) -> str:
         if kind == "x":
             return ld._normalize_x_url(u)
         if kind == "youtube":
-            vid = ld._youtube_video_id(u)
+            vid = _youtube_id(u)
             return f"youtube:{vid}" if vid else u.rstrip("/").lower()
         if kind == "podcast":
             p = urlsplit(u)
@@ -275,11 +344,13 @@ def _has_new_link(links: list, entry: dict) -> bool:
     already transcribed.
 
     Load-bearing: uniqueBody strips quoted history but KEEPS the sender's
-    signature, and find_media_links deliberately accepts any X link, any
-    YouTube URL and any podcast URL -- so a signature ("our channel", "follow
-    us on X") makes every follow-up look like a fresh transcription request.
-    That dropped the question AND sent an unsolicited failure reply. An entry
-    we cannot read is treated as "new" so a real request is never swallowed."""
+    signature, so a signature link makes a follow-up look like a fresh
+    transcription request -- dropping the question AND sending an unsolicited
+    failure reply. find_media_links now drops CONTAINER URLs outright (a
+    signature's "our channel" / "follow us on X" / "our show"), so this gate
+    handles the remaining case: a signature link to a real ITEM that this
+    conversation already transcribed. An entry we cannot read is treated as
+    "new" so a real request is never swallowed."""
     if not entry:
         return True
     try:
@@ -298,15 +369,17 @@ def find_media_links(body_html: str) -> list:
     extract_urls deduplicates case-insensitively (learn_digest.py:554), so
     case-variant URLs collapse upstream.
 
-    ANY X link is returned (not just /status/), so a link with no video still
-    earns an honest "no video found" reply; only the bare domain and navigation
-    pages (home/search/settings/...) are ignored."""
+    Only single ITEMS are returned. A CONTAINER URL -- one naming a channel,
+    profile, playlist or show -- produces no entry at all, exactly like an
+    article URL, so a message carrying only those is not a transcription
+    request (see _is_container_url for why that reverses the original
+    "any X link earns an honest no-video reply" decision)."""
     out, seen = [], set()
     for u in ld.extract_urls(body_html or ""):
         kind = ld.classify_url(u)
         if kind not in _SUPPORTED_KINDS:
             continue
-        if kind == "x" and _X_NONPOST.match(u):
+        if _is_container_url(u, kind):
             continue
         norm = _link_key(u, kind)
         if norm in seen:
@@ -389,12 +462,10 @@ def transcribe_link(url: str, kind: str = "x") -> dict:
         # video id: captions return None immediately and the audio path would
         # hand yt-dlp a whole listing to walk. The duration cap cannot bound
         # that (a channel has no duration) and the download runs on a daemon
-        # thread that outlives its join, so it must be refused here.
-        try:
-            vid = ld._youtube_video_id(url)
-        except Exception as e:
-            logger.warning(f"[xte] youtube id parse failed {str(url)[:70]}: {e}")
-            vid = None
+        # thread that outlives its join, so it must be refused here. Defense in
+        # depth -- find_media_links already drops these before the scan gets
+        # here, but transcribe_link is called directly too.
+        vid = _youtube_id(url)   # the module's ONE resolver; covers /live/ and /v/
         if not vid:
             return {"url": url, "ok": False,
                     "error": "that YouTube link points to a channel or playlist, "
@@ -559,11 +630,7 @@ def _status_id(url: str) -> str:
     m = _STATUS_LINK_RE.search(url or "")
     if m:
         return m.group(1)
-    try:
-        vid = ld._youtube_video_id(url or "")
-    except Exception:
-        vid = None
-    return vid or "post"
+    return _youtube_id(url) or "post"
 
 
 def _transcript_md(title: str, url: str, transcript: str, source: str = "xAI Grok STT") -> str:

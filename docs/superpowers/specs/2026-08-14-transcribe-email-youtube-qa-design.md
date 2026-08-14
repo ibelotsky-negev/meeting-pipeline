@@ -261,3 +261,37 @@ landing in the auto-filed notification or marketing folders is deterministically
 classified NOISE. Direct mail to Ken does not land in those folders, so this is
 a footnote rather than a problem -- recorded here so it is not rediscovered as a
 bug later.
+
+## Amendment -- 2026-08-15: container URLs are not requests
+
+This supersedes the Sources section above on one point. That section kept the
+`_X_NONPOST` filter as the only detection-time exclusion, i.e. ANY other X link
+was returned "so a link with no video still earns an honest no-video reply".
+That decision is REVERSED.
+
+A CONTAINER url -- one naming a channel, profile, playlist or show rather than a
+single item -- now produces no entry at all from `find_media_links`, exactly like
+an article URL: an X path with no `/status/<id>`, a YouTube URL with no parseable
+video id, and a podcast `/show/` or `/playlist/` page. A podcast `/episode/` URL
+is an item and still earns the honest "not supported yet" reply.
+
+Why: the original rationale assumed the only way to reach Sara was to
+deliberately email her a link. As built, ordinary mail and follow-up questions
+flow through the same gate, and Sara's inbox is shared with
+`sara_corrections.py`, so team replies to Pulse/biweekly/digest reports are
+routine traffic in the same 25-message window. A container URL in an email
+signature therefore dropped the follow-up question (the headline feature of this
+design silently failed) and earned an unsolicited reply on ordinary mail. The
+already-cached-link gate added later cannot rescue it: a container URL can never
+be cached -- a channel cannot transcribe, a profile has no video, a show is
+always unsupported -- so it could never self-heal. The cost of losing an honest
+reply to someone who deliberately pasted a profile URL is smaller than the cost
+of unsolicited replies and dropped questions.
+
+Consequence for YouTube: `ld._youtube_video_id` matches only `youtu.be/`, `v=`,
+`/shorts/` and `/embed/`, so `youtube.com/live/<id>` and `youtube.com/v/<id>`
+resolve to no id, and dropping every id-less YouTube URL would have silently
+swallowed two forms that transcribed fine before this branch. `learn_digest` is
+deployed and shared with the Read/Learn digest, so its regex was NOT widened;
+`x_transcribe_email._youtube_id` delegates to it and additionally recognizes
+those two forms, and is the module's single notion of "the video id".
