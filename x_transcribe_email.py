@@ -384,18 +384,34 @@ def is_auto_reply(m: dict) -> bool:
     return False
 
 
+NO_QUESTION_MARKER = "NO_QUESTION"
+
+
+def _is_no_question(answer: str) -> bool:
+    """True when the model judged the sender's note was not a question about the
+    video. Matches only an exact first-line marker so a real answer that merely
+    mentions the words is never suppressed."""
+    first = (answer or "").strip().splitlines()[0] if (answer or "").strip() else ""
+    return first.strip().rstrip(".!:;,").upper() == NO_QUESTION_MARKER
+
+
 _ANSWER_INSTRUCTIONS = (
     "You are Sara. Answer the colleague's question about a video you already transcribed for "
     "them. Use ONLY the transcript(s) below -- no outside knowledge. Return PLAIN TEXT (no "
     "markdown symbols) starting with a single line:\n"
     "ANSWER: <direct answer in one short paragraph, or a few '- ' bullets if it is genuinely a list>\n"
-    "If the transcript does not cover the question, say exactly that and do not guess.\n\n"
+    "If the transcript does not cover the question, say exactly that and do not guess.\n"
+    "If the note is NOT a question about the video -- a thank-you, an acknowledgement, a "
+    "signature, or forwarded boilerplate -- reply with exactly NO_QUESTION on the first "
+    "line and nothing else.\n\n"
 )
 
 
 def answer_question(question: str, links: list) -> str:
     """Claude answer grounded strictly in the cached transcript(s).
-    Returns '' on failure (caller says so rather than inventing an answer)."""
+    Returns '' on failure (caller says so rather than inventing an answer).
+    Returns exactly NO_QUESTION_MARKER (see _is_no_question) when the model
+    judges the sender's note was not actually a question about the video."""
     blocks = []
     for l in (links or []):
         blocks.append(f"--- {l.get('title') or l.get('url')} ({l.get('url')}) ---\n"
@@ -621,13 +637,23 @@ def _process_message(m: dict) -> dict:
 
 
 def _process_followup(m: dict, entry: dict) -> dict:
-    """Answer a link-free reply in a conversation we already transcribed."""
+    """Answer a link-free reply in a conversation we already transcribed.
+
+    Sends nothing when the model judges the note was not actually a question
+    (see _is_no_question) -- e.g. "thanks" or a signature. A Claude FAILURE
+    (answer_question returning '') is NOT a non-question: it still gets the
+    existing honest-failure reply via render_answer."""
     sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "")
     question = extract_note((m.get("uniqueBody") or {}).get("content", ""))
     answer = answer_question(question, entry.get("links") or [])
+    if _is_no_question(answer):
+        logger.info(f"[xte] follow-up from {sender} was not a question; not replying")
+        return {"from": sender, "subject": m.get("subject") or "", "followup": True,
+                "replied": False, "answered": False, "reason": "not a question",
+                "question": question[:200]}
     send_threaded_reply(m.get("id"), render_answer(question, answer))
     return {"from": sender, "subject": m.get("subject") or "", "followup": True,
-            "replied": True, "question": question[:200]}
+            "replied": True, "answered": True, "question": question[:200]}
 
 
 def run(dry_run: bool = False, limit: int = None) -> dict:
@@ -681,7 +707,8 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
                                  "would_answer": question[:200], "dry_run": True})
                 continue
             try:
-                outcomes.append(_process_followup(m, entry))
+                outcome = _process_followup(m, entry)
+                outcomes.append(outcome)
                 # Re-read before writing: a link message processed earlier in
                 # THIS scan may have cached a conversation via remember_thread,
                 # which writes straight to disk -- saving the top-of-run snapshot
@@ -693,7 +720,8 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
                 threads[m["conversationId"]] = entry
                 _save_threads(threads)
                 processed.add(mid)
-                replied += 1
+                if outcome.get("replied"):
+                    replied += 1
             except Exception as e:
                 logger.error(f"[xte] follow-up failed for {sender}: {e}", exc_info=True)
                 outcomes.append({"from": sender, "followup": True, "replied": False,

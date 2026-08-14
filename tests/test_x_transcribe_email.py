@@ -798,3 +798,68 @@ class TestFollowUp:
         assert "margins are 80 percent" in prompts[0]
         assert "what margins?" in prompts[0]
         assert "ONLY" in prompts[0]
+
+
+# ----------------------------------------------------------------------
+#  Task 7b -- do not answer a follow-up that is not a question
+# ----------------------------------------------------------------------
+
+class TestNoQuestionFollowUp:
+    def test_marker_detected_exactly(self):
+        assert xte._is_no_question("NO_QUESTION")
+        assert xte._is_no_question("  no_question  ")
+        assert xte._is_no_question("NO_QUESTION.")
+
+    def test_marker_not_matched_inside_a_real_answer(self):
+        assert not xte._is_no_question("ANSWER: he said NO_QUESTION was asked")
+        assert not xte._is_no_question("ANSWER: margins are 80 percent")
+
+    def test_empty_answer_is_not_a_no_question(self):
+        # A Claude failure must still produce the honest-failure reply.
+        assert not xte._is_no_question("")
+        assert not xte._is_no_question("   ")
+
+    def test_thanks_reply_sends_nothing_but_is_still_counted(self, xte_files, monkeypatch):
+        now = datetime.now(timezone.utc).isoformat()
+        xte._save_threads({"CONV-A": {
+            "created_at": now, "updated_at": now, "questions": 0,
+            "links": [{"url": "u", "title": "T", "transcript": "words"}]}})
+        monkeypatch.setattr(xte, "answer_question", lambda q, links: "NO_QUESTION")
+        _mock_inbox(monkeypatch, [_followup_msg("n1", "bk@negevlabs.com", "CONV-A", "thanks!")])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert calls == []                                   # no reply sent
+        assert res["replied"] == 0
+        assert xte._load_threads()["CONV-A"]["questions"] == 1   # still budgeted
+        assert "n1" in json.load(open(xte.STORE_PATH))["processed_ids"]
+
+    def test_real_question_still_answered(self, xte_files, monkeypatch):
+        now = datetime.now(timezone.utc).isoformat()
+        xte._save_threads({"CONV-A": {
+            "created_at": now, "updated_at": now, "questions": 0,
+            "links": [{"url": "u", "title": "T", "transcript": "margins are 80 percent"}]}})
+        monkeypatch.setattr(xte, "answer_question", lambda q, links: "ANSWER: 80 percent")
+        _mock_inbox(monkeypatch, [_followup_msg("n2", "bk@negevlabs.com", "CONV-A", "what margins?")])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 1
+        assert "80 percent" in _sent_bodies(calls)[0]
+
+    def test_claude_failure_still_sends_honest_reply(self, xte_files, monkeypatch):
+        now = datetime.now(timezone.utc).isoformat()
+        xte._save_threads({"CONV-A": {
+            "created_at": now, "updated_at": now, "questions": 0,
+            "links": [{"url": "u", "title": "T", "transcript": "words"}]}})
+        monkeypatch.setattr(xte, "answer_question", lambda q, links: "")
+        _mock_inbox(monkeypatch, [_followup_msg("n3", "bk@negevlabs.com", "CONV-A", "what margins?")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 1
+        assert "couldn't produce an answer" in _sent_bodies(calls)[0]
+
+    def test_prompt_tells_the_model_about_the_marker(self, monkeypatch):
+        prompts = []
+        monkeypatch.setattr(ld, "_call_claude_text",
+                            lambda p, m, max_tokens=2000, tools=None, timeout=None:
+                            prompts.append(p) or "NO_QUESTION")
+        xte.answer_question("thanks", [{"url": "u", "title": "T", "transcript": "w"}])
+        assert "NO_QUESTION" in prompts[0]
