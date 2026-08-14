@@ -642,3 +642,159 @@ class TestThreadCache:
         _capture_graph(monkeypatch)
         xte.run()
         assert xte._load_threads()["CONV-A"]["links"][0]["transcript"] == "cached words"
+
+
+# ----------------------------------------------------------------------
+#  Task 7 -- follow-up questions answered from the cached transcript
+# ----------------------------------------------------------------------
+
+def _followup_msg(mid, sender, conv_id, body):
+    m = _msg(mid, sender, "Re: transcript", body)
+    m["conversationId"] = conv_id
+    return m
+
+
+class TestAutoReplyDetection:
+    def test_auto_submitted_flags_true(self):
+        assert xte.is_auto_reply({"internetMessageHeaders": [
+            {"name": "Auto-Submitted", "value": "auto-replied"}]})
+
+    def test_auto_submitted_no_is_a_real_message(self):
+        assert not xte.is_auto_reply({"internetMessageHeaders": [
+            {"name": "Auto-Submitted", "value": "no"}]})
+
+    def test_x_autoreply_and_precedence_bulk_flag_true(self):
+        assert xte.is_auto_reply({"internetMessageHeaders": [{"name": "X-Autoreply", "value": "yes"}]})
+        assert xte.is_auto_reply({"internetMessageHeaders": [{"name": "Precedence", "value": "bulk"}]})
+
+    def test_no_headers_is_a_real_message(self):
+        assert not xte.is_auto_reply({})
+
+
+class TestRenderAnswer:
+    def test_escapes_the_question_and_renders_the_answer(self):
+        h = xte.render_answer("what about <b>margins</b>?", "ANSWER: 80 percent")
+        assert "&lt;b&gt;margins&lt;/b&gt;" in h        # echoed back escaped, never injected
+        assert "<b>ANSWER: 80 percent</b>" in h
+
+    def test_empty_answer_says_so_rather_than_sending_an_empty_body(self):
+        """answer_question returns '' when Claude fails -- the reply must say
+        so plainly instead of arriving blank (or inventing an answer)."""
+        h = xte.render_answer("what about margins?", "")
+        assert "couldn't produce an answer" in h
+
+
+class TestFollowUp:
+    def _seed(self, conv_id="CONV-A", questions=0):
+        now = datetime.now(timezone.utc).isoformat()
+        xte._save_threads({conv_id: {
+            "created_at": now, "updated_at": now, "questions": questions,
+            "links": [{"url": "https://x.com/i/status/1", "title": "T",
+                       "transcript": "he said margins are 80 percent"}]}})
+
+    def _patch_answer(self, monkeypatch):
+        monkeypatch.setattr(xte, "answer_question",
+                            lambda q, links: "ANSWER: margins are 80 percent")
+
+    def test_answers_link_free_reply_in_known_conversation(self, xte_files, monkeypatch):
+        self._seed(); self._patch_answer(monkeypatch)
+        _mock_inbox(monkeypatch, [_followup_msg("f1", "bk@negevlabs.com", "CONV-A", "what about margins?")])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 1
+        body = _sent_bodies(calls)[0]
+        assert "margins are 80 percent" in body
+        assert not _sent_attachments(calls)          # transcript already delivered
+        assert xte._load_threads()["CONV-A"]["questions"] == 1
+        assert "f1" in json.load(open(xte.STORE_PATH))["processed_ids"]
+
+    def test_unknown_conversation_is_ignored(self, xte_files, monkeypatch):
+        self._seed(); self._patch_answer(monkeypatch)
+        _mock_inbox(monkeypatch, [_followup_msg("f2", "bk@negevlabs.com", "CONV-UNKNOWN", "what about margins?")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 0 and calls == []
+
+    def test_question_cap_goes_silent(self, xte_files, monkeypatch):
+        self._seed(questions=xte.XTE_THREAD_MAX_QUESTIONS)
+        asked = []
+        monkeypatch.setattr(xte, "answer_question",
+                            lambda q, links: asked.append(q) or "ANSWER: margins are 80 percent")
+        _mock_inbox(monkeypatch, [_followup_msg("f3", "bk@negevlabs.com", "CONV-A", "one more?")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 0
+        assert calls == []   # silence, not a "limit reached" reply that would feed the loop
+        assert asked == []   # short-circuited before the Claude call, so no cost either
+
+    def test_autoresponder_is_skipped(self, xte_files, monkeypatch):
+        self._seed(); self._patch_answer(monkeypatch)
+        m = _followup_msg("f4", "bk@negevlabs.com", "CONV-A", "I am out of office")
+        m["internetMessageHeaders"] = [{"name": "Auto-Submitted", "value": "auto-replied"}]
+        _mock_inbox(monkeypatch, [m])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 0 and calls == []
+
+    def test_ineligible_sender_is_ignored(self, xte_files, monkeypatch):
+        self._seed(); self._patch_answer(monkeypatch)
+        _mock_inbox(monkeypatch, [_followup_msg("f5", "rando@gmail.com", "CONV-A", "what about margins?")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 0 and calls == []
+
+    def test_team_extra_address_is_eligible(self, xte_files, monkeypatch):
+        self._seed(); self._patch_answer(monkeypatch)
+        monkeypatch.setattr(xte, "XTE_TEAM_EXTRA", ["ibelotsky@gmail.com"])
+        _mock_inbox(monkeypatch, [_followup_msg("f6", "ibelotsky@gmail.com", "CONV-A", "margins?")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 1 and calls
+
+    def test_empty_question_is_skipped(self, xte_files, monkeypatch):
+        self._seed(); self._patch_answer(monkeypatch)
+        _mock_inbox(monkeypatch, [_followup_msg("f7", "bk@negevlabs.com", "CONV-A", "")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 0 and calls == []
+
+    def test_team_extra_address_gets_a_first_transcription_too(self, xte_files, monkeypatch):
+        """Eligibility applies to the original link email, not just follow-ups."""
+        monkeypatch.setattr(xte, "XTE_TEAM_EXTRA", ["ibelotsky@gmail.com"])
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "T" * 20,
+                                              "chars": 20, "error": "", "source": "xAI Grok STT"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("e1", "ibelotsky@gmail.com", "hi",
+                                       "https://x.com/i/status/111")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 1
+        assert _sent_attachments(calls)
+
+    def test_followup_save_keeps_a_conversation_cached_in_the_same_scan(self, xte_files, monkeypatch):
+        """A link message earlier in the SAME scan caches its conversation via
+        remember_thread, which writes straight to disk. Writing run()'s
+        top-of-run snapshot back wholesale would drop that entry and silently
+        lose the transcript a later follow-up in it would need."""
+        self._seed(); self._patch_answer(monkeypatch)
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "new words",
+                                              "chars": 9, "error": "", "source": "xAI Grok STT"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        link_msg = _msg("n1", "bk@negevlabs.com", "new clip", "https://x.com/i/status/999")
+        link_msg["conversationId"] = "CONV-B"
+        _mock_inbox(monkeypatch, [link_msg,
+                                  _followup_msg("f8", "bk@negevlabs.com", "CONV-A", "what about margins?")])
+        _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 2
+        threads = xte._load_threads()
+        assert threads["CONV-A"]["questions"] == 1
+        assert threads["CONV-B"]["links"][0]["transcript"] == "new words"   # not clobbered
+
+    def test_answer_prompt_is_grounded_in_the_cached_transcript(self, monkeypatch):
+        prompts = []
+        monkeypatch.setattr(ld, "_call_claude_text",
+                            lambda p, m, max_tokens=2000, tools=None, timeout=None:
+                            prompts.append(p) or "ANSWER: yes")
+        out = xte.answer_question("what margins?",
+                                  [{"url": "u", "title": "T", "transcript": "margins are 80 percent"}])
+        assert out == "ANSWER: yes"
+        assert "margins are 80 percent" in prompts[0]
+        assert "what margins?" in prompts[0]
+        assert "ONLY" in prompts[0]

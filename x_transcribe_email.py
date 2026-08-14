@@ -14,7 +14,8 @@ Reuses existing, deployed machinery -- single source of truth, no duplication:
 - config.is_internal_email: the team allow-list.
 
 Safety / robustness:
-- Only INTERNAL senders are served; Sara's own mail is skipped (loop guard).
+- Only INTERNAL senders (plus XTE_TEAM_EXTRA) are served; Sara's own mail is
+  skipped (loop guard).
 - Links are read from uniqueBody ONLY -- a link quoted in a reply's thread history
   does NOT re-trigger; only links the sender typed in THIS message count.
 - Idempotent via processed message-ids at /data/x_transcribe_email.json.
@@ -65,6 +66,12 @@ XTE_THREAD_MAX_QUESTIONS = int(os.environ.get("XTE_THREAD_MAX_QUESTIONS", "20"))
 XTE_MAX_MESSAGES = int(os.environ.get("XTE_MAX_MESSAGES", "25"))
 XTE_MAX_LINKS = int(os.environ.get("XTE_MAX_LINKS", "5"))
 XTE_SUMMARY_MODEL = os.environ.get("XTE_SUMMARY_MODEL", ld.SUMMARY_MODEL)
+
+# Extra addresses served beyond the internal domains -- for a team member's
+# personal address. Empty by default; config.is_internal_email already covers
+# every corporate address, so nothing needs to be set for the team or for
+# vu@negevcap.com.
+XTE_TEAM_EXTRA = [a.strip().lower() for a in os.environ.get("XTE_TEAM_EXTRA", "").split(",") if a.strip()]
 
 # In-process guard so the scheduled scan and a manual trigger never overlap.
 _run_lock = threading.Lock()
@@ -357,6 +364,50 @@ def summarize_transcript(url: str, transcript: str, note: str = "") -> str:
         return ""
 
 
+_AUTO_REPLY_HEADERS = ("x-autoreply", "x-autorespond", "x-autoresponder")
+
+
+def is_auto_reply(m: dict) -> bool:
+    """True for out-of-office / ticketing autoresponders. Load-bearing: Sara
+    now answers link-less mail in threads she owns, so without this an
+    autoresponder could ping-pong with her indefinitely."""
+    for h in (m.get("internetMessageHeaders") or []):
+        name = (h.get("name") or "").strip().lower()
+        value = (h.get("value") or "").strip().lower()
+        if name == "auto-submitted":
+            if value and value != "no":
+                return True
+        elif name in _AUTO_REPLY_HEADERS:
+            return True
+        elif name == "precedence" and value in ("auto_reply", "bulk", "junk"):
+            return True
+    return False
+
+
+_ANSWER_INSTRUCTIONS = (
+    "You are Sara. Answer the colleague's question about a video you already transcribed for "
+    "them. Use ONLY the transcript(s) below -- no outside knowledge. Return PLAIN TEXT (no "
+    "markdown symbols) starting with a single line:\n"
+    "ANSWER: <direct answer in one short paragraph, or a few '- ' bullets if it is genuinely a list>\n"
+    "If the transcript does not cover the question, say exactly that and do not guess.\n\n"
+)
+
+
+def answer_question(question: str, links: list) -> str:
+    """Claude answer grounded strictly in the cached transcript(s).
+    Returns '' on failure (caller says so rather than inventing an answer)."""
+    blocks = []
+    for l in (links or []):
+        blocks.append(f"--- {l.get('title') or l.get('url')} ({l.get('url')}) ---\n"
+                      f"{(l.get('transcript') or '')[:14000]}")
+    prompt = _ANSWER_INSTRUCTIONS + f"Question: {question}\n\nTranscript(s):\n" + "\n\n".join(blocks)
+    try:
+        return (ld._call_claude_text(prompt, XTE_SUMMARY_MODEL, max_tokens=1200) or "").strip()
+    except Exception as e:
+        logger.warning(f"[xte] answer failed: {e}")
+        return ""
+
+
 def _parse_title(summary: str, fallback: str) -> str:
     for line in (summary or "").splitlines():
         if line.strip().upper().startswith("TITLE:"):
@@ -444,6 +495,13 @@ def _failure_message(error: str) -> str:
     return "Could not transcribe this link: " + (error or "unknown reason")
 
 
+_FOOTER_HTML = (
+    "<p style='color:#888;font-size:12px;'>-- Sara<br>"
+    "I transcribe X and YouTube links. Reply to this email to ask a question about the video. "
+    "Spotify podcasts aren't supported yet.</p>"
+)
+
+
 def render_reply(results: list, truncated: int = 0) -> str:
     """HTML body for the reply: one section per link (summary or honest failure)."""
     parts = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;line-height:1.5;max-width:720px;">']
@@ -470,6 +528,18 @@ def render_reply(results: list, truncated: int = 0) -> str:
         parts.append(f"<p><em>{truncated} additional link(s) in your email were not processed "
                      f"(max {XTE_MAX_LINKS} per email).</em></p>")
     parts.append("<p style='color:#888;'>-- Sara</p></div>")
+    return "".join(parts)
+
+
+def render_answer(question: str, answer: str) -> str:
+    """HTML body for a follow-up answer: no attachment, they already have the
+    transcript."""
+    parts = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;line-height:1.5;max-width:720px;">']
+    parts.append(f"<p><b>You asked:</b> {html.escape(question)}</p>")
+    parts.append(_summary_to_html(answer)
+                 or "<p>I couldn't produce an answer just now -- try re-sending your question.</p>")
+    parts.append(_FOOTER_HTML)
+    parts.append("</div>")
     return "".join(parts)
 
 
@@ -550,6 +620,16 @@ def _process_message(m: dict) -> dict:
                        "chars": r.get("chars", 0), "error": r.get("error", "")} for r in results]}
 
 
+def _process_followup(m: dict, entry: dict) -> dict:
+    """Answer a link-free reply in a conversation we already transcribed."""
+    sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "")
+    question = extract_note((m.get("uniqueBody") or {}).get("content", ""))
+    answer = answer_question(question, entry.get("links") or [])
+    send_threaded_reply(m.get("id"), render_answer(question, answer))
+    return {"from": sender, "subject": m.get("subject") or "", "followup": True,
+            "replied": True, "question": question[:200]}
+
+
 def run(dry_run: bool = False, limit: int = None) -> dict:
     """Scan Sara's inbox for internal mail carrying X links and reply with the
     transcript(s) + summary. Idempotent (processed message ids). dry_run lists
@@ -557,6 +637,7 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
     started = datetime.now(timezone.utc)
     store = _load()
     processed = set(store.get("processed_ids") or [])
+    threads = _prune_threads(_load_threads())
     limit = limit or XTE_MAX_MESSAGES
 
     url = f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/mailFolders/inbox/messages"
@@ -579,10 +660,48 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
             continue
         # Links are read from uniqueBody so a quoted link in a reply never re-fires.
         links = find_media_links((m.get("uniqueBody") or {}).get("content", ""))
+        eligible = (config.is_internal_email(sender)
+                    or sender.strip().lower() in XTE_TEAM_EXTRA)
+
         if not links:
-            continue  # not a transcription request -- leave for other handlers
-        if not config.is_internal_email(sender):
-            logger.info(f"[xte] ignoring X-link mail from external sender {sender}")
+            # A link-free reply in a conversation we already transcribed is a
+            # follow-up question. Anything else is not a transcription request
+            # and is left for other handlers.
+            entry = threads.get(m.get("conversationId") or "") if m.get("conversationId") else None
+            if not entry or not eligible or is_auto_reply(m):
+                continue
+            if int(entry.get("questions") or 0) >= XTE_THREAD_MAX_QUESTIONS:
+                logger.info(f"[xte] follow-up cap reached for {m.get('conversationId')}; staying silent")
+                continue
+            question = extract_note((m.get("uniqueBody") or {}).get("content", ""))
+            if not question:
+                continue
+            if dry_run:
+                outcomes.append({"from": sender, "followup": True,
+                                 "would_answer": question[:200], "dry_run": True})
+                continue
+            try:
+                outcomes.append(_process_followup(m, entry))
+                # Re-read before writing: a link message processed earlier in
+                # THIS scan may have cached a conversation via remember_thread,
+                # which writes straight to disk -- saving the top-of-run snapshot
+                # back wholesale would drop it.
+                threads = _prune_threads(_load_threads())
+                entry = threads.get(m["conversationId"]) or entry
+                entry["questions"] = int(entry.get("questions") or 0) + 1
+                entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+                threads[m["conversationId"]] = entry
+                _save_threads(threads)
+                processed.add(mid)
+                replied += 1
+            except Exception as e:
+                logger.error(f"[xte] follow-up failed for {sender}: {e}", exc_info=True)
+                outcomes.append({"from": sender, "followup": True, "replied": False,
+                                 "error": f"{type(e).__name__}: {e}"})
+            continue
+
+        if not eligible:
+            logger.info(f"[xte] ignoring media-link mail from external sender {sender}")
             processed.add(mid)  # do not reconsider every run
             continue
 
