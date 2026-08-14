@@ -34,7 +34,7 @@ import base64
 import shutil
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import email_pipeline_sync as eps
 import learn_digest as ld
@@ -51,6 +51,15 @@ SARA_MAILBOX = os.environ.get("BOT_SENDER_EMAIL", "sara@palomar-labs.com")
 _DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
 STORE_PATH = os.path.join(_DATA_DIR, "x_transcribe_email.json")
 STATUS_PATH = os.path.join(_DATA_DIR, "x_transcribe_email_status.json")
+
+# Per-conversation transcript cache -- lets a follow-up question cost one Claude
+# call instead of a re-transcription.
+THREADS_PATH = os.path.join(_DATA_DIR, "x_transcribe_threads.json")
+XTE_THREAD_TTL_DAYS = int(os.environ.get("XTE_THREAD_TTL_DAYS", "30"))
+XTE_THREAD_MAX = int(os.environ.get("XTE_THREAD_MAX", "200"))
+# Loop breaker, NOT a usage limit: Sara answers link-less mail in threads she
+# owns, so an autoresponder on the other end could ping-pong indefinitely.
+XTE_THREAD_MAX_QUESTIONS = int(os.environ.get("XTE_THREAD_MAX_QUESTIONS", "20"))
 
 # Inbox scan window (most recent N messages) and per-email link cap (cost guard).
 XTE_MAX_MESSAGES = int(os.environ.get("XTE_MAX_MESSAGES", "25"))
@@ -109,6 +118,69 @@ def read_status() -> dict:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+def _load_threads() -> dict:
+    try:
+        with open(THREADS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    except Exception as e:
+        logger.warning(f"[xte] could not read thread cache ({e}); starting empty")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_threads(threads: dict):
+    try:
+        os.makedirs(os.path.dirname(THREADS_PATH), exist_ok=True)
+        with open(THREADS_PATH, "w", encoding="utf-8") as f:
+            json.dump(threads, f, default=str, indent=2)
+    except Exception as e:
+        logger.warning(f"[xte] could not write thread cache: {e}")
+
+
+def _prune_threads(threads: dict, now: datetime = None) -> dict:
+    """Drop conversations past the TTL, then keep only the newest
+    XTE_THREAD_MAX by updated_at. An unparseable timestamp is dropped."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=XTE_THREAD_TTL_DAYS)
+    kept = {}
+    for cid, entry in (threads or {}).items():
+        try:
+            updated = datetime.fromisoformat(str((entry or {}).get("updated_at")).replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if updated >= cutoff:
+            kept[cid] = entry
+    if len(kept) > XTE_THREAD_MAX:
+        ordered = sorted(kept.items(), key=lambda kv: str(kv[1].get("updated_at")), reverse=True)
+        kept = dict(ordered[:XTE_THREAD_MAX])
+    return kept
+
+
+def remember_thread(conversation_id: str, results: list):
+    """Cache successful transcripts so follow-up questions in this conversation
+    cost one Claude call. A conversation where every link failed is NOT cached --
+    there would be nothing to answer from, and a reply to it correctly falls
+    through to the existing skip."""
+    ok = [r for r in results if r.get("ok")]
+    if not conversation_id or not ok:
+        return
+    threads = _prune_threads(_load_threads())
+    now = datetime.now(timezone.utc).isoformat()
+    entry = threads.get(conversation_id) or {"created_at": now, "questions": 0, "links": []}
+    entry["updated_at"] = now
+    entry["links"] = (entry.get("links") or []) + [
+        {"url": r["url"], "title": r.get("title") or r["url"],
+         "transcript": r.get("transcript") or ""}
+        for r in ok
+    ]
+    threads[conversation_id] = entry
+    _save_threads(_prune_threads(threads))
 
 
 # ======================================================================
@@ -471,6 +543,7 @@ def _process_message(m: dict) -> dict:
         for r in results if r["ok"]
     ]
     send_threaded_reply(m.get("id"), render_reply(results, truncated), attachments)
+    remember_thread(m.get("conversationId") or "", results)
 
     return {"from": sender, "subject": subject, "replied": True,
             "links": [{"url": r["url"], "kind": r.get("kind", ""), "ok": r["ok"],
@@ -488,7 +561,7 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
 
     url = f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/mailFolders/inbox/messages"
     params = {
-        "$select": "id,subject,from,receivedDateTime,uniqueBody,internetMessageId",
+        "$select": "id,subject,from,receivedDateTime,uniqueBody,internetMessageId,conversationId,internetMessageHeaders",
         "$top": str(limit),
         "$orderby": "receivedDateTime desc",
     }

@@ -9,6 +9,7 @@ The autouse no_network fixture (conftest) fails any real HTTP.
 import os
 import json
 import base64
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,6 +22,7 @@ import email_pipeline_sync as eps
 def xte_files(monkeypatch, tmp_path):
     monkeypatch.setattr(xte, "STORE_PATH", str(tmp_path / "store.json"))
     monkeypatch.setattr(xte, "STATUS_PATH", str(tmp_path / "status.json"))
+    monkeypatch.setattr(xte, "THREADS_PATH", str(tmp_path / "threads.json"))
     return tmp_path
 
 
@@ -575,3 +577,68 @@ class TestQuestionInFirstEmail:
     def test_answer_label_renders_bold(self):
         h = xte._summary_to_html("ANSWER: he said 40x\nTL;DR: gist")
         assert "<b>ANSWER: he said 40x</b>" in h
+
+
+# ----------------------------------------------------------------------
+#  Task 6 -- per-conversation transcript cache
+# ----------------------------------------------------------------------
+
+class TestThreadCache:
+    def _ok(self, url="https://x.com/i/status/1", text="words"):
+        return {"url": url, "ok": True, "title": "T", "transcript": text,
+                "chars": len(text), "error": "", "source": "xAI Grok STT"}
+
+    def test_remembers_successful_links(self, xte_files, monkeypatch):
+        xte.remember_thread("conv-1", [self._ok()])
+        entry = xte._load_threads()["conv-1"]
+        assert entry["questions"] == 0
+        assert entry["links"][0]["transcript"] == "words"
+        assert entry["created_at"] and entry["updated_at"]
+
+    def test_all_failed_is_not_cached(self, xte_files, monkeypatch):
+        xte.remember_thread("conv-2", [{"url": "u", "ok": False, "error": "nope"}])
+        assert "conv-2" not in xte._load_threads()
+
+    def test_missing_conversation_id_is_ignored(self, xte_files, monkeypatch):
+        xte.remember_thread("", [self._ok()])
+        assert xte._load_threads() == {}
+
+    def test_second_reply_appends_to_the_same_conversation(self, xte_files, monkeypatch):
+        xte.remember_thread("conv-3", [self._ok(text="one")])
+        xte.remember_thread("conv-3", [self._ok(url="https://youtu.be/b", text="two")])
+        assert len(xte._load_threads()["conv-3"]["links"]) == 2
+
+    def test_ttl_evicts_stale_conversations(self, xte_files, monkeypatch):
+        old = (datetime.now(timezone.utc) - timedelta(days=xte.XTE_THREAD_TTL_DAYS + 1)).isoformat()
+        fresh = datetime.now(timezone.utc).isoformat()
+        pruned = xte._prune_threads({
+            "old": {"created_at": old, "updated_at": old, "questions": 0, "links": []},
+            "new": {"created_at": fresh, "updated_at": fresh, "questions": 0, "links": []},
+        })
+        assert "old" not in pruned and "new" in pruned
+
+    def test_unparseable_timestamp_is_dropped_not_crashed(self, xte_files):
+        pruned = xte._prune_threads({"bad": {"updated_at": "not-a-date", "links": []}})
+        assert pruned == {}
+
+    def test_max_entries_keeps_newest(self, xte_files, monkeypatch):
+        monkeypatch.setattr(xte, "XTE_THREAD_MAX", 2)
+        base = datetime.now(timezone.utc)
+        threads = {}
+        for i in range(4):
+            ts = (base - timedelta(minutes=i)).isoformat()
+            threads[f"c{i}"] = {"created_at": ts, "updated_at": ts, "questions": 0, "links": []}
+        pruned = xte._prune_threads(threads)
+        assert set(pruned) == {"c0", "c1"}   # newest two by updated_at
+
+    def test_run_caches_the_conversation(self, xte_files, monkeypatch):
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": self._ok(u, "cached words"))
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        m = _msg("c1", "bk@negevlabs.com", "hi", "https://x.com/i/status/111")
+        m["conversationId"] = "CONV-A"
+        _mock_inbox(monkeypatch, [m])
+        _capture_graph(monkeypatch)
+        xte.run()
+        assert xte._load_threads()["CONV-A"]["links"][0]["transcript"] == "cached words"
