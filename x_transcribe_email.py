@@ -304,17 +304,33 @@ def send_threaded_reply(source_message_id: str, html_body: str, attachments: lis
 
     Sequence: createReply (draft) -> PATCH the body -> POST each attachment ->
     send. Raises on a missing draft id so the caller does NOT mark the message
-    processed and the next run retries it."""
+    processed and the next run retries it.
+
+    If PATCH/attach/send fails after the draft was created, the draft would
+    otherwise be orphaned (never sent, never deleted) -- and since a retry
+    calls createReply again, a persistent failure would leave a fresh
+    abandoned draft in Sara's mailbox on every scan cycle. So on any failure
+    past this point, best-effort DELETE the draft we just created, then
+    re-raise the ORIGINAL error unchanged (the cleanup call's own failure is
+    swallowed -- it must never mask the real error or change retry
+    semantics)."""
     base = f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/messages"
     draft = eps.graph_post(f"{base}/{source_message_id}/createReply", {}) or {}
     draft_id = draft.get("id")
     if not draft_id:
         raise RuntimeError("createReply returned no draft id")
-    eps.graph_patch(f"{base}/{draft_id}",
-                    {"body": {"contentType": "HTML", "content": html_body}})
-    for att in (attachments or []):
-        eps.graph_post(f"{base}/{draft_id}/attachments", att)
-    eps.graph_post(f"{base}/{draft_id}/send", {})
+    try:
+        eps.graph_patch(f"{base}/{draft_id}",
+                        {"body": {"contentType": "HTML", "content": html_body}})
+        for att in (attachments or []):
+            eps.graph_post(f"{base}/{draft_id}/attachments", att)
+        eps.graph_post(f"{base}/{draft_id}/send", {})
+    except Exception:
+        try:
+            eps.graph_delete(f"{base}/{draft_id}")
+        except Exception as cleanup_err:
+            logger.warning(f"[xte] could not delete orphaned draft {draft_id}: {cleanup_err}")
+        raise
 
 
 # ======================================================================

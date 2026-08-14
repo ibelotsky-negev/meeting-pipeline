@@ -38,8 +38,10 @@ def _mock_inbox(monkeypatch, messages):
 
 
 def _capture_graph(monkeypatch):
-    """Record every Graph write. createReply answers with a draft id so the
-    threaded-reply sequence can run to completion offline."""
+    """Record every Graph write (POST/PATCH/DELETE). createReply answers with
+    a draft id so the threaded-reply sequence can run to completion offline;
+    DELETE (best-effort draft cleanup on failure) is recorded too, so tests
+    can assert it happened without touching real Graph."""
     calls = []
 
     def _post(url, json_body):
@@ -52,8 +54,13 @@ def _capture_graph(monkeypatch):
         calls.append({"method": "PATCH", "url": url, "body": json_body})
         return {}
 
+    def _delete(url):
+        calls.append({"method": "DELETE", "url": url})
+        return {}
+
     monkeypatch.setattr(eps, "graph_post", _post)
     monkeypatch.setattr(eps, "graph_patch", _patch)
+    monkeypatch.setattr(eps, "graph_delete", _delete)
     return calls
 
 
@@ -181,6 +188,59 @@ class TestThreadedReply:
         with pytest.raises(RuntimeError):
             xte.send_threaded_reply("msg-9", "<p>hi</p>")
 
+    def test_patch_failure_deletes_orphaned_draft_and_reraises(self, monkeypatch):
+        """PATCH fails after createReply already made a draft -- the draft must
+        be deleted (not left orphaned) and the original error must still
+        propagate so run() does not mark the source message processed."""
+        calls = _capture_graph(monkeypatch)
+
+        def _boom_patch(url, json_body):
+            calls.append({"method": "PATCH", "url": url, "body": json_body})
+            raise RuntimeError("graph 500 on patch")
+
+        monkeypatch.setattr(eps, "graph_patch", _boom_patch)
+        with pytest.raises(RuntimeError, match="graph 500 on patch"):
+            xte.send_threaded_reply("msg-9", "<p>hi</p>")
+        seq = [(c["method"], c["url"].rsplit("/", 1)[-1]) for c in calls]
+        assert seq == [("POST", "createReply"), ("PATCH", "draft-1"), ("DELETE", "draft-1")]
+
+    def test_send_failure_deletes_orphaned_draft_and_reraises(self, monkeypatch):
+        """Same guarantee when the failure is the final send call instead of
+        the body PATCH -- the whole post-draft sequence is covered, not just
+        its first step."""
+        calls = _capture_graph(monkeypatch)
+
+        def _boom_post(url, json_body):
+            calls.append({"method": "POST", "url": url, "body": json_body})
+            if url.endswith("/createReply"):
+                return {"id": "draft-1"}
+            if url.endswith("/send"):
+                raise RuntimeError("graph 500 on send")
+            return {}
+
+        monkeypatch.setattr(eps, "graph_post", _boom_post)
+        with pytest.raises(RuntimeError, match="graph 500 on send"):
+            xte.send_threaded_reply("msg-9", "<p>hi</p>")
+        seq = [(c["method"], c["url"].rsplit("/", 1)[-1]) for c in calls]
+        assert seq == [("POST", "createReply"), ("PATCH", "draft-1"),
+                       ("POST", "send"), ("DELETE", "draft-1")]
+
+    def test_cleanup_failure_does_not_mask_original_error(self, monkeypatch):
+        """The cleanup DELETE is best-effort: if it also fails, the ORIGINAL
+        error must still be what's raised, never the cleanup error."""
+        _capture_graph(monkeypatch)
+
+        def _boom_patch(url, json_body):
+            raise RuntimeError("original graph 500")
+
+        def _boom_delete(url):
+            raise RuntimeError("delete also failed")
+
+        monkeypatch.setattr(eps, "graph_patch", _boom_patch)
+        monkeypatch.setattr(eps, "graph_delete", _boom_delete)
+        with pytest.raises(RuntimeError, match="original graph 500"):
+            xte.send_threaded_reply("msg-9", "<p>hi</p>")
+
 
 # ----------------------------------------------------------------------
 #  run() -- inbox scan, gating, reply, dedup
@@ -254,3 +314,28 @@ class TestRun:
         res = xte.run()
         assert res["replied"] == 0
         assert "m5" not in json.load(open(xte.STORE_PATH))["processed_ids"]  # will retry next run
+
+    def test_post_draft_failure_leaves_message_unprocessed_and_cleans_up_draft(self, xte_files, monkeypatch):
+        """Unlike test_reply_failure_not_marked_processed (which fails at the
+        very first graph_post call, before any draft exists), this fails on
+        the final send -- AFTER createReply already created a draft. Must
+        still retry next run, AND must not leave that draft orphaned."""
+        self._patch_ok(monkeypatch)
+        _mock_inbox(monkeypatch, [_msg("m6", "bk@negevlabs.com", "x", "https://x.com/i/status/111")])
+        calls = _capture_graph(monkeypatch)
+
+        def _boom_post(url, json_body):
+            calls.append({"method": "POST", "url": url, "body": json_body})
+            if url.endswith("/createReply"):
+                return {"id": "draft-1"}
+            if url.endswith("/send"):
+                raise RuntimeError("graph 500 on send")
+            return {}
+
+        monkeypatch.setattr(eps, "graph_post", _boom_post)
+        res = xte.run()
+        assert res["replied"] == 0
+        assert "m6" not in json.load(open(xte.STORE_PATH))["processed_ids"]  # will retry next run
+        seq = [(c["method"], c["url"].rsplit("/", 1)[-1]) for c in calls]
+        assert seq == [("POST", "createReply"), ("PATCH", "draft-1"),
+                       ("POST", "attachments"), ("POST", "send"), ("DELETE", "draft-1")]

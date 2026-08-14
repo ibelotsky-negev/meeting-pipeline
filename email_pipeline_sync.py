@@ -181,6 +181,12 @@ def graph_patch(url: str, json_body: dict) -> dict:
     return resp.json() if resp.content else {}
 
 
+def graph_delete(url: str) -> dict:
+    headers = {"Authorization": f"Bearer {get_graph_token()}"}
+    resp = _request_with_retry("DELETE", url, headers)
+    return resp.json() if resp.content else {}
+
+
 # ======================================================================
 #  RUN LEDGER (SQLite)
 # ======================================================================
