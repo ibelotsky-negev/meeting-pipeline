@@ -210,28 +210,87 @@ class TestSummaryRendering:
 # ----------------------------------------------------------------------
 
 class TestTranscribeLink:
-    def test_success(self, monkeypatch, tmp_path):
+    def _audio_ok(self, monkeypatch, tmp_path, text="hello world"):
         d = tmp_path / "aud"; d.mkdir()
         monkeypatch.setattr(ld, "extract_x_post_audio",
                             lambda u, timeout=None: (str(d / "a.m4a"), 30.0, None, str(d)))
-        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: ("hello world", None))
-        r = xte.transcribe_link("https://x.com/i/status/111")
+        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: (text, None))
+        return d
+
+    def test_x_success_via_stt(self, monkeypatch, tmp_path):
+        d = self._audio_ok(monkeypatch, tmp_path)
+        r = xte.transcribe_link("https://x.com/i/status/111", "x")
         assert r["ok"] and r["transcript"] == "hello world" and r["chars"] == 11
+        assert r["source"] == "xAI Grok STT"
         assert not os.path.isdir(str(d))  # tmpdir cleaned up
 
-    def test_no_audio_extracted(self, monkeypatch, tmp_path):
+    def test_x_no_audio_extracted(self, monkeypatch, tmp_path):
         monkeypatch.setattr(ld, "extract_x_post_audio",
                             lambda u, timeout=None: (None, 0, "no video could be found", str(tmp_path / "x")))
-        r = xte.transcribe_link("https://x.com/i/status/111")
+        r = xte.transcribe_link("https://x.com/i/status/111", "x")
         assert not r["ok"] and "no video" in r["error"]
 
-    def test_stt_failure(self, monkeypatch, tmp_path):
+    def test_x_stt_failure(self, monkeypatch, tmp_path):
         d = tmp_path / "aud"; d.mkdir()
         monkeypatch.setattr(ld, "extract_x_post_audio",
                             lambda u, timeout=None: (str(d / "a.m4a"), 30.0, None, str(d)))
         monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: (None, "STT status 400"))
-        r = xte.transcribe_link("https://x.com/i/status/111")
+        r = xte.transcribe_link("https://x.com/i/status/111", "x")
         assert not r["ok"] and "400" in r["error"]
+
+    def test_youtube_prefers_captions_and_never_calls_stt(self, monkeypatch):
+        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: "caption text")
+
+        def _never(*a, **k):
+            raise AssertionError("STT must not run when captions exist")
+        monkeypatch.setattr(ld, "extract_x_post_audio", _never)
+        r = xte.transcribe_link("https://www.youtube.com/watch?v=abc", "youtube")
+        assert r["ok"] and r["transcript"] == "caption text"
+        assert r["source"] == "YouTube captions"
+
+    def test_youtube_falls_back_to_stt_when_no_captions(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: None)
+        self._audio_ok(monkeypatch, tmp_path, text="spoken words")
+        r = xte.transcribe_link("https://www.youtube.com/watch?v=abc", "youtube")
+        assert r["ok"] and r["transcript"] == "spoken words"
+        assert r["source"] == "xAI Grok STT"
+
+    def test_youtube_caption_error_falls_back_not_crashes(self, monkeypatch, tmp_path):
+        def _boom(u):
+            raise RuntimeError("captions api down")
+        monkeypatch.setattr(ld, "_fetch_youtube_transcript", _boom)
+        self._audio_ok(monkeypatch, tmp_path, text="spoken words")
+        r = xte.transcribe_link("https://www.youtube.com/watch?v=abc", "youtube")
+        assert r["ok"] and r["transcript"] == "spoken words"
+
+    def test_podcast_unsupported_without_calling_any_resolver(self, monkeypatch):
+        def _never(*a, **k):
+            raise AssertionError("no resolver may run for a podcast link")
+        monkeypatch.setattr(ld, "extract_x_post_audio", _never)
+        monkeypatch.setattr(ld, "_fetch_youtube_transcript", _never)
+        r = xte.transcribe_link("https://open.spotify.com/episode/xyz", "podcast")
+        assert not r["ok"]
+        assert "not supported yet" in r["error"]
+
+
+class TestFailureMessage:
+    def test_podcast_reason_passes_through_verbatim(self):
+        assert xte._failure_message(xte.PODCAST_UNSUPPORTED) == xte.PODCAST_UNSUPPORTED
+
+    def test_no_video_reason_is_humanized(self):
+        assert "No video was found" in xte._failure_message("no video could be found")
+
+
+class TestAttachmentNaming:
+    def test_status_id_uses_x_status_then_youtube_id(self):
+        assert xte._status_id("https://x.com/i/status/2069002271216787464") == "2069002271216787464"
+        assert xte._status_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+        assert xte._status_id("https://x.com/no/id/here") == "post"
+
+    def test_transcript_md_records_the_real_source(self):
+        md = xte._transcript_md("T", "https://youtu.be/a", "words", source="YouTube captions")
+        assert "YouTube captions" in md
+        assert "Grok" not in md
 
 
 class TestThreadedReply:

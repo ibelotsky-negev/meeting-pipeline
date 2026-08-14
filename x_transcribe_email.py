@@ -174,15 +174,23 @@ def find_media_links(body_html: str) -> list:
 # ======================================================================
 
 
-def transcribe_link(url: str) -> dict:
-    """Transcribe one X post's video audio. Returns a result dict; never raises.
-    ok=False carries a specific, honest error reason (no fabrication)."""
-    result = {"url": url, "ok": False, "error": "", "transcript": "", "chars": 0}
+PODCAST_UNSUPPORTED = (
+    "Spotify and other podcast links are not supported yet -- podcast audio is "
+    "DRM-protected and cannot be downloaded for transcription."
+)
+
+
+def _transcribe_audio_url(url: str) -> dict:
+    """Shared yt-dlp + Grok STT path. ld.extract_x_post_audio is a generic
+    yt-dlp wrapper despite its name -- it takes any URL and enforces the
+    duration and size caps -- so this serves X and YouTube alike.
+    Never raises; ok=False carries a specific, honest reason."""
+    result = {"url": url, "ok": False, "error": "", "transcript": "", "chars": 0, "source": ""}
     tmpdir = None
     try:
         audio_path, _duration, err, tmpdir = ld.extract_x_post_audio(url)
         if err or not audio_path:
-            result["error"] = err or "no audio could be extracted from this post"
+            result["error"] = err or "no audio could be extracted from this link"
             return result
         text, stt_err = ld._grok_stt_from_file(audio_path)
         if stt_err or not text:
@@ -191,6 +199,7 @@ def transcribe_link(url: str) -> dict:
         result["ok"] = True
         result["transcript"] = text
         result["chars"] = len(text)
+        result["source"] = "xAI Grok STT"
         return result
     except Exception as e:
         logger.warning(f"[xte] transcribe failed {url[:70]}: {e}")
@@ -199,6 +208,28 @@ def transcribe_link(url: str) -> dict:
     finally:
         if tmpdir and os.path.isdir(tmpdir):
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def transcribe_link(url: str, kind: str = "x") -> dict:
+    """Transcribe one link by kind. Never raises; ok=False carries a specific,
+    honest error reason (no fabrication).
+
+    youtube: captions first (fast, free, and most videos have them), falling
+    back to the same yt-dlp + STT path as X only when there are none.
+    podcast: reported unsupported without calling any resolver."""
+    if kind == "podcast":
+        return {"url": url, "ok": False, "error": PODCAST_UNSUPPORTED,
+                "transcript": "", "chars": 0, "source": ""}
+    if kind == "youtube":
+        try:
+            captions = ld._fetch_youtube_transcript(url)
+        except Exception as e:
+            logger.warning(f"[xte] youtube captions failed {url[:70]}: {e}")
+            captions = None
+        if captions:
+            return {"url": url, "ok": True, "error": "", "transcript": captions,
+                    "chars": len(captions), "source": "YouTube captions"}
+    return _transcribe_audio_url(url)
 
 
 _SUMMARY_INSTRUCTIONS = (
@@ -269,15 +300,23 @@ def _summary_to_html(summary: str) -> str:
 
 
 def _status_id(url: str) -> str:
+    """Stable short id for the attachment filename: X status id, else YouTube
+    video id, else 'post'."""
     m = _STATUS_LINK_RE.search(url or "")
-    return m.group(1) if m else "post"
+    if m:
+        return m.group(1)
+    try:
+        vid = ld._youtube_video_id(url or "")
+    except Exception:
+        vid = None
+    return vid or "post"
 
 
-def _transcript_md(title: str, url: str, transcript: str) -> str:
+def _transcript_md(title: str, url: str, transcript: str, source: str = "xAI Grok STT") -> str:
     return (
         f"# Transcript -- {title}\n\n"
         f"- Source: {url}\n"
-        f"- Transcribed by: Sara (xAI Grok STT)\n\n"
+        f"- Transcribed by: Sara ({source})\n\n"
         f"---\n\n{transcript}\n"
     )
 
@@ -294,6 +333,8 @@ def _attachment(name: str, text: str) -> dict:
 def _failure_message(error: str) -> str:
     """Turn a per-link failure reason into a clear sentence for the reply."""
     low = (error or "").lower()
+    if "not supported yet" in low:
+        return error or PODCAST_UNSUPPORTED
     if any(k in low for k in ("no video", "no audio", "no downloadable", "no media", "no transcribable")):
         return "No video was found at this link, so there was nothing to transcribe."
     if any(k in low for k in ("timeout", "guest token", "429", "502", "503", "504", "temporar")):
