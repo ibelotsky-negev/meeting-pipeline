@@ -378,7 +378,7 @@ class TestRun:
         monkeypatch.setattr(xte, "transcribe_link",
                             lambda u, k="x": {"url": u, "ok": True, "transcript": "T" * 50, "chars": 50, "error": ""})
         monkeypatch.setattr(xte, "summarize_transcript",
-                            lambda u, t: "TITLE: Vid\nTL;DR: ok\nKEY POINTS:\n- p1")
+                            lambda u, t, note="": "TITLE: Vid\nTL;DR: ok\nKEY POINTS:\n- p1")
 
     def test_dry_run_lists_but_sends_nothing_and_writes_no_store(self, xte_files, monkeypatch):
         _mock_inbox(monkeypatch, [_msg("m1", "bk@negevlabs.com", "hey", "https://x.com/i/status/111")])
@@ -510,3 +510,68 @@ class TestSourceWiring:
         body = _sent_bodies(calls)[0]
         assert "not supported yet" in body
         assert not _sent_attachments(calls)  # nothing transcribed, nothing to attach
+
+
+# ----------------------------------------------------------------------
+#  Task 5 -- answer a question asked alongside the link
+# ----------------------------------------------------------------------
+
+class TestExtractNote:
+    def test_strips_links_and_returns_prose(self):
+        html = '<p>What does he say about valuations? https://x.com/i/status/111</p>'
+        note = xte.extract_note(html, ["https://x.com/i/status/111"])
+        assert note == "What does he say about valuations?"
+
+    def test_link_only_body_yields_empty_note(self):
+        assert xte.extract_note('<p>https://x.com/i/status/111</p>',
+                                ["https://x.com/i/status/111"]) == ""
+
+    def test_strips_untracked_urls_too(self):
+        note = xte.extract_note("<p>see https://example.com/a and tell me why</p>", [])
+        assert "example.com" not in note
+        assert "tell me why" in note
+
+    def test_truncates_to_2000_chars(self):
+        note = xte.extract_note("<p>" + ("z" * 5000) + "</p>", [])
+        assert len(note) == 2000
+
+
+class TestQuestionInFirstEmail:
+    def test_note_is_passed_to_the_summarizer(self, xte_files, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "T" * 20,
+                                              "chars": 20, "error": "", "source": "xAI Grok STT"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": seen.update(note=note) or "TITLE: V\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("q1", "bk@negevlabs.com", "q",
+                                       "What did he say about pricing? https://x.com/i/status/111")])
+        _capture_graph(monkeypatch)
+        xte.run()
+        assert seen["note"] == "What did he say about pricing?"
+
+    def test_no_prose_means_empty_note(self, xte_files, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "T" * 20,
+                                              "chars": 20, "error": "", "source": "xAI Grok STT"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": seen.update(note=note) or "TITLE: V\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("q2", "bk@negevlabs.com", "", "https://x.com/i/status/111")])
+        _capture_graph(monkeypatch)
+        xte.run()
+        assert seen["note"] == ""
+
+    def test_prompt_includes_answer_instruction_only_when_note_present(self, monkeypatch):
+        prompts = []
+        monkeypatch.setattr(ld, "_call_claude_text",
+                            lambda p, m, max_tokens=2000, tools=None, timeout=None:
+                            prompts.append(p) or "TITLE: t")
+        xte.summarize_transcript("https://x.com/i/status/1", "words", note="why?")
+        xte.summarize_transcript("https://x.com/i/status/1", "words")
+        assert "ANSWER:" in prompts[0] and "why?" in prompts[0]
+        assert "ANSWER:" not in prompts[1]
+
+    def test_answer_label_renders_bold(self):
+        h = xte._summary_to_html("ANSWER: he said 40x\nTL;DR: gist")
+        assert "<b>ANSWER: he said 40x</b>" in h

@@ -169,6 +169,21 @@ def find_media_links(body_html: str) -> list:
     return out
 
 
+def extract_note(body_html: str, urls: list = None) -> str:
+    """The sender's own prose from THIS message (uniqueBody), with links
+    removed -- used as an optional question about the video.
+
+    Deliberately does NOT decide whether the prose is a question: forwarded-mail
+    boilerplate would fool any heuristic. The model judges, and a note that
+    turns out to be a greeting simply produces the normal summary."""
+    text = eps.html_to_text(body_html or "")
+    for u in (urls or []):
+        text = text.replace(u, " ")
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:2000]
+
+
 # ======================================================================
 #  TRANSCRIBE + SUMMARIZE (reuse learn_digest)
 # ======================================================================
@@ -244,10 +259,25 @@ _SUMMARY_INSTRUCTIONS = (
 )
 
 
-def summarize_transcript(url: str, transcript: str) -> str:
-    """Claude summary of the transcript in the fixed TITLE/TL;DR/KEY POINTS shape.
+_QUESTION_INSTRUCTIONS = (
+    "The requester included this note with the link:\n\"\"\"\n{note}\n\"\"\"\n"
+    "If it asks something about the video, BEGIN your reply with a single line:\n"
+    "ANSWER: <direct answer, grounded ONLY in the transcript>\n"
+    "If the transcript does not cover it, say exactly that on the ANSWER line -- never guess "
+    "and never draw on outside knowledge.\n"
+    "If the note is not a question (a greeting, a signature, forwarded boilerplate), omit the "
+    "ANSWER line entirely and just summarize.\n\n"
+)
+
+
+def summarize_transcript(url: str, transcript: str, note: str = "") -> str:
+    """Claude summary in the fixed TITLE/TL;DR/KEY POINTS shape, optionally
+    preceded by an ANSWER line when the sender asked something.
     Returns '' on failure (caller still sends the transcript)."""
-    prompt = _SUMMARY_INSTRUCTIONS + f"Source: {url}\n\nTranscript:\n{transcript[:14000]}"
+    prompt = _SUMMARY_INSTRUCTIONS
+    if (note or "").strip():
+        prompt += _QUESTION_INSTRUCTIONS.format(note=note.strip())
+    prompt += f"Source: {url}\n\nTranscript:\n{transcript[:14000]}"
     try:
         return (ld._call_claude_text(prompt, XTE_SUMMARY_MODEL, max_tokens=1200) or "").strip()
     except Exception as e:
@@ -273,7 +303,7 @@ def _summary_to_html(summary: str) -> str:
     """Escape + lightly format the labeled summary text into readable HTML
     (bold section labels, real bullet lists). The TITLE line is dropped -- it is
     surfaced as the section heading instead."""
-    labels = ("TL;DR:", "KEY POINTS:", "NOTABLE QUOTES:")
+    labels = ("ANSWER:", "TL;DR:", "KEY POINTS:", "NOTABLE QUOTES:")
     parts, bullets = [], []
 
     def flush():
@@ -421,12 +451,13 @@ def _process_message(m: dict) -> dict:
     pairs = find_media_links(body_html)
     truncated = max(0, len(pairs) - XTE_MAX_LINKS)
     pairs = pairs[:XTE_MAX_LINKS]
+    note = extract_note(body_html, [u for u, _ in pairs])
 
     results = []
     for url, kind in pairs:
         r = transcribe_link(url, kind)
         if r["ok"]:
-            r["summary"] = summarize_transcript(url, r["transcript"])
+            r["summary"] = summarize_transcript(url, r["transcript"], note)
             r["title"] = _parse_title(r["summary"], url)
         else:
             r["title"] = url
