@@ -543,7 +543,7 @@ def render_reply(results: list, truncated: int = 0) -> str:
     if truncated:
         parts.append(f"<p><em>{truncated} additional link(s) in your email were not processed "
                      f"(max {XTE_MAX_LINKS} per email).</em></p>")
-    parts.append("<p style='color:#888;'>-- Sara</p></div>")
+    parts.append(_FOOTER_HTML + "</div>")
     return "".join(parts)
 
 

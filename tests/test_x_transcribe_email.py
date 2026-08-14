@@ -207,6 +207,19 @@ class TestSummaryRendering:
         assert "No video was found" in body
 
 
+class TestFooter:
+    def test_footer_on_transcript_reply(self):
+        body = xte.render_reply([{"url": "https://x.com/i/status/1", "ok": True, "title": "T",
+                                  "summary": "TITLE: T\nTL;DR: ok"}])
+        assert "Reply to this email to ask" in body
+        assert "aren't supported yet" in body
+
+    def test_footer_on_followup_reply(self):
+        body = xte.render_answer("why?", "ANSWER: because")
+        assert "Reply to this email to ask" in body
+        assert "You asked:" in body
+
+
 # ----------------------------------------------------------------------
 #  transcribe_link (audio + STT reuse mocked)
 # ----------------------------------------------------------------------
