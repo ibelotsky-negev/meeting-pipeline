@@ -37,10 +37,34 @@ def _mock_inbox(monkeypatch, messages):
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": messages})
 
 
-def _capture_sends(monkeypatch):
-    sent = []
-    monkeypatch.setattr(eps, "graph_post", lambda url, json_body: sent.append({"url": url, "body": json_body}) or {})
-    return sent
+def _capture_graph(monkeypatch):
+    """Record every Graph write. createReply answers with a draft id so the
+    threaded-reply sequence can run to completion offline."""
+    calls = []
+
+    def _post(url, json_body):
+        calls.append({"method": "POST", "url": url, "body": json_body})
+        if url.endswith("/createReply"):
+            return {"id": "draft-1"}
+        return {}
+
+    def _patch(url, json_body):
+        calls.append({"method": "PATCH", "url": url, "body": json_body})
+        return {}
+
+    monkeypatch.setattr(eps, "graph_post", _post)
+    monkeypatch.setattr(eps, "graph_patch", _patch)
+    return calls
+
+
+def _sent_bodies(calls):
+    """HTML bodies of every reply actually patched onto a draft."""
+    return [c["body"]["body"]["content"] for c in calls
+            if c["method"] == "PATCH" and "body" in (c["body"] or {})]
+
+
+def _sent_attachments(calls):
+    return [c["body"] for c in calls if c["url"].endswith("/attachments")]
 
 
 # ----------------------------------------------------------------------
@@ -135,6 +159,29 @@ class TestTranscribeLink:
         assert not r["ok"] and "400" in r["error"]
 
 
+class TestThreadedReply:
+    def test_create_reply_patch_attach_send_in_order(self, monkeypatch):
+        calls = _capture_graph(monkeypatch)
+        xte.send_threaded_reply("msg-9", "<p>hi</p>",
+                                [xte._attachment("t.md", "body text")])
+        seq = [(c["method"], c["url"].rsplit("/", 1)[-1]) for c in calls]
+        assert seq == [("POST", "createReply"), ("PATCH", "draft-1"),
+                       ("POST", "attachments"), ("POST", "send")]
+        assert calls[0]["url"].endswith("/messages/msg-9/createReply")
+        assert calls[1]["body"]["body"]["content"] == "<p>hi</p>"
+        assert calls[2]["body"]["name"] == "t.md"
+
+    def test_no_attachments_skips_attachment_call(self, monkeypatch):
+        calls = _capture_graph(monkeypatch)
+        xte.send_threaded_reply("msg-9", "<p>hi</p>")
+        assert not any(c["url"].endswith("/attachments") for c in calls)
+
+    def test_missing_draft_id_raises(self, monkeypatch):
+        monkeypatch.setattr(eps, "graph_post", lambda url, json_body: {})
+        with pytest.raises(RuntimeError):
+            xte.send_threaded_reply("msg-9", "<p>hi</p>")
+
+
 # ----------------------------------------------------------------------
 #  run() -- inbox scan, gating, reply, dedup
 # ----------------------------------------------------------------------
@@ -148,23 +195,21 @@ class TestRun:
 
     def test_dry_run_lists_but_sends_nothing_and_writes_no_store(self, xte_files, monkeypatch):
         _mock_inbox(monkeypatch, [_msg("m1", "bk@negevlabs.com", "hey", "https://x.com/i/status/111")])
-        sent = _capture_sends(monkeypatch)
+        calls = _capture_graph(monkeypatch)
         res = xte.run(dry_run=True)
         assert res["scanned"] == 1 and res["replied"] == 0
         assert res["outcomes"][0]["would_transcribe"]
-        assert sent == []
+        assert calls == []
         assert not os.path.exists(xte.STORE_PATH)
 
     def test_live_replies_with_transcript_attachment(self, xte_files, monkeypatch):
         self._patch_ok(monkeypatch)
         _mock_inbox(monkeypatch, [_msg("m1", "bk@negevlabs.com", "please transcribe", "https://x.com/i/status/111")])
-        sent = _capture_sends(monkeypatch)
+        calls = _capture_graph(monkeypatch)
         res = xte.run()
-        assert res["replied"] == 1 and len(sent) == 1
-        msg = sent[0]["body"]["message"]
-        assert msg["toRecipients"][0]["emailAddress"]["address"] == "bk@negevlabs.com"
-        assert msg["subject"].startswith("Re:")
-        atts = msg["attachments"]
+        assert res["replied"] == 1
+        assert calls[0]["url"].endswith("/messages/m1/createReply")   # threaded onto the request
+        atts = _sent_attachments(calls)
         assert atts and atts[0]["@odata.type"] == "#microsoft.graph.fileAttachment"
         assert atts[0]["name"] == "transcript_111.md"
         assert "TTTTT" in base64.b64decode(atts[0]["contentBytes"]).decode("utf-8")
@@ -174,9 +219,9 @@ class TestRun:
     def test_external_sender_gated_out(self, xte_files, monkeypatch):
         self._patch_ok(monkeypatch)
         _mock_inbox(monkeypatch, [_msg("m2", "rando@gmail.com", "hi", "https://x.com/i/status/111")])
-        sent = _capture_sends(monkeypatch)
+        calls = _capture_graph(monkeypatch)
         res = xte.run()
-        assert res["replied"] == 0 and sent == []
+        assert res["replied"] == 0 and calls == []
         assert "m2" in json.load(open(xte.STORE_PATH))["processed_ids"]  # not reconsidered
 
     def test_skips_saras_own_mail_and_link_free_mail(self, xte_files, monkeypatch):
@@ -186,18 +231,18 @@ class TestRun:
             _msg("m4", "dan@negevlabs.com", "fyi", "no links in here at all"),     # nothing to do
         ]
         _mock_inbox(monkeypatch, msgs)
-        sent = _capture_sends(monkeypatch)
+        calls = _capture_graph(monkeypatch)
         res = xte.run()
-        assert res["replied"] == 0 and sent == []
+        assert res["replied"] == 0 and calls == []
 
     def test_dedup_skips_already_processed_id(self, xte_files, monkeypatch):
         self._patch_ok(monkeypatch)
         os.makedirs(os.path.dirname(xte.STORE_PATH), exist_ok=True)
         json.dump({"processed_ids": ["m1"]}, open(xte.STORE_PATH, "w"))
         _mock_inbox(monkeypatch, [_msg("m1", "bk@negevlabs.com", "again", "https://x.com/i/status/111")])
-        sent = _capture_sends(monkeypatch)
+        calls = _capture_graph(monkeypatch)
         res = xte.run()
-        assert res["replied"] == 0 and sent == []
+        assert res["replied"] == 0 and calls == []
 
     def test_reply_failure_not_marked_processed(self, xte_files, monkeypatch):
         self._patch_ok(monkeypatch)

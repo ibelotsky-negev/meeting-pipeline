@@ -297,16 +297,24 @@ def render_reply(results: list, truncated: int = 0) -> str:
     return "".join(parts)
 
 
-def send_reply(to_addr: str, subject: str, html_body: str, attachments: list):
-    message = {
-        "subject": subject,
-        "body": {"contentType": "HTML", "content": html_body},
-        "toRecipients": [{"emailAddress": {"address": to_addr}}],
-    }
-    if attachments:
-        message["attachments"] = attachments
-    eps.graph_post(f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/sendMail",
-                   {"message": message, "saveToSentItems": True})
+def send_threaded_reply(source_message_id: str, html_body: str, attachments: list = None):
+    """Reply in-thread via createReply so the reply inherits conversationId,
+    subject and recipient. sendMail would thread only by subject heuristics,
+    which breaks the conversationId match that follow-up questions rely on.
+
+    Sequence: createReply (draft) -> PATCH the body -> POST each attachment ->
+    send. Raises on a missing draft id so the caller does NOT mark the message
+    processed and the next run retries it."""
+    base = f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/messages"
+    draft = eps.graph_post(f"{base}/{source_message_id}/createReply", {}) or {}
+    draft_id = draft.get("id")
+    if not draft_id:
+        raise RuntimeError("createReply returned no draft id")
+    eps.graph_patch(f"{base}/{draft_id}",
+                    {"body": {"contentType": "HTML", "content": html_body}})
+    for att in (attachments or []):
+        eps.graph_post(f"{base}/{draft_id}/attachments", att)
+    eps.graph_post(f"{base}/{draft_id}/send", {})
 
 
 # ======================================================================
@@ -339,9 +347,7 @@ def _process_message(m: dict) -> dict:
                     _transcript_md(r["title"], r["url"], r["transcript"]))
         for r in results if r["ok"]
     ]
-    first_title = next((r["title"] for r in results if r["ok"]), "X video")
-    subj = ("Re: " + subject) if subject.strip() else f"Transcript: {first_title}"
-    send_reply(sender, subj, render_reply(results, truncated), attachments)
+    send_threaded_reply(m.get("id"), render_reply(results, truncated), attachments)
 
     return {"from": sender, "subject": subject, "replied": True,
             "links": [{"url": r["url"], "ok": r["ok"], "chars": r.get("chars", 0),
