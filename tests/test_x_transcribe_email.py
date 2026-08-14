@@ -224,6 +224,13 @@ class TestFooter:
 #  transcribe_link (audio + STT reuse mocked)
 # ----------------------------------------------------------------------
 
+# A REAL-shaped YouTube video id (11 chars). transcribe_link now refuses a
+# YouTube URL it cannot parse a video id out of (channel / playlist / handle),
+# so the stand-in id in these fixtures has to be one ld._youtube_video_id
+# actually matches -- its regex requires 6+ chars.
+_YT_VIDEO = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
 class TestTranscribeLink:
     def _audio_ok(self, monkeypatch, tmp_path, text="hello world"):
         d = tmp_path / "aud"; d.mkdir()
@@ -259,14 +266,14 @@ class TestTranscribeLink:
         def _never(*a, **k):
             raise AssertionError("STT must not run when captions exist")
         monkeypatch.setattr(ld, "extract_x_post_audio", _never)
-        r = xte.transcribe_link("https://www.youtube.com/watch?v=abc", "youtube")
+        r = xte.transcribe_link(_YT_VIDEO, "youtube")
         assert r["ok"] and r["transcript"] == "caption text"
         assert r["source"] == "YouTube captions"
 
     def test_youtube_falls_back_to_stt_when_no_captions(self, monkeypatch, tmp_path):
         monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: None)
         self._audio_ok(monkeypatch, tmp_path, text="spoken words")
-        r = xte.transcribe_link("https://www.youtube.com/watch?v=abc", "youtube")
+        r = xte.transcribe_link(_YT_VIDEO, "youtube")
         assert r["ok"] and r["transcript"] == "spoken words"
         assert r["source"] == "xAI Grok STT"
 
@@ -275,7 +282,7 @@ class TestTranscribeLink:
             raise RuntimeError("captions api down")
         monkeypatch.setattr(ld, "_fetch_youtube_transcript", _boom)
         self._audio_ok(monkeypatch, tmp_path, text="spoken words")
-        r = xte.transcribe_link("https://www.youtube.com/watch?v=abc", "youtube")
+        r = xte.transcribe_link(_YT_VIDEO, "youtube")
         assert r["ok"] and r["transcript"] == "spoken words"
 
     def test_podcast_unsupported_without_calling_any_resolver(self, monkeypatch):
@@ -876,3 +883,312 @@ class TestNoQuestionFollowUp:
                             prompts.append(p) or "NO_QUESTION")
         xte.answer_question("thanks", [{"url": "u", "title": "T", "transcript": "w"}])
         assert "NO_QUESTION" in prompts[0]
+
+
+# ----------------------------------------------------------------------
+#  Final review wave -- link-path guards (signature links, non-video
+#  YouTube URLs, post-send failures)
+# ----------------------------------------------------------------------
+
+def _cached(conv_id, url, transcript="he said margins are 80 percent", questions=0, links=None):
+    """Seed the per-conversation transcript cache with one already-transcribed
+    link (or an explicit, possibly corrupted, links value)."""
+    now = datetime.now(timezone.utc).isoformat()
+    xte._save_threads({conv_id: {
+        "created_at": now, "updated_at": now, "questions": questions,
+        "links": links if links is not None else
+        [{"url": url, "title": "T", "transcript": transcript}]}})
+
+
+class TestLinkKey:
+    def test_same_video_different_forms_share_a_key(self):
+        assert (xte._link_key("https://youtu.be/dQw4w9WgXcQ")
+                == xte._link_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
+
+    def test_x_forms_share_a_key(self):
+        assert (xte._link_key("https://twitter.com/i/status/111")
+                == xte._link_key("https://X.com/i/status/111/"))
+
+    def test_different_videos_do_not_share_a_key(self):
+        assert (xte._link_key("https://youtu.be/dQw4w9WgXcQ")
+                != xte._link_key("https://youtu.be/AbCdEfGhIjK"))
+
+    def test_has_new_link_matches_a_cached_link_across_forms(self):
+        entry = {"links": [{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}]}
+        assert not xte._has_new_link([("https://youtu.be/dQw4w9WgXcQ", "youtube")], entry)
+        assert xte._has_new_link([("https://youtu.be/AbCdEfGhIjK", "youtube")], entry)
+
+    def test_has_new_link_survives_a_corrupted_cache_entry(self):
+        assert xte._has_new_link([("https://youtu.be/dQw4w9WgXcQ", "youtube")],
+                                 {"links": "corrupted-not-a-list"})
+        assert xte._has_new_link([("https://youtu.be/dQw4w9WgXcQ", "youtube")], {"links": 7})
+
+
+class TestSignatureLinkDoesNotHijackFollowUp:
+    """FIX 1: uniqueBody keeps the sender's signature, and find_media_links
+    accepts profile / channel / show URLs. Before this guard, a signature link
+    pushed every follow-up down the transcription path -- the question was
+    dropped and an unsolicited failure reply went out."""
+
+    def test_followup_with_a_cached_signature_link_is_answered_not_transcribed(
+            self, xte_files, monkeypatch):
+        _cached("CONV-A", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        monkeypatch.setattr(xte, "answer_question",
+                            lambda q, links: "ANSWER: margins are 80 percent")
+        seen = []
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": seen.append(u) or {
+                                "url": u, "ok": False, "error": "nope",
+                                "transcript": "", "chars": 0, "source": ""})
+        body = ('<p>what did he say about pricing?</p>'
+                '<p>--<br>Ken Belotsky, Palomar Labs<br>'
+                '<a href="https://youtu.be/dQw4w9WgXcQ">our latest clip</a></p>')
+        _mock_inbox(monkeypatch, [_followup_msg("s1", "bk@negevlabs.com", "CONV-A", body)])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert seen == []                                  # signature link never transcribed
+        assert res["replied"] == 1
+        assert res["outcomes"][0].get("followup") is True
+        assert "margins are 80 percent" in _sent_bodies(calls)[0]
+        assert not _sent_attachments(calls)
+        assert xte._load_threads()["CONV-A"]["questions"] == 1
+
+    def test_a_genuinely_new_link_in_a_cached_conversation_still_transcribes(
+            self, xte_files, monkeypatch):
+        _cached("CONV-A", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        asked = []
+        monkeypatch.setattr(xte, "answer_question", lambda q, links: asked.append(q) or "ANSWER: no")
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "new words",
+                                              "chars": 9, "error": "", "source": "xAI Grok STT"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        body = ('<p>and this one too?</p>'
+                '<p>--<br>Ken<br><a href="https://youtu.be/dQw4w9WgXcQ">sig</a></p>'
+                '<p>https://youtu.be/AbCdEfGhIjK</p>')
+        _mock_inbox(monkeypatch, [_followup_msg("s2", "bk@negevlabs.com", "CONV-A", body)])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 1
+        assert asked == []                                 # not routed to the follow-up path
+        assert _sent_attachments(calls)                    # a real transcription reply
+
+    def test_link_mail_in_an_uncached_conversation_still_transcribes(self, xte_files, monkeypatch):
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "words",
+                                              "chars": 5, "error": "", "source": "xAI Grok STT"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("s3", "bk@negevlabs.com", "new", "https://x.com/i/status/111")])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 1
+        assert _sent_attachments(calls)
+
+    def test_autoresponder_carrying_a_media_link_is_skipped_and_marked_processed(
+            self, xte_files, monkeypatch):
+        """The link path had no is_auto_reply check at all: an autoresponder
+        whose template carries a media link bypassed BOTH loop breakers."""
+        seen = []
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": seen.append(u) or {"url": u, "ok": True,
+                                                                "transcript": "w", "chars": 1,
+                                                                "error": "", "source": ""})
+        # Patched so a REGRESSION fails offline instead of reaching the live
+        # Claude API (the no_network fixture blocks requests, not httpx).
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        m = _msg("a1", "bk@negevlabs.com", "Out of office", "https://x.com/i/status/111")
+        m["internetMessageHeaders"] = [{"name": "Auto-Submitted", "value": "auto-replied"}]
+        _mock_inbox(monkeypatch, [m])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 0 and calls == [] and seen == []
+        assert "a1" in json.load(open(xte.STORE_PATH))["processed_ids"]   # not re-evaluated
+
+
+class TestYouTubeNonVideoLinks:
+    """FIX 2: a channel / playlist / handle URL has no video id, so captions
+    return None and the old code handed it to yt-dlp -- which a channel has no
+    duration to cap, on a daemon thread that outlives its join."""
+
+    @pytest.mark.parametrize("url", [
+        "https://www.youtube.com/@somechannel",
+        "https://www.youtube.com/playlist?list=PLabcdefgh",
+        "https://www.youtube.com/c/SomeName",
+    ])
+    def test_non_video_url_fails_honestly_without_touching_ytdlp(self, monkeypatch, url):
+        called = []
+        monkeypatch.setattr(ld, "extract_x_post_audio",
+                            lambda u, timeout=None: called.append(u) or (None, 0, "err", None))
+        monkeypatch.setattr(ld, "_fetch_youtube_transcript",
+                            lambda u: called.append(u) or None)
+        r = xte.transcribe_link(url, "youtube")
+        assert called == []                      # resolver never invoked
+        assert not r["ok"]
+        assert "channel or playlist" in r["error"]
+        assert "channel or playlist" in xte._failure_message(r["error"])
+
+    def test_a_real_video_url_still_reaches_the_resolvers(self, monkeypatch):
+        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: "caption text")
+        r = xte.transcribe_link("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube")
+        assert r["ok"] and r["transcript"] == "caption text"
+
+    def test_video_id_lookup_error_is_contained(self, monkeypatch):
+        called = []
+
+        def _boom(u):
+            raise RuntimeError("regex blew up")
+
+        monkeypatch.setattr(ld, "_youtube_video_id", _boom)
+        monkeypatch.setattr(ld, "extract_x_post_audio",
+                            lambda u, timeout=None: called.append(u) or (None, 0, "err", None))
+        r = xte.transcribe_link("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube")
+        assert called == [] and not r["ok"]
+
+
+class TestPostSendFailures:
+    """FIX 3: anything raising between the send and processed.add re-sends that
+    email on every 15-minute scan, forever."""
+
+    def _ok_transcribe(self, monkeypatch):
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "words",
+                                              "chars": 5, "error": "", "source": "xAI Grok STT"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+
+    def test_remember_thread_coerces_a_corrupted_links_value(self, xte_files):
+        _cached("CONV-C", "", links="corrupted-not-a-list")
+        xte.remember_thread("CONV-C", [{"url": "https://x.com/i/status/1", "ok": True,
+                                        "title": "T", "transcript": "words"}])
+        links = xte._load_threads()["CONV-C"]["links"]
+        assert isinstance(links, list) and len(links) == 1
+
+    def test_corrupted_cache_does_not_unsend_a_delivered_reply(self, xte_files, monkeypatch):
+        self._ok_transcribe(monkeypatch)
+        _cached("CONV-C", "", links="corrupted-not-a-list")
+        m = _msg("c9", "bk@negevlabs.com", "clip", "https://x.com/i/status/111")
+        m["conversationId"] = "CONV-C"
+        _mock_inbox(monkeypatch, [m])
+        _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 1
+        assert "c9" in json.load(open(xte.STORE_PATH))["processed_ids"]   # never re-sent
+
+    def test_remember_thread_failure_does_not_unsend_the_reply(self, xte_files, monkeypatch):
+        """Any caching failure at all -- not just a corrupted links value."""
+        self._ok_transcribe(monkeypatch)
+
+        def _boom(conversation_id, results):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(xte, "remember_thread", _boom)
+        _mock_inbox(monkeypatch, [_msg("c10", "bk@negevlabs.com", "clip", "https://x.com/i/status/111")])
+        _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 1
+        assert "c10" in json.load(open(xte.STORE_PATH))["processed_ids"]
+
+    def test_corrupted_questions_counter_does_not_abort_the_scan(self, xte_files, monkeypatch):
+        _cached("CONV-A", "https://x.com/i/status/1", questions="many")
+        monkeypatch.setattr(xte, "answer_question", lambda q, links: "ANSWER: 80 percent")
+        _mock_inbox(monkeypatch, [_followup_msg("q9", "bk@negevlabs.com", "CONV-A", "what margins?")])
+        _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 1
+        assert xte._load_threads()["CONV-A"]["questions"] == 1
+
+    def test_as_int_defaults_instead_of_raising(self):
+        assert xte._as_int("many") == 0
+        assert xte._as_int(None) == 0
+        assert xte._as_int({"a": 1}) == 0
+        assert xte._as_int("7") == 7
+        assert xte._as_int(3) == 3
+
+    def test_processed_persists_across_a_mid_scan_abort(self, xte_files, monkeypatch):
+        """A container restart between two messages must not re-send the reply
+        already delivered for the first one."""
+        def _t(u, k="x"):
+            if "999" in u:
+                raise KeyboardInterrupt("container restart")
+            return {"url": u, "ok": True, "transcript": "words", "chars": 5,
+                    "error": "", "source": "xAI Grok STT"}
+
+        monkeypatch.setattr(xte, "transcribe_link", _t)
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [
+            _msg("ok1", "bk@negevlabs.com", "first", "https://x.com/i/status/111"),
+            _msg("boom", "bk@negevlabs.com", "second", "https://x.com/i/status/999"),
+        ])
+        _capture_graph(monkeypatch)
+        with pytest.raises(KeyboardInterrupt):
+            xte.run()
+        store = json.load(open(xte.STORE_PATH))
+        assert "ok1" in store["processed_ids"]      # already replied -> never re-sent
+        assert "boom" not in store["processed_ids"]
+
+    def test_followup_processed_persists_across_a_mid_scan_abort(self, xte_files, monkeypatch):
+        _cached("CONV-A", "https://x.com/i/status/1")
+
+        def _answer(q, links):
+            if "boom" in q:
+                raise KeyboardInterrupt("container restart")
+            return "ANSWER: 80 percent"
+
+        monkeypatch.setattr(xte, "answer_question", _answer)
+        _mock_inbox(monkeypatch, [
+            _followup_msg("fa", "bk@negevlabs.com", "CONV-A", "what margins?"),
+            _followup_msg("fb", "bk@negevlabs.com", "CONV-A", "boom now"),
+        ])
+        _capture_graph(monkeypatch)
+        with pytest.raises(KeyboardInterrupt):
+            xte.run()
+        assert "fa" in json.load(open(xte.STORE_PATH))["processed_ids"]
+
+
+class TestPodcastDedupKey:
+    def test_path_query_boundary_is_not_collapsed(self):
+        """FIX 4: concatenating path+query with no separator made
+        /episode/xy?zsi=abc and /episode/xyz?si=abc the same key, silently
+        dropping one of the two links."""
+        html = ("a https://open.spotify.com/episode/xy?zsi=abc "
+                "b https://open.spotify.com/episode/xyz?si=abc c")
+        pairs = xte.find_media_links(html)
+        assert len(pairs) == 2
+
+    def test_same_podcast_url_still_dedups(self):
+        html = ("a https://open.spotify.com/episode/xyz?si=abc "
+                "b https://open.spotify.com/episode/xyz?si=abc/ c")
+        assert len(xte.find_media_links(html)) == 1
+
+    def test_key_has_no_double_slash(self):
+        assert "com//" not in xte._link_key("https://open.spotify.com/episode/xyz", "podcast")
+
+
+class TestAutoReplyHyphenForm:
+    def test_precedence_auto_reply_hyphen_is_detected(self):
+        """FIX 5: some autoresponders emit the hyphen form. This is one of only
+        two loop breakers."""
+        assert xte.is_auto_reply({"internetMessageHeaders": [
+            {"name": "Precedence", "value": "auto-reply"}]})
+
+    def test_precedence_list_is_still_a_real_message(self):
+        assert not xte.is_auto_reply({"internetMessageHeaders": [
+            {"name": "Precedence", "value": "list"}]})
+
+
+class TestModuleHygiene:
+    def test_docstring_matches_what_the_module_now_does(self):
+        """FIX 6: the docstring still described an X-only tool on the old
+        domain, and omitted both loop breakers."""
+        doc = xte.__doc__ or ""
+        assert "sara@negevlabs.com" not in doc            # renamed to palomar-labs.com
+        assert "youtube" in doc.lower()
+        assert "is_auto_reply" in doc
+        assert "XTE_THREAD_MAX_QUESTIONS" in doc
+
+    def test_no_dead_module_lock(self):
+        """FIX 7: _run_lock was never acquired -- the real guard is app.py's
+        _xte_trigger_lock. A dead lock claiming that guarantee is misleading."""
+        assert not hasattr(xte, "_run_lock")

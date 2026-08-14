@@ -371,11 +371,19 @@ machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, 
   the bare domain + nav pages are ignored). A podcast link (Spotify etc.) is detected too and
   reported unsupported rather than silently ignored. Links are read from `uniqueBody` ONLY, so
   a link quoted in a reply's thread history never re-fires. A link with no downloadable video
-  still earns an honest "no video found" reply. A link-free reply in a conversation Sara
-  already transcribed is treated as a follow-up question instead of a new request (see State).
+  still earns an honest "no video found" reply. A reply in a conversation Sara already
+  transcribed is treated as a follow-up question unless it adds a link that conversation has
+  NOT already transcribed (`_has_new_link`, compared on the normalized `_link_key` so
+  `youtu.be/ID` matches a cached `youtube.com/watch?v=ID`) -- `uniqueBody` strips quoted
+  history but KEEPS the sender's SIGNATURE, and a signature link (company channel, X profile,
+  podcast show) would otherwise hijack the follow-up path: the question dropped, an
+  unsolicited failure reply sent (see State).
 - **Flow:** per link, `transcribe_link` dispatches by kind -- YouTube tries captions first
   (`_fetch_youtube_transcript`, fast and free) and falls back to the same yt-dlp + Grok STT
-  path as X only when there are none; podcast returns `PODCAST_UNSUPPORTED` without calling
+  path as X only when there are none, but a YouTube URL with no parseable video id (channel /
+  playlist / `@handle`) is refused up front and NEVER reaches yt-dlp (a channel has no
+  duration for the cap to bound, and the download thread is a daemon that outlives its join);
+  podcast returns `PODCAST_UNSUPPORTED` without calling
   any resolver -- then a Claude summary (TITLE/TL;DR/KEY POINTS/NOTABLE QUOTES) goes out via
   `send_threaded_reply` with the transcript(s) attached as `.md` (the attachment header records
   the real source, "YouTube captions" or "xAI Grok STT"). A note asked alongside the link
@@ -388,16 +396,23 @@ machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, 
 - **Safety:** Sara's own outbound is skipped (loop guard); external senders are ignored (and
   marked processed so they are not reconsidered); per-email link cap `XTE_MAX_LINKS` (default
   5). Replies go out via Graph `createReply` (never `sendMail`) so the reply inherits
-  `conversationId` -- the match the follow-up path depends on. Two loop breakers guard that
-  path: `is_auto_reply` skips a message carrying an autoresponder header (`Auto-Submitted`,
-  `X-Autoreply`/`X-Autorespond`/`X-Autoresponder`, or `Precedence: bulk/auto_reply/junk`), and
+  `conversationId` -- the match the follow-up path depends on. Two loop breakers guard BOTH
+  paths: `is_auto_reply` skips a message carrying an autoresponder header (`Auto-Submitted`,
+  `X-Autoreply`/`X-Autorespond`/`X-Autoresponder`, or
+  `Precedence: bulk/auto_reply/auto-reply/junk`) -- checked on the LINK path too, where such a
+  message is marked processed so it is not re-evaluated every scan, since an autoresponder
+  whose template carries a media link would otherwise bypass both breakers -- and
   `XTE_THREAD_MAX_QUESTIONS` (default 20) caps follow-ups per conversation -- at the cap Sara
   goes silent on purpose, since a "limit reached" reply would itself feed the loop. A follow-up
   the model judges is not actually a question (returns the `NO_QUESTION` marker -- a thank-you,
   acknowledgement, or forwarded boilerplate) gets no reply either, but the conversation's
   `questions` counter still increments, so the same cap bounds Claude spend as well as replies.
   Idempotent via processed message-ids at `/data/x_transcribe_email.json`; a reply-send failure
-  is NOT marked processed so it retries. Status at `/data/x_transcribe_email_status.json`.
+  is NOT marked processed so it retries. That retry rule cuts both ways, so NOTHING after the
+  send may raise: the `remember_thread` cache write is wrapped, persisted counters are read
+  through `_as_int`, and ids are persisted after EACH reply (`_persist_processed`), not only at
+  the end of the scan -- otherwise one post-send exception, or a restart mid-scan, re-sends a
+  delivered reply every 15 minutes. Status at `/data/x_transcribe_email_status.json`.
 - **State:** per-conversation transcript cache at `/data/x_transcribe_threads.json`, keyed on
   `conversationId`, written by `remember_thread` only when at least one link in the message
   transcribed successfully (nothing cached means nothing to answer a follow-up from). Evicted
@@ -429,7 +444,9 @@ machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, 
 | Email-to-transcript never replies | Sender not on an internal domain, or no x.com/YouTube link in the new (unquoted) body | Send from an `INTERNAL_DOMAINS` address with an x.com or youtube.com/youtu.be link in the body (not just quoted); a link with no video still gets a "no video found" reply. Check `/transcribe-email/status` |
 | Follow-up question gets no reply | The reply landed in a different Exchange conversation, or the first run's transcripts were never cached (every link failed) | Replies must be sent via `createReply` so `conversationId` is inherited; check `/data/x_transcribe_threads.json` for the conversation |
 | Spotify link replies "not supported yet" | By design -- podcast audio is DRM'd, yt-dlp cannot fetch it and `_fetch_spoken` has no key and an unvalidated request shape | Expected. Deferred work, not a bug |
-| Sara keeps replying to an autoresponder | Autoresponder sends no `Auto-Submitted`/`Precedence` header | The per-conversation cap `XTE_THREAD_MAX_QUESTIONS` stops it after 20 and goes silent; lower it if needed |
+| Sara keeps replying to an autoresponder | Autoresponder sends no `Auto-Submitted`/`Precedence` header | `is_auto_reply` guards BOTH paths (a media link in the autoresponder's template no longer bypasses it), and the per-conversation cap `XTE_THREAD_MAX_QUESTIONS` stops a header-less one after 20 and goes silent; lower it if needed |
+| Follow-up question gets a transcription reply instead of an answer | A link in the sender's signature made the message look like a new request -- `uniqueBody` strips quoted history but KEEPS signatures | A message is a follow-up unless `_has_new_link` finds a link that conversation has not already transcribed. A signature link Sara has NEVER transcribed still reads as new -- transcribe it once, or drop it from the signature |
+| YouTube link replies "not a single video" | The URL is a channel / playlist / `@handle`, which has no video id | By design -- yt-dlp would walk the whole listing with no duration for the cap to bound. Send the link to one video |
 
 ## Environment Variables (Railway)
 
