@@ -423,25 +423,27 @@ def _process_message(m: dict) -> dict:
     pairs = pairs[:XTE_MAX_LINKS]
 
     results = []
-    for url, _kind in pairs:
-        r = transcribe_link(url)
+    for url, kind in pairs:
+        r = transcribe_link(url, kind)
         if r["ok"]:
             r["summary"] = summarize_transcript(url, r["transcript"])
             r["title"] = _parse_title(r["summary"], url)
         else:
             r["title"] = url
+        r["kind"] = kind
         results.append(r)
 
     attachments = [
         _attachment(f"transcript_{_status_id(r['url'])}.md",
-                    _transcript_md(r["title"], r["url"], r["transcript"]))
+                    _transcript_md(r["title"], r["url"], r["transcript"],
+                                   source=r.get("source") or "xAI Grok STT"))
         for r in results if r["ok"]
     ]
     send_threaded_reply(m.get("id"), render_reply(results, truncated), attachments)
 
     return {"from": sender, "subject": subject, "replied": True,
-            "links": [{"url": r["url"], "ok": r["ok"], "chars": r.get("chars", 0),
-                       "error": r.get("error", "")} for r in results]}
+            "links": [{"url": r["url"], "kind": r.get("kind", ""), "ok": r["ok"],
+                       "chars": r.get("chars", 0), "error": r.get("error", "")} for r in results]}
 
 
 def run(dry_run: bool = False, limit: int = None) -> dict:

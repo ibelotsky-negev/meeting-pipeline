@@ -376,7 +376,7 @@ class TestThreadedReply:
 class TestRun:
     def _patch_ok(self, monkeypatch):
         monkeypatch.setattr(xte, "transcribe_link",
-                            lambda u: {"url": u, "ok": True, "transcript": "T" * 50, "chars": 50, "error": ""})
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "T" * 50, "chars": 50, "error": ""})
         monkeypatch.setattr(xte, "summarize_transcript",
                             lambda u, t: "TITLE: Vid\nTL;DR: ok\nKEY POINTS:\n- p1")
 
@@ -466,3 +466,47 @@ class TestRun:
         seq = [(c["method"], c["url"].rsplit("/", 1)[-1]) for c in calls]
         assert seq == [("POST", "createReply"), ("PATCH", "draft-1"),
                        ("POST", "attachments"), ("POST", "send"), ("DELETE", "draft-1")]
+
+
+# ----------------------------------------------------------------------
+#  Task 4 -- kind dispatch wired into the scan, real source in attachments
+# ----------------------------------------------------------------------
+
+class TestSourceWiring:
+    def test_youtube_link_transcribes_and_attaches(self, xte_files, monkeypatch):
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "YT WORDS",
+                                              "chars": 8, "error": "", "source": "YouTube captions"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: Clip\nTL;DR: ok\nKEY POINTS:\n- p1")
+        _mock_inbox(monkeypatch, [_msg("y1", "bk@negevlabs.com", "watch",
+                                       "https://www.youtube.com/watch?v=abc123")])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 1
+        atts = _sent_attachments(calls)
+        assert atts[0]["name"] == "transcript_abc123.md"
+        md = base64.b64decode(atts[0]["contentBytes"]).decode("utf-8")
+        assert "YT WORDS" in md and "YouTube captions" in md
+
+    def test_kind_is_passed_to_transcribe_link(self, xte_files, monkeypatch):
+        seen = []
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": seen.append(k) or {"url": u, "ok": False,
+                                                                "error": "nope", "transcript": "",
+                                                                "chars": 0, "source": ""})
+        _mock_inbox(monkeypatch, [_msg("k1", "bk@negevlabs.com", "mixed",
+                                       "https://x.com/i/status/111 https://youtu.be/abc")])
+        _capture_graph(monkeypatch)
+        xte.run()
+        assert seen == ["x", "youtube"]
+
+    def test_podcast_only_message_still_gets_a_reply(self, xte_files, monkeypatch):
+        _mock_inbox(monkeypatch, [_msg("p1", "bk@negevlabs.com", "listen",
+                                       "https://open.spotify.com/episode/xyz")])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 1          # silence would read as a broken service
+        body = _sent_bodies(calls)[0]
+        assert "not supported yet" in body
+        assert not _sent_attachments(calls)  # nothing transcribed, nothing to attach
