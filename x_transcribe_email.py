@@ -116,23 +116,35 @@ def read_status() -> dict:
 # ======================================================================
 
 
-def find_x_links(body_html: str) -> list:
-    """Return de-duped x.com / twitter.com content links found in the HTML.
-    Reuses learn_digest.extract_urls (handles both hrefs and plain text). ANY X
-    link the sender includes is returned (not just /status/), so a link with no
-    video still earns an honest "no video found" reply; only the bare domain and
-    navigation pages (home/search/settings/...) are ignored."""
+# Kinds this module acts on. An article link is not a transcription request and
+# is omitted entirely, so a message carrying only articles falls through to the
+# existing skip and is left for other handlers.
+_SUPPORTED_KINDS = ("x", "youtube", "podcast")
+
+
+def find_media_links(body_html: str) -> list:
+    """Return de-duped (url, kind) pairs for x / youtube / podcast links found
+    in the HTML, in first-seen order. Reuses learn_digest.extract_urls (handles
+    both hrefs and plain text) and classify_url.
+
+    ANY X link is returned (not just /status/), so a link with no video still
+    earns an honest "no video found" reply; only the bare domain and navigation
+    pages (home/search/settings/...) are ignored."""
     out, seen = [], set()
     for u in ld.extract_urls(body_html or ""):
-        if ld.classify_url(u) != "x":
+        kind = ld.classify_url(u)
+        if kind not in _SUPPORTED_KINDS:
             continue
-        if _X_NONPOST.match(u):
-            continue
-        norm = ld._normalize_x_url(u)
+        if kind == "x":
+            if _X_NONPOST.match(u):
+                continue
+            norm = ld._normalize_x_url(u)
+        else:
+            norm = (u or "").strip().rstrip("/").lower()
         if norm in seen:
             continue
         seen.add(norm)
-        out.append(u)
+        out.append((u, kind))
     return out
 
 
@@ -344,12 +356,12 @@ def _process_message(m: dict) -> dict:
     sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "")
     subject = m.get("subject") or ""
     body_html = (m.get("uniqueBody") or {}).get("content", "")
-    links = find_x_links(body_html)
-    truncated = max(0, len(links) - XTE_MAX_LINKS)
-    links = links[:XTE_MAX_LINKS]
+    pairs = find_media_links(body_html)
+    truncated = max(0, len(pairs) - XTE_MAX_LINKS)
+    pairs = pairs[:XTE_MAX_LINKS]
 
     results = []
-    for url in links:
+    for url, _kind in pairs:
         r = transcribe_link(url)
         if r["ok"]:
             r["summary"] = summarize_transcript(url, r["transcript"])
@@ -398,7 +410,7 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
         if sender.strip().lower() == SARA_MAILBOX.strip().lower():
             continue
         # Links are read from uniqueBody so a quoted link in a reply never re-fires.
-        links = find_x_links((m.get("uniqueBody") or {}).get("content", ""))
+        links = find_media_links((m.get("uniqueBody") or {}).get("content", ""))
         if not links:
             continue  # not a transcription request -- leave for other handlers
         if not config.is_internal_email(sender):
@@ -408,7 +420,7 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
 
         if dry_run:
             outcomes.append({"from": sender, "subject": m.get("subject") or "",
-                             "would_transcribe": links[:XTE_MAX_LINKS], "dry_run": True})
+                             "would_transcribe": [u for u, _ in links[:XTE_MAX_LINKS]], "dry_run": True})
             continue
 
         try:

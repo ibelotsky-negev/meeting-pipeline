@@ -79,25 +79,40 @@ def _sent_attachments(calls):
 # ----------------------------------------------------------------------
 
 class TestLinkDetection:
-    def test_finds_x_links_includes_profile_excludes_youtube_and_nav(self):
-        html = ('see https://x.com/i/status/111 and '
-                '<a href="https://twitter.com/a/status/222">x</a> '
-                'profile https://x.com/someone yt https://youtube.com/watch?v=z '
-                'nav https://x.com/home')
-        links = xte.find_x_links(html)
-        assert any("111" in u for u in links)
-        assert any("222" in u for u in links)
-        assert any(u.rstrip("/").endswith("someone") for u in links)   # profile now included -> no-video reply
-        assert not any("youtube" in u for u in links)
-        assert not any(u.rstrip("/").endswith("x.com/home") for u in links)  # nav page ignored
+    def test_returns_x_youtube_and_podcast_with_kinds(self):
+        html = ('x https://x.com/i/status/111 '
+                'yt https://www.youtube.com/watch?v=abc123 '
+                'pod https://open.spotify.com/episode/xyz '
+                'article https://example.com/post')
+        pairs = xte.find_media_links(html)
+        kinds = dict((u, k) for u, k in pairs)
+        assert kinds.get("https://x.com/i/status/111") == "x"
+        assert kinds.get("https://www.youtube.com/watch?v=abc123") == "youtube"
+        assert kinds.get("https://open.spotify.com/episode/xyz") == "podcast"
+        assert not any("example.com" in u for u, _ in pairs)   # articles are not requests
 
-    def test_dedups_same_link_case_and_slash(self):
+    def test_keeps_x_profile_but_drops_nav_pages(self):
+        html = 'profile https://x.com/someone nav https://x.com/home'
+        pairs = xte.find_media_links(html)
+        assert any(u.rstrip("/").endswith("someone") for u, _ in pairs)  # -> honest no-video reply
+        assert not any(u.rstrip("/").endswith("x.com/home") for u, _ in pairs)
+
+    def test_dedups_x_by_normalized_url(self):
         html = "a https://x.com/i/status/111 b https://X.com/i/status/111/ c"
-        assert len(xte.find_x_links(html)) == 1
+        assert len(xte.find_media_links(html)) == 1
+
+    def test_dedups_youtube_by_case_and_trailing_slash(self):
+        html = "a https://youtu.be/AbC/ b https://youtu.be/AbC c"
+        assert len(xte.find_media_links(html)) == 1
+
+    def test_preserves_first_seen_order(self):
+        html = "yt https://www.youtube.com/watch?v=one then x https://x.com/i/status/222"
+        pairs = xte.find_media_links(html)
+        assert [k for _, k in pairs] == ["youtube", "x"]
 
     def test_empty_body_no_links(self):
-        assert xte.find_x_links("") == []
-        assert xte.find_x_links("just text, no links") == []
+        assert xte.find_media_links("") == []
+        assert xte.find_media_links("just text, no links") == []
 
 
 class TestSummaryRendering:
