@@ -102,7 +102,7 @@ class TestLinkDetection:
         assert len(xte.find_media_links(html)) == 1
 
     def test_dedups_youtube_by_case_and_trailing_slash(self):
-        html = "a https://youtu.be/AbC/ b https://youtu.be/AbC c"
+        html = "a https://youtu.be/AbCdefg/ b https://youtu.be/AbCdefg c"
         assert len(xte.find_media_links(html)) == 1
 
     def test_preserves_first_seen_order(self):
@@ -113,6 +113,34 @@ class TestLinkDetection:
     def test_empty_body_no_links(self):
         assert xte.find_media_links("") == []
         assert xte.find_media_links("just text, no links") == []
+
+    def test_youtube_same_video_different_forms_dedups(self):
+        # youtu.be/AbCdefg and youtube.com/watch?v=AbCdefg are the same video
+        html = 'a https://youtu.be/AbCdefg b https://www.youtube.com/watch?v=AbCdefg c'
+        pairs = xte.find_media_links(html)
+        assert len(pairs) == 1
+        assert pairs[0][1] == "youtube"
+
+    def test_youtube_ids_differing_only_by_case_are_separate(self):
+        # Video IDs are case-sensitive, so these are two different videos
+        html = 'a https://www.youtube.com/watch?v=dQw4w9WgXcQ b https://www.youtube.com/watch?v=dqw4w9wgxcq'
+        pairs = xte.find_media_links(html)
+        assert len(pairs) == 2
+        assert all(k == "youtube" for _, k in pairs)
+
+    def test_youtube_unparseable_id_still_processed(self):
+        # If video ID extraction fails, fall back to lexical form so no crash
+        html = 'invalid https://youtube.com/foo/bar/baz'
+        pairs = xte.find_media_links(html)
+        assert len(pairs) == 1
+        assert pairs[0][1] == "youtube"
+
+    def test_podcast_ids_differing_only_by_case_are_separate(self):
+        # Podcast IDs are case-sensitive in the path
+        html = 'a https://open.spotify.com/episode/ABC b https://open.spotify.com/episode/abc'
+        pairs = xte.find_media_links(html)
+        assert len(pairs) == 2
+        assert all(k == "podcast" for _, k in pairs)
 
 
 class TestSummaryRendering:

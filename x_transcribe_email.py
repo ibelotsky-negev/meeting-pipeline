@@ -124,14 +124,37 @@ _SUPPORTED_KINDS = ("x", "youtube", "podcast")
 
 def find_media_links(body_html: str) -> list:
     """Return de-duped (url, kind) pairs for x / youtube / podcast links found
-    in the HTML, in first-seen order. Reuses learn_digest.extract_urls (handles
-    both hrefs and plain text) and classify_url.
+    in the HTML, in first-seen order. Extracts URLs locally (extract_urls dedupes
+    by lowercasing, which loses case-sensitive URL info). Reuses classify_url,
+    _youtube_video_id, and _normalize_x_url for media type logic.
 
     ANY X link is returned (not just /status/), so a link with no video still
     earns an honest "no video found" reply; only the bare domain and navigation
-    pages (home/search/settings/...) are ignored."""
+    pages (home/search/settings/...) are ignored.
+
+    YouTube: deduplicate by video ID (case-sensitive), so youtu.be/AbC and
+    youtube.com/watch?v=AbC are the same video. If video ID extraction fails,
+    fall back to lexical form. Podcast: deduplicate by normalized URL (scheme
+    and host only, case-sensitive path/query) so IDs differing only by case
+    are kept as distinct entries."""
+    # Extract URLs locally to preserve case (extract_urls dedupes by lowercasing)
+    import re
+    import html as html_module
+    _URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+", re.I)
+    _HREF_RE = re.compile(r'href\s*=\s*["\']([^"\']+)["\']', re.I)
+
+    cleaned = body_html or ""
+    found = []
+    for href in _HREF_RE.findall(cleaned):
+        found.append(href)
+    for bare in _URL_RE.findall(cleaned):
+        found.append(bare)
+
     out, seen = [], set()
-    for u in ld.extract_urls(body_html or ""):
+    for u_raw in found:
+        u = html_module.unescape(u_raw).strip()
+        if not u or len(u) < 8:
+            continue
         kind = ld.classify_url(u)
         if kind not in _SUPPORTED_KINDS:
             continue
@@ -139,8 +162,27 @@ def find_media_links(body_html: str) -> list:
             if _X_NONPOST.match(u):
                 continue
             norm = ld._normalize_x_url(u)
-        else:
-            norm = (u or "").strip().rstrip("/").lower()
+        elif kind == "youtube":
+            try:
+                vid = ld._youtube_video_id(u)
+                if vid:
+                    norm = f"youtube:{vid}"
+                else:
+                    norm = (u or "").rstrip("/").lower()
+            except Exception:
+                norm = (u or "").rstrip("/").lower()
+        else:  # podcast
+            # Only lowercase scheme and host, preserve case in path/query
+            stripped = u.rstrip("/")
+            parsed = stripped.split("://", 1)
+            if len(parsed) == 2:
+                scheme, rest = parsed
+                host_path = rest.split("/", 1)
+                host = host_path[0].lower()
+                path = "/" + host_path[1] if len(host_path) > 1 else ""
+                norm = f"{scheme.lower()}://{host}{path}"
+            else:
+                norm = stripped.lower()
         if norm in seen:
             continue
         seen.add(norm)
