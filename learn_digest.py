@@ -647,7 +647,17 @@ def _youtube_video_id(url: str):
 
 
 def _fetch_youtube_transcript(url: str):
-    """Primary YouTube resolver: youtube-transcript-api. Lazy import."""
+    """Primary YouTube resolver: youtube-transcript-api. Lazy import.
+
+    Handles BOTH library generations, because the API changed incompatibly at
+    1.0 and the pin was raised 0.6.2 -> 1.2.4:
+    - 1.x: instance method, YouTubeTranscriptApi().fetch(vid), yielding snippet
+      OBJECTS with a .text attribute.
+    - 0.6.x: static YouTubeTranscriptApi.get_transcript(vid), yielding DICTS.
+    0.6.2 broke against YouTube's current response format -- it returned an empty
+    body and raised "no element found: line 1, column 0" for every video -- so 1.x
+    is what actually works. The legacy branch is kept only so a stale local install
+    degrades to the yt-dlp fallback instead of failing in a confusing way."""
     vid = _youtube_video_id(url)
     if not vid:
         return None
@@ -657,8 +667,18 @@ def _fetch_youtube_transcript(url: str):
         logger.info("[learn] youtube-transcript-api not available; will fall back")
         return None
     try:
-        chunks = YouTubeTranscriptApi.get_transcript(vid)
-        text = " ".join(c.get("text", "") for c in (chunks or []))
+        if hasattr(YouTubeTranscriptApi, "fetch"):
+            chunks = YouTubeTranscriptApi().fetch(vid)
+        else:
+            chunks = YouTubeTranscriptApi.get_transcript(vid)
+        parts = []
+        for c in (chunks or []):
+            piece = getattr(c, "text", None)
+            if piece is None and isinstance(c, dict):
+                piece = c.get("text", "")
+            if piece:
+                parts.append(piece)
+        text = " ".join(parts)
         return text or None
     except Exception as e:
         logger.warning(f"[learn] youtube transcript failed {vid}: {e}")

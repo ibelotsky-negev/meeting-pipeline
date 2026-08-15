@@ -1310,3 +1310,110 @@ class TestVideoWatchTasks:
              "topic": "Negev Labs biotech", "url": "https://e/1", "why": "w", "summary": "s"})
         add = [c for c in calls if "/addTask" in c[1]][0]
         assert f"/sections/{ld.VIDEO_TO_WATCH_SECTION_GID}/" not in add[1]
+
+
+# ----------------------------------------------------------------------
+#  YouTube caption resolver -- both library generations
+#
+#  The API changed incompatibly at youtube-transcript-api 1.0 (static
+#  get_transcript -> instance fetch, dict chunks -> snippet objects), and the
+#  old 0.6.2 pin broke against YouTube's current response format, returning
+#  "no element found: line 1, column 0" for every video. These pin the shim
+#  that spans both -- nothing covered it before, because every other test in
+#  the repo mocks _fetch_youtube_transcript itself rather than its internals.
+# ----------------------------------------------------------------------
+
+class _Snippet:
+    """Stand-in for a 1.x FetchedTranscriptSnippet (carries .text)."""
+
+    def __init__(self, text):
+        self.text = text
+
+
+def _install_fake_yta(monkeypatch, api_cls):
+    """Inject a fake youtube_transcript_api so the lazy import inside the
+    resolver picks it up. Offline: the real library is never imported."""
+    import sys
+    import types
+    mod = types.ModuleType("youtube_transcript_api")
+    mod.YouTubeTranscriptApi = api_cls
+    monkeypatch.setitem(sys.modules, "youtube_transcript_api", mod)
+
+
+class TestFetchYoutubeTranscript:
+    _URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def test_modern_1x_instance_api_with_snippet_objects(self, monkeypatch):
+        seen = []
+
+        class Api1x:
+            def fetch(self, vid):
+                seen.append(vid)
+                return [_Snippet("hello"), _Snippet("world")]
+
+        _install_fake_yta(monkeypatch, Api1x)
+        assert ld._fetch_youtube_transcript(self._URL) == "hello world"
+        assert seen == ["dQw4w9WgXcQ"]
+
+    def test_legacy_06x_static_api_with_dict_chunks(self, monkeypatch):
+        seen = []
+
+        class Api06:
+            @staticmethod
+            def get_transcript(vid):
+                seen.append(vid)
+                return [{"text": "hello"}, {"text": "world"}]
+
+        _install_fake_yta(monkeypatch, Api06)
+        assert ld._fetch_youtube_transcript(self._URL) == "hello world"
+        assert seen == ["dQw4w9WgXcQ"]
+
+    def test_fetch_is_preferred_when_both_exist(self, monkeypatch):
+        """1.x is the generation that actually works -- never fall back to the
+        legacy call while fetch is present."""
+
+        class ApiBoth:
+            def fetch(self, vid):
+                return [_Snippet("modern")]
+
+            @staticmethod
+            def get_transcript(vid):
+                raise AssertionError("legacy path must not run when fetch exists")
+
+        _install_fake_yta(monkeypatch, ApiBoth)
+        assert ld._fetch_youtube_transcript(self._URL) == "modern"
+
+    def test_resolver_error_degrades_to_none(self, monkeypatch):
+        """The exact 0.6.2 breakage shape -- must degrade so the caller can
+        still try yt-dlp rather than raising out."""
+
+        class ApiBroken:
+            def fetch(self, vid):
+                raise Exception("no element found: line 1, column 0")
+
+        _install_fake_yta(monkeypatch, ApiBroken)
+        assert ld._fetch_youtube_transcript(self._URL) is None
+
+    def test_empty_transcript_is_none_not_empty_string(self, monkeypatch):
+        class ApiEmpty:
+            def fetch(self, vid):
+                return []
+
+        _install_fake_yta(monkeypatch, ApiEmpty)
+        assert ld._fetch_youtube_transcript(self._URL) is None
+
+    def test_blank_snippets_are_skipped(self, monkeypatch):
+        class ApiBlanks:
+            def fetch(self, vid):
+                return [_Snippet(""), _Snippet("kept"), _Snippet(None)]
+
+        _install_fake_yta(monkeypatch, ApiBlanks)
+        assert ld._fetch_youtube_transcript(self._URL) == "kept"
+
+    def test_no_video_id_never_reaches_the_library(self, monkeypatch):
+        class ApiNever:
+            def fetch(self, vid):
+                raise AssertionError("must not be reached without a video id")
+
+        _install_fake_yta(monkeypatch, ApiNever)
+        assert ld._fetch_youtube_transcript("https://www.youtube.com/@somechannel") is None
