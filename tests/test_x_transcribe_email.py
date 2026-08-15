@@ -1434,6 +1434,13 @@ class TestXSpacesAndBroadcastsAreItems:
         """REGRESSION GUARD -- narrowing the rule must not reopen it."""
         assert xte.find_media_links(f"see {url} thanks") == []
 
+    def test_spaces_start_nav_page_is_not_detected_but_a_real_id_still_is(self):
+        """ITEM 3 regression guard: /i/spaces/start is X's own start-a-Space
+        nav page, not a Space id -- narrowing _X_LIVE_ITEM_RE to exclude it
+        must not reopen detection for a genuine Space id."""
+        assert xte.find_media_links("see https://x.com/i/spaces/start thanks") == []
+        assert xte.find_media_links(f"see {self.SPACE} thanks") == [(self.SPACE, "x")]
+
 
 class TestYouTubeClipIsAnItem:
     """RESIDUAL A. A /clip/<id> URL names ONE item -- a user-trimmed excerpt of

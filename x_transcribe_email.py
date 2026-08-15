@@ -112,7 +112,12 @@ XTE_TEAM_EXTRA = [a.strip().lower() for a in os.environ.get("XTE_TEAM_EXTRA", ""
 # path is a profile or a navigation page: a CONTAINER, not an item (see
 # _is_container_url). Subsumes the old _X_NONPOST bare-domain/nav list.
 _STATUS_LINK_RE = re.compile(r"/status/(\d+)")
-_X_LIVE_ITEM_RE = re.compile(r"/i/(?:spaces|broadcasts)/([A-Za-z0-9_-]+)", re.I)
+# The negative lookahead excludes ONLY the exact literal "start" -- X's own
+# "start a Space" nav page (x.com/i/spaces/start), not a real id -- so it must
+# be followed by a non-id character or end of string; "start123abc" still
+# matches as an id, since a genuine Space/broadcast id is any alphanumeric
+# token and could in principle begin with those letters.
+_X_LIVE_ITEM_RE = re.compile(r"/i/(?:spaces|broadcasts)/(?!start(?:[^A-Za-z0-9_-]|$))([A-Za-z0-9_-]+)", re.I)
 # Podcast container shapes. An /episode/ URL is an ITEM and stays detected --
 # it still earns the honest "podcasts not supported yet" reply.
 _PODCAST_CONTAINER_RE = re.compile(r"/(?:show|playlist)/", re.I)
@@ -433,8 +438,15 @@ def _has_new_link(links: list, entry: dict) -> bool:
       podcast link in a conversation with nothing cached still reads as a
       request and still earns its honest unsupported reply.
 
-    An entry we cannot read is treated as "new" so a real request is never
-    swallowed."""
+    Not every unreadable entry hits the `except` below and reads as "new" --
+    that only fires when reading the entry itself raises (e.g. `entry` is not
+    a dict, or its `links` value is not iterable at all). A `links` value
+    that is merely the WRONG type but still iterable -- a string, say --
+    raises nothing: each character it yields fails the `isinstance(l, dict)`
+    filter, so `cached` quietly comes back empty instead, and control falls
+    through to the ordinary candidate check below, which then depends on
+    THIS message's own links -- a link-less follow-up against such an entry
+    returns False (NOT new), not True."""
     if not entry:
         return True
     try:
