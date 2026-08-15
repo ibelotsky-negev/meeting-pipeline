@@ -27,19 +27,30 @@ Safety / robustness:
   skipped (loop guard).
 - Links are read from uniqueBody ONLY -- a link quoted in a reply's thread history
   does NOT re-trigger; only links the sender typed in THIS message count.
-- Only single ITEMS count as a request. A CONTAINER url -- channel, profile,
-  playlist or show -- yields no entry at all (_is_container_url), so ordinary
-  mail carrying one in a signature earns no reply and a follow-up question is
-  still answered as one. Sara's inbox is SHARED (sara_corrections.py scans the
-  same folder), so ordinary team mail is routine traffic here.
-- uniqueBody still keeps the sender's SIGNATURE, so a message whose every link is
-  one this conversation already transcribed counts as a follow-up question, not a
-  new request (_has_new_link) -- otherwise a signature link would hijack the
-  follow-up path and earn an unsolicited reply.
+- Only single ITEMS count as a request. A CONTAINER url yields no entry at all
+  (_is_container_url), so mail carrying one in a signature earns no reply:
+  an X path naming no item (profile, bare domain, nav page -- items are
+  /status/<id>, /i/spaces/<id>, /i/broadcasts/<id>), a YouTube URL with neither
+  a video id nor a /clip/<id> (@handle, /c/, /user/, /channel/, /playlist?list=),
+  and a podcast /show/ or /playlist/ page. That last rule is Spotify
+  path-shaped, so a SHOW page on another host (Apple, anchor.fm, pod.link,
+  overcast, castbox, podbean) is still detected as an item and answered with the
+  honest "not supported yet" reply -- deliberate, and harmless now that a
+  podcast link can no longer block a follow-up (see below).
+- uniqueBody still keeps the sender's SIGNATURE, so a message counts as a
+  follow-up question rather than a new request (_has_new_link) when every
+  TRANSCRIBABLE link in it is one this conversation already transcribed --
+  otherwise a signature link would hijack the follow-up path and earn an
+  unsolicited reply. Podcast links never count at all there: one can never be
+  transcribed, so it can never be cached, and letting it count would drop every
+  follow-up question in that conversation forever.
+- Sara's inbox is SHARED (sara_corrections.py scans the same folder), so
+  ordinary team mail is routine traffic here.
 - Two loop breakers on BOTH paths: is_auto_reply skips autoresponder headers, and
   XTE_THREAD_MAX_QUESTIONS caps follow-ups per conversation.
-- A non-video YouTube URL (channel / playlist / handle) never reaches yt-dlp --
-  it has no duration for the cap to bound (see transcribe_link).
+- A YouTube URL naming no single video (channel / playlist / handle) never
+  reaches yt-dlp -- it has no duration for the cap to bound (see
+  transcribe_link). A /clip/<id> does name one and goes down the audio path.
 - Idempotent via processed message-ids at /data/x_transcribe_email.json, persisted
   after EACH reply so an abort mid-scan cannot re-send a delivered one.
 - Per-email link cap (cost guard); the 60-min duration + size caps live inside
@@ -95,10 +106,13 @@ XTE_SUMMARY_MODEL = os.environ.get("XTE_SUMMARY_MODEL", ld.SUMMARY_MODEL)
 # vu@negevcap.com.
 XTE_TEAM_EXTRA = [a.strip().lower() for a in os.environ.get("XTE_TEAM_EXTRA", "").split(",") if a.strip()]
 
-# The one X-post marker: a shareable post always carries /status/<id>. Any
-# other path is a profile or a navigation page -- a CONTAINER, not an item
-# (see _is_container_url). Subsumes the old _X_NONPOST bare-domain/nav list.
+# The X ITEM markers. A shareable post always carries /status/<id> (numeric),
+# and a Space or a live broadcast carries /i/spaces/<id> or /i/broadcasts/<id>
+# (alphanumeric) -- all three name ONE item that can carry audio. Any other
+# path is a profile or a navigation page: a CONTAINER, not an item (see
+# _is_container_url). Subsumes the old _X_NONPOST bare-domain/nav list.
 _STATUS_LINK_RE = re.compile(r"/status/(\d+)")
+_X_LIVE_ITEM_RE = re.compile(r"/i/(?:spaces|broadcasts)/([A-Za-z0-9_-]+)", re.I)
 # Podcast container shapes. An /episode/ URL is an ITEM and stays detected --
 # it still earns the honest "podcasts not supported yet" reply.
 _PODCAST_CONTAINER_RE = re.compile(r"/(?:show|playlist)/", re.I)
@@ -106,6 +120,9 @@ _PODCAST_CONTAINER_RE = re.compile(r"/(?:show|playlist)/", re.I)
 # /live/<id> (the address-bar form for livestreams and premieres) and the
 # legacy /v/<id>. See _youtube_id.
 _YT_EXTRA_ID_RE = re.compile(r"youtube\.com/(?:live|v)/([A-Za-z0-9_-]{6,})", re.I)
+# A /clip/<id> URL names one item too, but its id is a CLIP id, not a watch id
+# (the underlying video id is not in the URL at all). See _youtube_clip_id.
+_YT_CLIP_RE = re.compile(r"youtube\.com/clip/([A-Za-z0-9_-]+)", re.I)
 
 
 # ======================================================================
@@ -249,7 +266,45 @@ def remember_thread(conversation_id: str, results: list):
 # Kinds this module acts on. An article link is not a transcription request and
 # is omitted entirely, so a message carrying only articles falls through to the
 # existing skip and is left for other handlers.
-_SUPPORTED_KINDS = ("x", "youtube", "podcast")
+#
+# TRANSCRIBABLE is the subset that can actually produce a transcript. podcast is
+# DETECTED (so a podcast-only email earns its honest "not supported yet" reply
+# rather than silence) but can never yield one, so it never counts as a new
+# transcription request when choosing the follow-up branch -- see _has_new_link.
+_TRANSCRIBABLE_KINDS = ("x", "youtube")
+_SUPPORTED_KINDS = _TRANSCRIBABLE_KINDS + ("podcast",)
+
+
+def _x_item_id(url: str):
+    """The id of a single X ITEM: a post's /status/<id>, or a Space's or live
+    broadcast's /i/spaces|broadcasts/<id>. None for a profile or a navigation
+    page. The module's ONE notion of "this X url names one item", used by the
+    container check and by _status_id's attachment name so both agree.
+
+    Spaces and broadcasts are items, not containers: they carry audio and may
+    genuinely transcribe. Sweeping them into the no-/status/ container rule
+    produced TOTAL SILENCE for a sender who asked about one -- worse than the
+    honest capped/failed reply they used to get. Never raises."""
+    u = str(url or "")
+    m = _STATUS_LINK_RE.search(u)
+    if m:
+        return m.group(1)
+    m = _X_LIVE_ITEM_RE.search(u)
+    return m.group(1) if m else None
+
+
+def _youtube_clip_id(url: str):
+    """The id of a YouTube /clip/<id> -- a user-trimmed excerpt of one video,
+    a single ITEM. Kept SEPARATE from _youtube_id (and namespaced everywhere it
+    is used as an identity) because a clip URL does not carry the underlying
+    watch id at all: _youtube_id can never resolve one, and a clip id must
+    never be mistaken for, or collide with, a watch id of the same characters.
+
+    yt-dlp can fetch a clip, so a clip reaches the audio path instead of the
+    "channel or playlist" refusal; captions cannot be looked up (they are keyed
+    by watch id), so that lookup simply returns None first. Never raises."""
+    m = _YT_CLIP_RE.search(str(url or ""))
+    return m.group(1) if m else None
 
 
 def _youtube_id(url: str):
@@ -285,6 +340,13 @@ def _is_container_url(url: str, kind: str) -> bool:
     single item. find_media_links drops these entirely, exactly like an article
     URL -- they are not transcription requests.
 
+    "Single item" is deliberately WIDER than "a post or a watch id": an X Space
+    and a live broadcast are items, and so is a YouTube /clip/<id>. All three
+    can carry audio and may genuinely transcribe, so sweeping them in here
+    produced total silence for the sender -- worse than the honest capped or
+    failed reply they used to get, and against this module's rule that a link
+    it cannot handle is reported, never ignored.
+
     This REVERSES the original decision that ANY X link is returned "so a link
     with no video still earns an honest no-video reply". That was safe while the
     only way to reach Sara was to deliberately email her a link. Ordinary mail
@@ -300,9 +362,11 @@ def _is_container_url(url: str, kind: str) -> bool:
     u = url or ""
     try:
         if kind == "x":
-            return not _STATUS_LINK_RE.search(u)   # a post always carries /status/<id>
+            return not _x_item_id(u)               # post, Space or broadcast -> item
         if kind == "youtube":
-            return not _youtube_id(u)              # no video id -> channel / playlist / handle
+            # A watch id (incl. /live/ and /v/), or a /clip/<id> -- whose watch
+            # id is not in the URL, so _youtube_id alone would drop a real item.
+            return not (_youtube_id(u) or _youtube_clip_id(u))
         if kind == "podcast":
             return bool(_PODCAST_CONTAINER_RE.search(u))
     except Exception as e:
@@ -316,9 +380,12 @@ def _link_key(url: str, kind: str = None) -> str:
     message added a NEW link to a conversation. Never raises.
 
     X: via ld._normalize_x_url. YouTube: by video ID, so youtu.be/ID and
-    youtube.com/watch?v=ID are the same video (lexical fallback when no ID can
-    be parsed). Podcast: scheme+host lowercased, path/query/fragment preserved
-    as-is -- rebuilt with urlunsplit so the '?' separator survives (concatenating
+    youtube.com/watch?v=ID are the same video; a /clip/<id> keys on the CLIP id
+    under its own "youtube:clip:" namespace, since a clip URL carries no watch
+    id and its id must never collide with a watch id of the same characters
+    (lexical fallback when neither can be parsed). Podcast: scheme+host
+    lowercased, path/query/fragment preserved as-is -- rebuilt with urlunsplit
+    so the '?' separator survives (concatenating
     path+query collided /episode/xy?zsi=abc with /episode/xyz?si=abc)."""
     from urllib.parse import urlsplit, urlunsplit
 
@@ -329,7 +396,12 @@ def _link_key(url: str, kind: str = None) -> str:
             return ld._normalize_x_url(u)
         if kind == "youtube":
             vid = _youtube_id(u)
-            return f"youtube:{vid}" if vid else u.rstrip("/").lower()
+            if vid:
+                return f"youtube:{vid}"
+            clip = _youtube_clip_id(u)
+            if clip:
+                return f"youtube:clip:{clip}"
+            return u.rstrip("/").lower()
         if kind == "podcast":
             p = urlsplit(u)
             return urlunsplit((p.scheme.lower(), p.netloc.lower(),
@@ -340,17 +412,29 @@ def _link_key(url: str, kind: str = None) -> str:
 
 
 def _has_new_link(links: list, entry: dict) -> bool:
-    """True when the message carries a media link this conversation has NOT
-    already transcribed.
+    """True when the message carries a TRANSCRIBABLE media link this
+    conversation has NOT already transcribed -- i.e. when it is a new
+    transcription request rather than a follow-up question.
 
     Load-bearing: uniqueBody strips quoted history but KEEPS the sender's
     signature, so a signature link makes a follow-up look like a fresh
     transcription request -- dropping the question AND sending an unsolicited
-    failure reply. find_media_links now drops CONTAINER URLs outright (a
+    failure reply. find_media_links drops CONTAINER URLs outright (a
     signature's "our channel" / "follow us on X" / "our show"), so this gate
-    handles the remaining case: a signature link to a real ITEM that this
-    conversation already transcribed. An entry we cannot read is treated as
-    "new" so a real request is never swallowed."""
+    handles the rest:
+    - a signature link to a real ITEM this conversation already transcribed;
+    - ANY podcast link. A podcast can never be transcribed, so its result is
+      never ok and remember_thread can never cache it: letting one count would
+      keep this True forever and drop EVERY follow-up question in the
+      conversation in favour of a repeat "not supported yet" reply. Fixed here,
+      at the gate, and NOT by widening the podcast container regex -- a regex
+      enumerating podcast hosts (Apple, anchor.fm, pod.link, overcast, castbox,
+      podbean, ...) rots with every new host. Detection is untouched, so a
+      podcast link in a conversation with nothing cached still reads as a
+      request and still earns its honest unsupported reply.
+
+    An entry we cannot read is treated as "new" so a real request is never
+    swallowed."""
     if not entry:
         return True
     try:
@@ -358,7 +442,8 @@ def _has_new_link(links: list, entry: dict) -> bool:
                   for l in (entry.get("links") or []) if isinstance(l, dict)}
     except Exception:
         return True
-    return any(_link_key(u, k) not in cached for u, k in (links or []))
+    candidates = [(u, k) for u, k in (links or []) if k in _TRANSCRIBABLE_KINDS]
+    return any(_link_key(u, k) not in cached for u, k in candidates)
 
 
 def find_media_links(body_html: str) -> list:
@@ -373,7 +458,14 @@ def find_media_links(body_html: str) -> list:
     profile, playlist or show -- produces no entry at all, exactly like an
     article URL, so a message carrying only those is not a transcription
     request (see _is_container_url for why that reverses the original
-    "any X link earns an honest no-video reply" decision)."""
+    "any X link earns an honest no-video reply" decision, and for what still
+    counts as an item: posts, Spaces, broadcasts, watch ids, clips, and a
+    podcast episode).
+
+    Detection is NOT where the podcast-vs-follow-up question is settled: a
+    podcast link stays detected here so a podcast-only email still gets its
+    honest unsupported reply, and _has_new_link decides whether it counts as a
+    new request."""
     out, seen = [], set()
     for u in ld.extract_urls(body_html or ""):
         kind = ld.classify_url(u)
@@ -458,15 +550,18 @@ def transcribe_link(url: str, kind: str = "x") -> dict:
         return {"url": url, "ok": False, "error": PODCAST_UNSUPPORTED,
                 "transcript": "", "chars": 0, "source": ""}
     if kind == "youtube":
-        # A channel / playlist / @handle URL classifies as youtube but has no
-        # video id: captions return None immediately and the audio path would
-        # hand yt-dlp a whole listing to walk. The duration cap cannot bound
-        # that (a channel has no duration) and the download runs on a daemon
-        # thread that outlives its join, so it must be refused here. Defense in
-        # depth -- find_media_links already drops these before the scan gets
-        # here, but transcribe_link is called directly too.
-        vid = _youtube_id(url)   # the module's ONE resolver; covers /live/ and /v/
-        if not vid:
+        # A channel / playlist / @handle URL classifies as youtube but names no
+        # single video: captions return None immediately and the audio path
+        # would hand yt-dlp a whole listing to walk. The duration cap cannot
+        # bound that (a channel has no duration) and the download runs on a
+        # daemon thread that outlives its join, so it must be refused here.
+        # Defense in depth -- find_media_links already drops these before the
+        # scan gets here, but transcribe_link is called directly too.
+        #
+        # A /clip/<id> IS one item and must NOT be refused: yt-dlp fetches the
+        # clip, so it falls through to the audio path (its captions lookup is
+        # keyed by watch id, which a clip URL does not carry, and returns None).
+        if not (_youtube_id(url) or _youtube_clip_id(url)):
             return {"url": url, "ok": False,
                     "error": "that YouTube link points to a channel or playlist, "
                              "not a single video",
@@ -625,12 +720,18 @@ def _summary_to_html(summary: str) -> str:
 
 
 def _status_id(url: str) -> str:
-    """Stable short id for the attachment filename: X status id, else YouTube
-    video id, else 'post'."""
-    m = _STATUS_LINK_RE.search(url or "")
-    if m:
-        return m.group(1)
-    return _youtube_id(url) or "post"
+    """Stable short id for the attachment filename: X item id (post status,
+    Space or broadcast), else YouTube watch id, else a clip id under its own
+    "clip_" prefix (so a clip and a watch id of the same characters cannot
+    produce the same filename), else 'post'."""
+    xid = _x_item_id(url)
+    if xid:
+        return xid
+    vid = _youtube_id(url)
+    if vid:
+        return vid
+    clip = _youtube_clip_id(url)
+    return f"clip_{clip}" if clip else "post"
 
 
 def _transcript_md(title: str, url: str, transcript: str, source: str = "xAI Grok STT") -> str:
@@ -853,10 +954,13 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
         entry = threads.get(m.get("conversationId") or "") if m.get("conversationId") else None
         # uniqueBody keeps the sender's SIGNATURE, and a signature link (company
         # channel, X profile, podcast show) is a "supported" link. In a
-        # conversation we already transcribed, only a genuinely NEW link is a new
-        # request -- otherwise this is a follow-up question and must be answered
-        # as one, not transcribed. Compared on the normalized key, so youtu.be/ID
-        # matches a cached youtube.com/watch?v=ID.
+        # conversation we already transcribed, only a genuinely NEW
+        # TRANSCRIBABLE link is a new request -- otherwise this is a follow-up
+        # question and must be answered as one, not transcribed. Compared on the
+        # normalized key, so youtu.be/ID matches a cached youtube.com/watch?v=ID.
+        # A podcast link never counts (it can never be cached, so it would block
+        # every follow-up forever); with no cached conversation the branch below
+        # is not taken at all, so it still earns its honest unsupported reply.
         if links and not _has_new_link(links, entry):
             logger.info(f"[xte] no new link in known conversation {m.get('conversationId')}; "
                         f"treating as a follow-up")

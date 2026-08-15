@@ -370,32 +370,47 @@ machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, 
   x.com/twitter.com or youtube.com/youtu.be link to a single ITEM. A **container** URL --
   one naming a channel, profile, playlist or show rather than one item -- is NOT a request
   and yields no entry at all, exactly like an article URL (`_is_container_url`): an X path
-  with no `/status/<id>` (profiles, the bare domain, nav pages), a YouTube URL with no
-  parseable video id (`@handle`, `/c/`, `/user/`, `/channel/`, `/playlist?list=`), and a
-  podcast `/show/` or `/playlist/` page. That REVERSES the original "any X link earns an
-  honest no-video reply" rule -- ordinary mail and follow-up questions pass through this same
-  gate, Sara's inbox is SHARED with `sara_corrections.py`, and a container URL can never be
-  cached, so a signature link dropped the question and sent an unsolicited reply.
-  A podcast `/episode/` link IS an item: detected and reported unsupported rather than
-  silently ignored. Links are read from `uniqueBody` ONLY, so
+  naming no item (profiles, the bare domain, nav pages), a YouTube URL with neither a
+  parseable video id nor a `/clip/<id>` (`@handle`, `/c/`, `/user/`, `/channel/`,
+  `/playlist?list=`), and a podcast `/show/` or `/playlist/` page. That REVERSES the original
+  "any X link earns an honest no-video reply" rule -- ordinary mail and follow-up questions
+  pass through this same gate, Sara's inbox is SHARED with `sara_corrections.py`, and a
+  container URL can never be cached, so a signature link dropped the question and sent an
+  unsolicited reply. ITEM is deliberately wider than "post or watch id": `/status/<id>`,
+  `/i/spaces/<id>` and `/i/broadcasts/<id>` are X items (`_x_item_id`), a YouTube
+  `/clip/<id>` is an item (`_youtube_clip_id` -- a clip URL carries no watch id, so its id is
+  namespaced `youtube:clip:` in `_link_key` and `clip_` in the attachment name), and a
+  podcast `/episode/` is an item: all reach the resolvers and produce a transcript or an
+  honest failure, never silence. The podcast container regex is Spotify path-shaped, so a
+  SHOW page on Apple / anchor.fm / pod.link / overcast / castbox / podbean is still detected
+  as an item and answered "not supported yet" -- accepted deliberately (a per-host regex
+  would rot). Links are read from `uniqueBody` ONLY, so
   a link quoted in a reply's thread history never re-fires. An ITEM link with no downloadable
   video still earns an honest "no video found" reply. A reply in a conversation Sara already
-  transcribed is treated as a follow-up question unless it adds a link that conversation has
-  NOT already transcribed (`_has_new_link`, compared on the normalized `_link_key` so
-  `youtu.be/ID` matches a cached `youtube.com/watch?v=ID`) -- `uniqueBody` strips quoted
-  history but KEEPS the sender's SIGNATURE, so a signature link would otherwise hijack the
-  follow-up path: the question dropped, an unsolicited failure reply sent (see State). The
-  container rule covers the common signature link (channel / profile / show); `_has_new_link`
-  covers the rest -- a signature link to a real ITEM this conversation already transcribed.
+  transcribed is treated as a follow-up question unless it adds a **transcribable** (`x` /
+  `youtube`) link that conversation has NOT already transcribed (`_has_new_link`, compared on
+  the normalized `_link_key` so `youtu.be/ID` matches a cached `youtube.com/watch?v=ID`) --
+  `uniqueBody` strips quoted history but KEEPS the sender's SIGNATURE, so a signature link
+  would otherwise hijack the follow-up path: the question dropped, an unsolicited failure
+  reply sent (see State). The container rule covers the common signature link (channel /
+  profile / Spotify show); `_has_new_link` covers the rest -- a signature link to a real ITEM
+  this conversation already transcribed, and ANY podcast link (a podcast never transcribes,
+  so it can never be cached; letting it count would drop every follow-up in that conversation
+  forever). With no cached conversation the follow-up branch is not taken at all, so a
+  podcast-only email still gets its honest unsupported reply.
 - **Flow:** per link, `transcribe_link` dispatches by kind -- YouTube tries captions first
   (`_fetch_youtube_transcript`, fast and free) and falls back to the same yt-dlp + Grok STT
-  path as X only when there are none, but a YouTube URL with no parseable video id (channel /
+  path as X only when there are none, but a YouTube URL naming no single video (channel /
   playlist / `@handle`) is refused up front and NEVER reaches yt-dlp (a channel has no
   duration for the cap to bound, and the download thread is a daemon that outlives its join)
-  -- defense in depth, since detection now drops those before the scan gets here. Every
-  YouTube id in this module comes from ONE local resolver, `_youtube_id`: it delegates to the
-  shared `ld._youtube_video_id` and additionally recognizes `/live/<id>` (the address-bar form
-  for livestreams and premieres) and the legacy `/v/<id>`, which that regex does not cover.
+  -- defense in depth, since detection now drops those before the scan gets here. A
+  `/clip/<id>` is NOT refused: yt-dlp can fetch a clip, so it skips straight to the audio path
+  (captions are keyed by watch id, which a clip URL does not carry, so that lookup returns
+  None). Every YouTube WATCH id in this module comes from ONE local resolver, `_youtube_id`:
+  it delegates to the shared `ld._youtube_video_id` and additionally recognizes `/live/<id>`
+  (the address-bar form for livestreams and premieres) and the legacy `/v/<id>`, which that
+  regex does not cover; a clip id comes from `_youtube_clip_id` and is kept separate so it can
+  never collide with a watch id.
   `learn_digest` is shared with the Read/Learn digest and is deliberately NOT widened;
   podcast returns `PODCAST_UNSUPPORTED` without calling
   any resolver -- then a Claude summary (TITLE/TL;DR/KEY POINTS/NOTABLE QUOTES) goes out via
@@ -455,12 +470,12 @@ machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, 
 | X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
 | Read/Learn digest silently empty ("no unread items") | Saved items are forwarded-to-self and arrive READ; pre-2.23.0 runs were unread-only and skipped them | Fixed @2.23.0: normal runs use a trailing `LEARN_LOOKBACK_DAYS` window, read/unread agnostic. For older-than-window backlog use `/learn/run?backlog=1` |
 | Read/Learn X-video shows "content not retrieved" / STT never arrives | Post has no NATIVE downloadable video (Grok VIDEO_WITH_AUDIO over-fired), or video > 60-min cap; yt-dlp can't fetch it | Expected for those posts -- @2.25.0 the digest now surfaces Grok's visual/text summary (prefixed `[x-video audio pending STT replay]`) instead of discarding it; unfetchable entries cycle to `failed` after 3 attempts. Only genuinely-short native X clips transcribe |
-| Email-to-transcript never replies | Sender not on an internal domain, or no x.com/YouTube ITEM link in the new (unquoted) body -- a container URL (channel / profile / playlist / show) is not a request | Send from an `INTERNAL_DOMAINS` address with a link to one post or video in the body (not just quoted); an ITEM link with no video still gets a "no video found" reply. Check `/transcribe-email/status` |
+| Email-to-transcript never replies | Sender not on an internal domain, or no x.com/YouTube ITEM link in the new (unquoted) body -- a container URL (channel / profile / playlist / Spotify show) is not a request | Send from an `INTERNAL_DOMAINS` address with a link to one post, Space, broadcast, video or clip in the body (not just quoted); an ITEM link with no video still gets a "no video found" reply. Check `/transcribe-email/status` |
 | Follow-up question gets no reply | The reply landed in a different Exchange conversation, or the first run's transcripts were never cached (every link failed) | Replies must be sent via `createReply` so `conversationId` is inherited; check `/data/x_transcribe_threads.json` for the conversation |
 | Spotify link replies "not supported yet" | By design -- podcast audio is DRM'd, yt-dlp cannot fetch it and `_fetch_spoken` has no key and an unvalidated request shape | Expected. Deferred work, not a bug |
 | Sara keeps replying to an autoresponder | Autoresponder sends no `Auto-Submitted`/`Precedence` header | `is_auto_reply` guards BOTH paths (a media link in the autoresponder's template no longer bypasses it), and the per-conversation cap `XTE_THREAD_MAX_QUESTIONS` stops a header-less one after 20 and goes silent; lower it if needed |
-| Follow-up question gets a transcription reply instead of an answer | A link in the sender's signature made the message look like a new request -- `uniqueBody` strips quoted history but KEEPS signatures | Two guards. A CONTAINER link (channel / profile / show) is not a request at all, so a signature carrying one is inert. A signature link to a real ITEM Sara has never transcribed still reads as new -- transcribe it once, or drop it from the signature |
-| Channel / profile / playlist / show link gets no reply at all | By design -- a container URL is not a transcription request (`_is_container_url`), so the message is left for other handlers exactly like an article link | Send the link to ONE post or video. Reversed the old "any X link earns an honest no-video reply" rule: ordinary mail and follow-ups share this gate, and a container can never be cached, so it could never self-heal |
+| Follow-up question gets a transcription reply instead of an answer | A link in the sender's signature made the message look like a new request -- `uniqueBody` strips quoted history but KEEPS signatures | Two guards. A CONTAINER link (channel / profile / Spotify show) is not a request at all, so a signature carrying one is inert; and no podcast link of any host ever counts as a new request. What still reads as new is a signature link to a real TRANSCRIBABLE ITEM (X post / Space / broadcast, YouTube video or clip) Sara has never transcribed -- transcribe it once, or drop it from the signature |
+| Channel / profile / playlist / Spotify-show link gets no reply at all | By design -- a container URL is not a transcription request (`_is_container_url`), so the message is left for other handlers exactly like an article link | Send the link to ONE post or video. Reversed the old "any X link earns an honest no-video reply" rule: ordinary mail and follow-ups share this gate, and a container can never be cached, so it could never self-heal. NOT containers (these do get a reply): `/i/spaces/<id>`, `/i/broadcasts/<id>`, `youtube.com/clip/<id>`, a podcast `/episode/`, and a show page on a non-Spotify host |
 
 ## Environment Variables (Railway)
 

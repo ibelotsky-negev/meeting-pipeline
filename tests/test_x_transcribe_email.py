@@ -165,7 +165,11 @@ class TestLinkDetection:
         assert pairs[0][0] == "https://youtu.be/AbCdefgh"  # period not in URL
 
     def test_x_nav_page_with_period_still_filtered(self):
-        # X nav page followed by period should still match _X_NONPOST filter
+        # An X nav page followed by a period must still read as a container:
+        # trailing punctuation is stripped upstream, and the URL names no item
+        # (no /status/, /i/spaces/ or /i/broadcasts/ id). (_X_NONPOST, the old
+        # bare-domain/nav list this used to name, was deleted -- the no-item
+        # rule strictly subsumes it.)
         html = "go home https://x.com/home. stay safe"
         pairs = xte.find_media_links(html)
         assert not any(u.endswith("/home") or u.endswith("/home.") for u, _ in pairs)
@@ -1367,3 +1371,234 @@ class TestModuleHygiene:
         """FIX 7: _run_lock was never acquired -- the real guard is app.py's
         _xte_trigger_lock. A dead lock claiming that guarantee is misleading."""
         assert not hasattr(xte, "_run_lock")
+
+
+# ----------------------------------------------------------------------
+#  Task 10 / RESIDUAL A -- three ITEM shapes were swept up as containers
+# ----------------------------------------------------------------------
+
+class TestXSpacesAndBroadcastsAreItems:
+    """RESIDUAL A. x.com/i/spaces/<id> and x.com/i/broadcasts/<id> name single
+    ITEMS -- live audio that may genuinely transcribe -- but the blanket "an X
+    path with no /status/ is a container" rule dropped them at detection, so
+    find_media_links returned [], run() hit a bare continue, and the sender got
+    TOTAL SILENCE. That contradicts this module's own principle (pinned in
+    test_podcast_only_message_still_gets_a_reply: "silence would read as a
+    broken service") -- a Spotify episode, which can NEVER transcribe, earned
+    an honest reply while a Space, which might actually work, earned nothing."""
+
+    SPACE = "https://x.com/i/spaces/1YpKkZWjWQvGj"
+    BROADCAST = "https://x.com/i/broadcasts/1yNGaNqbrjbGj"
+
+    @pytest.mark.parametrize("url", [SPACE, BROADCAST])
+    def test_detected_as_an_x_item(self, url):
+        assert xte.find_media_links(f"listen to {url} today") == [(url, "x")]
+
+    @pytest.mark.parametrize("url", [SPACE, BROADCAST])
+    def test_reaches_the_audio_resolver(self, monkeypatch, tmp_path, url):
+        d = tmp_path / "aud"; d.mkdir()
+        seen = []
+        monkeypatch.setattr(ld, "extract_x_post_audio",
+                            lambda u, timeout=None: seen.append(u) or (str(d / "a.m4a"), 30.0, None, str(d)))
+        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: ("space words", None))
+        r = xte.transcribe_link(url, "x")
+        assert seen == [url]                      # resolver actually invoked
+        assert r["ok"] and r["transcript"] == "space words"
+
+    @pytest.mark.parametrize("url,expected", [(SPACE, "1YpKkZWjWQvGj"),
+                                              (BROADCAST, "1yNGaNqbrjbGj")])
+    def test_attachment_id_is_the_item_id_not_post(self, url, expected):
+        assert xte._status_id(url) == expected
+
+    def test_space_and_broadcast_keys_do_not_collide(self):
+        assert xte._link_key(self.SPACE) != xte._link_key(self.BROADCAST)
+        assert xte._link_key(self.SPACE) != xte._link_key("https://x.com/i/status/111")
+
+    def test_space_link_earns_an_honest_reply_instead_of_silence(self, xte_files, monkeypatch):
+        """END TO END -- the residual itself: the reply may be a failure, but
+        it must not be silence."""
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": False, "transcript": "", "chars": 0,
+                                              "error": "no video could be found", "source": ""})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("sp1", "bk@negevlabs.com", "space", self.SPACE)])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 1
+        assert "No video was found" in _sent_bodies(calls)[0]
+
+    @pytest.mark.parametrize("url", ["https://x.com/someone",
+                                     "https://x.com/home",
+                                     "https://twitter.com/palomarlabs"])
+    def test_profiles_and_nav_pages_are_still_containers(self, url):
+        """REGRESSION GUARD -- narrowing the rule must not reopen it."""
+        assert xte.find_media_links(f"see {url} thanks") == []
+
+
+class TestYouTubeClipIsAnItem:
+    """RESIDUAL A. A /clip/<id> URL names ONE item -- a user-trimmed excerpt of
+    a single video -- but the underlying watch id is NOT in the URL, so
+    _youtube_id can never resolve one: detection dropped it as a container
+    (total silence) and transcribe_link, called directly, refused it as "a
+    channel or playlist". yt-dlp can fetch a clip, so it now goes down the
+    audio path and produces a real transcript or an honest failure. The clip id
+    is NAMESPACED everywhere it is used as an identity, so it can never collide
+    with a watch id made of the same characters."""
+
+    CLIP = "https://www.youtube.com/clip/UgkxRV3S7Bnm0M2Rl0mKZDQ8ejlUgFR2m8Zx"
+    SAME_CHARS = "dQw4w9WgXcQ"
+
+    def test_detected_as_a_youtube_item(self):
+        assert xte.find_media_links(f"watch {self.CLIP} now") == [(self.CLIP, "youtube")]
+
+    def test_reaches_the_resolver_instead_of_the_channel_refusal(self, monkeypatch, tmp_path):
+        # Captions are looked up by WATCH id, which a clip URL does not carry,
+        # so ld._fetch_youtube_transcript short-circuits to None offline (no
+        # import, no network) and the clip falls through to the audio path.
+        d = tmp_path / "aud"; d.mkdir()
+        seen = []
+        monkeypatch.setattr(ld, "extract_x_post_audio",
+                            lambda u, timeout=None: seen.append(u) or (str(d / "a.m4a"), 20.0, None, str(d)))
+        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: ("clip words", None))
+        r = xte.transcribe_link(self.CLIP, "youtube")
+        assert seen == [self.CLIP]                          # resolver actually invoked
+        assert r["ok"] and r["transcript"] == "clip words"
+        assert "channel or playlist" not in (r.get("error") or "")
+
+    def test_clip_failure_is_honest_not_a_channel_refusal(self, monkeypatch):
+        monkeypatch.setattr(ld, "extract_x_post_audio",
+                            lambda u, timeout=None: (None, 0, "no video could be found in this clip", None))
+        r = xte.transcribe_link(self.CLIP, "youtube")
+        assert not r["ok"]
+        assert "channel or playlist" not in r["error"]
+        assert "No video was found" in xte._failure_message(r["error"])
+
+    def test_clip_id_never_collides_with_a_watch_id(self):
+        clip = f"https://www.youtube.com/clip/{self.SAME_CHARS}"
+        watch = f"https://www.youtube.com/watch?v={self.SAME_CHARS}"
+        assert xte._link_key(clip) != xte._link_key(watch)
+        assert xte._status_id(clip) != xte._status_id(watch)
+
+    def test_clip_key_is_stable_across_tracking_suffixes(self):
+        assert xte._link_key(f"{self.CLIP}?si=abc123") == xte._link_key(self.CLIP)
+
+    def test_clip_transcribes_end_to_end(self, xte_files, monkeypatch):
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "clip words",
+                                              "chars": 10, "error": "", "source": "xAI Grok STT"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: Clip\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("cl1", "bk@negevlabs.com", "clip", self.CLIP)])
+        calls = _capture_graph(monkeypatch)
+        assert xte.run()["replied"] == 1
+        atts = _sent_attachments(calls)
+        assert atts and atts[0]["name"].startswith("transcript_clip_")
+
+    @pytest.mark.parametrize("url", ["https://www.youtube.com/@handle",
+                                     "https://www.youtube.com/playlist?list=PLabcdefgh",
+                                     "https://www.youtube.com/c/SomeName",
+                                     "https://open.spotify.com/show/abc123"])
+    def test_containers_are_still_dropped(self, url):
+        """REGRESSION GUARD -- narrowing the rule must not reopen it."""
+        assert xte.find_media_links(f"see {url} thanks") == []
+
+
+# ----------------------------------------------------------------------
+#  Task 10 / RESIDUAL B -- a podcast link never blocks a follow-up
+# ----------------------------------------------------------------------
+
+# A SHOW page on a non-Spotify host: the podcast container rule is Spotify
+# path-shaped (/show/, /playlist/), so this is detected as an item.
+_APPLE_SHOW = "https://podcasts.apple.com/us/podcast/acquired/id1050462261"
+_SPOTIFY_EPISODE = "https://open.spotify.com/episode/abc123"
+
+
+class TestPodcastLinkNeverBlocksAFollowUp:
+    """RESIDUAL B. Show pages on Apple / anchor.fm / pod.link / overcast /
+    castbox / podbean are still DETECTED as items (the container regex is
+    Spotify-shaped), and a Spotify /episode/ deliberately is. A podcast result
+    is NEVER ok, so remember_thread can never cache it -- if a podcast link
+    counted as a new transcription request, _has_new_link would stay True
+    forever and EVERY follow-up question in that conversation would be dropped
+    in favour of a repeat "not supported yet" reply.
+
+    Fixed at the GATE (only a TRANSCRIBABLE kind -- x, youtube -- can make a
+    message a new request), NOT by chasing per-host URL shapes: a regex
+    enumerating podcast hosts rots with every new host. Detection is unchanged,
+    so a podcast-only email still earns its honest unsupported reply."""
+
+    @pytest.mark.parametrize("podcast_url", [_APPLE_SHOW, _SPOTIFY_EPISODE])
+    def test_followup_carrying_a_podcast_link_is_answered_not_transcribed(
+            self, xte_files, monkeypatch, podcast_url):
+        _cached("CONV-A", "https://x.com/i/status/1")
+        monkeypatch.setattr(xte, "answer_question",
+                            lambda q, links: "ANSWER: margins are 80 percent")
+        seen = []
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": seen.append(u) or {
+                                "url": u, "ok": False, "error": "nope",
+                                "transcript": "", "chars": 0, "source": ""})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        body = ('<p>what did he say about pricing?</p>'
+                '<p>--<br>Ken Belotsky, Palomar Labs<br>'
+                f'<a href="{podcast_url}">our podcast</a></p>')
+        _mock_inbox(monkeypatch, [_followup_msg("pb1", "bk@negevlabs.com", "CONV-A", body)])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert seen == []                                  # podcast link never transcribed
+        assert res["replied"] == 1
+        assert res["outcomes"][0].get("followup") is True  # answered, not transcribed
+        assert "margins are 80 percent" in _sent_bodies(calls)[0]
+        assert not _sent_attachments(calls)
+        assert xte._load_threads()["CONV-A"]["questions"] == 1
+
+    def test_a_new_youtube_link_still_transcribes_alongside_a_podcast_link(
+            self, xte_files, monkeypatch):
+        """ORDERING: the gate must not over-block. A message in a cached
+        conversation that carries a genuinely NEW transcribable link is still a
+        transcription request, podcast link in the signature or not."""
+        _cached("CONV-A", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        asked = []
+        monkeypatch.setattr(xte, "answer_question",
+                            lambda q, links: asked.append(q) or "ANSWER: no")
+        monkeypatch.setattr(xte, "transcribe_link",
+                            lambda u, k="x": {"url": u, "ok": True, "transcript": "new words",
+                                              "chars": 9, "error": "", "source": "xAI Grok STT"})
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        body = ('<p>and this one?</p>'
+                '<p>https://youtu.be/AbCdEfGhIjK</p>'
+                f'<p>--<br>Ken<br><a href="{_APPLE_SHOW}">our podcast</a></p>')
+        _mock_inbox(monkeypatch, [_followup_msg("pb3", "bk@negevlabs.com", "CONV-A", body)])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert asked == []                                 # not routed to the follow-up path
+        assert res["replied"] == 1
+        assert _sent_attachments(calls)                    # a real transcription reply
+
+    def test_podcast_only_mail_in_an_uncached_conversation_still_replies(
+            self, xte_files, monkeypatch):
+        """MUST NOT REGRESS. Detection is unchanged -- a podcast link is still
+        an item, so a podcast-only email with nothing cached to answer from
+        still earns its honest unsupported reply rather than silence."""
+        monkeypatch.setattr(xte, "summarize_transcript",
+                            lambda u, t, note="": "TITLE: V\nTL;DR: ok")
+        _mock_inbox(monkeypatch, [_msg("pb4", "bk@negevlabs.com", "listen", _APPLE_SHOW)])
+        calls = _capture_graph(monkeypatch)
+        res = xte.run()
+        assert res["replied"] == 1
+        assert "not supported yet" in _sent_bodies(calls)[0]
+        assert not _sent_attachments(calls)
+
+    def test_has_new_link_ignores_podcast_kinds_in_a_known_conversation(self):
+        entry = {"links": [{"url": "https://x.com/i/status/1"}]}
+        assert not xte._has_new_link([(_APPLE_SHOW, "podcast")], entry)
+        assert not xte._has_new_link([(_SPOTIFY_EPISODE, "podcast")], entry)
+        assert xte._has_new_link([("https://youtu.be/AbCdEfGhIjK", "youtube")], entry)
+
+    def test_podcast_link_still_counts_when_there_is_nothing_cached(self):
+        """No entry means no transcript to answer from, so the podcast link
+        must still read as a request -- that is what earns the honest reply."""
+        assert xte._has_new_link([(_APPLE_SHOW, "podcast")], None)
+        assert xte._has_new_link([(_APPLE_SHOW, "podcast")], {})

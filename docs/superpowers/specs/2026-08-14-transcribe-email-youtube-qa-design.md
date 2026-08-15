@@ -295,3 +295,50 @@ swallowed two forms that transcribed fine before this branch. `learn_digest` is
 deployed and shared with the Read/Learn digest, so its regex was NOT widened;
 `x_transcribe_email._youtube_id` delegates to it and additionally recognizes
 those two forms, and is the module's single notion of "the video id".
+
+## Amendment 2 -- 2026-08-15: narrowing "container", and the follow-up gate
+
+This NARROWS the 2026-08-15 amendment above on two points. It does not reopen
+it: a channel, profile, nav page, Spotify show or playlist still produces no
+entry at all.
+
+### Three ITEM shapes were swept up
+
+`x.com/i/spaces/<id>`, `x.com/i/broadcasts/<id>` and `youtube.com/clip/<id>`
+name single ITEMS, not containers, but the blanket rules ("an X path with no
+`/status/<id>`", "a YouTube URL with no parseable video id") dropped all three.
+They produced no entry, so `run()` hit a bare `continue` and the sender got
+TOTAL SILENCE -- where before this branch they reached the resolvers and
+produced either a transcript or an honest capped/failed reply. That contradicts
+the module's own principle: a Spotify episode, which can NEVER transcribe, gets
+an honest reply, while an X Space, which might actually work, got nothing.
+
+They are items now. `_x_item_id` is the single notion of "this X url names one
+item" (post status id, or a Space / broadcast id) and backs both the container
+check and the attachment name. A clip is kept SEPARATE from a watch id
+(`_youtube_clip_id`): a clip URL does not carry the underlying watch id at all,
+so `_youtube_id` can never resolve one, captions cannot be looked up (they are
+keyed by watch id, so that lookup returns None first) and yt-dlp fetches the
+clip itself. The clip id is namespaced wherever it is an identity --
+`youtube:clip:<id>` in `_link_key`, `clip_<id>` in the attachment filename --
+so it can never collide with a watch id made of the same characters.
+
+### A podcast link never counts as a new transcription request
+
+The podcast container rule (`/show/`, `/playlist/`) is Spotify path-shaped, so
+a SHOW page on Apple, anchor.fm, pod.link, overcast, castbox or podbean is still
+detected as an item, as is any Spotify `/episode/`. A podcast result is never
+`ok`, so `remember_thread` can never cache it: while such a link counted as a
+request, `_has_new_link` stayed True forever and EVERY follow-up question in
+that conversation was dropped in favour of a repeat "not supported yet" reply --
+the original signature-link defect surviving in a narrow lane.
+
+Fixed at the GATE, not at the host regex: only a TRANSCRIBABLE kind (`x`,
+`youtube`) can make a message count as a new request in a conversation Sara has
+already transcribed. A regex enumerating podcast hosts would rot with every new
+host, and widening it would ALSO have silenced podcast-only mail, which is the
+opposite of the principle above. Detection is untouched: a podcast link is still
+an item, and with no cached conversation the follow-up branch is not taken at
+all, so a podcast-only email still earns its honest unsupported reply. Ordering
+is load-bearing -- the transcribable filter runs INSIDE the gate, after the
+"no cached entry -> this is a request" exit.
