@@ -1330,6 +1330,32 @@ class _Snippet:
         self.text = text
 
 
+class _Track:
+    """Stand-in for a 1.x Transcript: one caption track in one language."""
+
+    def __init__(self, language_code, is_generated, texts):
+        self.language_code = language_code
+        self.is_generated = is_generated
+        self._texts = texts
+
+    def fetch(self):
+        return [_Snippet(t) for t in self._texts]
+
+
+def _api_with_tracks(*tracks):
+    """A 1.x-shaped fake API exposing list() -> tracks. `fetch` is defined only
+    so the resolver takes the 1.x branch; calling it is a failure."""
+
+    class Api1x:
+        def list(self, vid):
+            return list(tracks)
+
+        def fetch(self, vid):
+            raise AssertionError("resolver must go through list(), not fetch()")
+
+    return Api1x
+
+
 def _install_fake_yta(monkeypatch, api_cls):
     """Inject a fake youtube_transcript_api so the lazy import inside the
     resolver picks it up. Offline: the real library is never imported."""
@@ -1344,16 +1370,35 @@ class TestFetchYoutubeTranscript:
     _URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
     def test_modern_1x_instance_api_with_snippet_objects(self, monkeypatch):
-        seen = []
-
-        class Api1x:
-            def fetch(self, vid):
-                seen.append(vid)
-                return [_Snippet("hello"), _Snippet("world")]
-
-        _install_fake_yta(monkeypatch, Api1x)
+        _install_fake_yta(monkeypatch,
+                          _api_with_tracks(_Track("en", True, ["hello", "world"])))
         assert ld._fetch_youtube_transcript(self._URL) == "hello world"
-        assert seen == ["dQw4w9WgXcQ"]
+
+    def test_non_english_only_video_is_transcribed(self, monkeypatch):
+        """The regression that mattered: api.fetch(vid) defaults to English and
+        raises NoTranscriptFound when the only captions are in another language,
+        so a Russian-captioned video looked exactly like one with no captions."""
+        _install_fake_yta(monkeypatch,
+                          _api_with_tracks(_Track("ru", True, ["privet", "mir"])))
+        assert ld._fetch_youtube_transcript(self._URL) == "privet mir"
+
+    def test_manual_track_preferred_over_auto_generated(self, monkeypatch):
+        _install_fake_yta(monkeypatch, _api_with_tracks(
+            _Track("en", True, ["asr"]),
+            _Track("de", False, ["human"]),
+        ))
+        assert ld._fetch_youtube_transcript(self._URL) == "human"
+
+    def test_first_track_used_when_all_auto_generated(self, monkeypatch):
+        _install_fake_yta(monkeypatch, _api_with_tracks(
+            _Track("ru", True, ["first"]),
+            _Track("en", True, ["second"]),
+        ))
+        assert ld._fetch_youtube_transcript(self._URL) == "first"
+
+    def test_no_tracks_at_all_is_none(self, monkeypatch):
+        _install_fake_yta(monkeypatch, _api_with_tracks())
+        assert ld._fetch_youtube_transcript(self._URL) is None
 
     def test_legacy_06x_static_api_with_dict_chunks(self, monkeypatch):
         seen = []
@@ -1373,6 +1418,9 @@ class TestFetchYoutubeTranscript:
         legacy call while fetch is present."""
 
         class ApiBoth:
+            def list(self, vid):
+                return [_Track("en", True, ["modern"])]
+
             def fetch(self, vid):
                 return [_Snippet("modern")]
 
@@ -1388,6 +1436,9 @@ class TestFetchYoutubeTranscript:
         still try yt-dlp rather than raising out."""
 
         class ApiBroken:
+            def list(self, vid):
+                raise Exception("no element found: line 1, column 0")
+
             def fetch(self, vid):
                 raise Exception("no element found: line 1, column 0")
 
@@ -1395,23 +1446,19 @@ class TestFetchYoutubeTranscript:
         assert ld._fetch_youtube_transcript(self._URL) is None
 
     def test_empty_transcript_is_none_not_empty_string(self, monkeypatch):
-        class ApiEmpty:
-            def fetch(self, vid):
-                return []
-
-        _install_fake_yta(monkeypatch, ApiEmpty)
+        _install_fake_yta(monkeypatch, _api_with_tracks(_Track("en", True, [])))
         assert ld._fetch_youtube_transcript(self._URL) is None
 
     def test_blank_snippets_are_skipped(self, monkeypatch):
-        class ApiBlanks:
-            def fetch(self, vid):
-                return [_Snippet(""), _Snippet("kept"), _Snippet(None)]
-
-        _install_fake_yta(monkeypatch, ApiBlanks)
+        _install_fake_yta(monkeypatch,
+                          _api_with_tracks(_Track("en", True, ["", "kept", None])))
         assert ld._fetch_youtube_transcript(self._URL) == "kept"
 
     def test_no_video_id_never_reaches_the_library(self, monkeypatch):
         class ApiNever:
+            def list(self, vid):
+                raise AssertionError("must not be reached without a video id")
+
             def fetch(self, vid):
                 raise AssertionError("must not be reached without a video id")
 

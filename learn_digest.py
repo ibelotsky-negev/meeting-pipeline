@@ -646,6 +646,25 @@ def _youtube_video_id(url: str):
     return m.group(1) if m else None
 
 
+def _fetch_transcript_any_language(api, vid: str):
+    """Fetch a transcript in ANY available language, not just English.
+
+    api.fetch(vid) defaults to English and raises NoTranscriptFound on a video
+    whose captions exist only in another language -- so a Russian-captioned
+    video looked identical to one with no captions at all, and fell through to
+    the yt-dlp path for no reason. Preference order: a manually-created track
+    (human-written, more accurate than ASR), else whatever exists. The original
+    language is preferred over a translation -- the summarizer reads any
+    language, and translating first would lose fidelity."""
+    tracks = list(api.list(vid))
+    if not tracks:
+        return None
+    chosen = next((t for t in tracks if not t.is_generated), None) or tracks[0]
+    logger.info(f"[learn] youtube transcript {vid}: using {getattr(chosen, 'language_code', '?')}"
+                f"{' (auto)' if getattr(chosen, 'is_generated', False) else ' (manual)'}")
+    return chosen.fetch()
+
+
 def _fetch_youtube_transcript(url: str):
     """Primary YouTube resolver: youtube-transcript-api. Lazy import.
 
@@ -668,7 +687,7 @@ def _fetch_youtube_transcript(url: str):
         return None
     try:
         if hasattr(YouTubeTranscriptApi, "fetch"):
-            chunks = YouTubeTranscriptApi().fetch(vid)
+            chunks = _fetch_transcript_any_language(YouTubeTranscriptApi(), vid)
         else:
             chunks = YouTubeTranscriptApi.get_transcript(vid)
         parts = []
