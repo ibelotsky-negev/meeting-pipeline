@@ -1,23 +1,58 @@
 #!/usr/bin/env python3
 """
-x-transcribe-email -- email Sara an x.com link, get the transcript + summary back.
+x-transcribe-email -- email Sara a video link, get the transcript + summary back.
 
-Any INTERNAL team member emails sara@negevlabs.com an x.com / twitter.com post
-link. Sara scans her inbox (scheduled, and via /transcribe-email/run), transcribes
-each X video, summarizes it, and REPLIES to the sender with a structured summary
-in the body and the full transcript attached as a .md file (one per link).
+Any INTERNAL team member emails sara@palomar-labs.com an x.com / twitter.com or
+youtube.com / youtu.be link. Sara scans her inbox (scheduled, and via
+/transcribe-email/run), transcribes each video (YouTube captions first, falling
+back to yt-dlp + Grok STT; X always via yt-dlp + Grok STT), summarizes it, and
+REPLIES IN-THREAD to the sender with a structured summary in the body and the
+full transcript attached as a .md file (one per link). A podcast link is
+detected and reported unsupported rather than silently ignored.
+
+A question asked alongside the link is answered first on an ANSWER: line, and a
+LATER link-free reply in that same conversation is answered from the cached
+transcript (one Claude call, no re-transcription).
 
 Reuses existing, deployed machinery -- single source of truth, no duplication:
-- email_pipeline_sync (eps): Graph app-only token, graph_get / graph_post, html_to_text.
-- learn_digest (ld): extract_urls, classify_url, extract_x_post_audio,
+- email_pipeline_sync (eps): Graph app-only token, graph_get / graph_post /
+  graph_patch / graph_delete, html_to_text.
+- learn_digest (ld): extract_urls, classify_url, _normalize_x_url,
+  _youtube_video_id, _fetch_youtube_transcript, extract_x_post_audio,
   _grok_stt_from_file, _call_claude_text, SUMMARY_MODEL (the 2.22.0 STT path).
 - config.is_internal_email: the team allow-list.
 
 Safety / robustness:
-- Only INTERNAL senders are served; Sara's own mail is skipped (loop guard).
+- Only INTERNAL senders (plus XTE_TEAM_EXTRA) are served; Sara's own mail is
+  skipped (loop guard).
 - Links are read from uniqueBody ONLY -- a link quoted in a reply's thread history
   does NOT re-trigger; only links the sender typed in THIS message count.
-- Idempotent via processed message-ids at /data/x_transcribe_email.json.
+- Only single ITEMS count as a request. A CONTAINER url yields no entry at all
+  (_is_container_url), so mail carrying one in a signature earns no reply:
+  an X path naming no item (profile, bare domain, nav page -- items are
+  /status/<id>, /i/spaces/<id>, /i/broadcasts/<id>), a YouTube URL with neither
+  a video id nor a /clip/<id> (@handle, /c/, /user/, /channel/, /playlist?list=),
+  and a podcast /show/ or /playlist/ page. That last rule is Spotify
+  path-shaped, so a SHOW page on another host (Apple, anchor.fm, pod.link,
+  overcast, castbox, podbean) is still detected as an item and answered with the
+  honest "not supported yet" reply -- deliberate, and harmless now that a
+  podcast link can no longer block a follow-up (see below).
+- uniqueBody still keeps the sender's SIGNATURE, so a message counts as a
+  follow-up question rather than a new request (_has_new_link) when every
+  TRANSCRIBABLE link in it is one this conversation already transcribed --
+  otherwise a signature link would hijack the follow-up path and earn an
+  unsolicited reply. Podcast links never count at all there: one can never be
+  transcribed, so it can never be cached, and letting it count would drop every
+  follow-up question in that conversation forever.
+- Sara's inbox is SHARED (sara_corrections.py scans the same folder), so
+  ordinary team mail is routine traffic here.
+- Two loop breakers on BOTH paths: is_auto_reply skips autoresponder headers, and
+  XTE_THREAD_MAX_QUESTIONS caps follow-ups per conversation.
+- A YouTube URL naming no single video (channel / playlist / handle) never
+  reaches yt-dlp -- it has no duration for the cap to bound (see
+  transcribe_link). A /clip/<id> does name one and goes down the audio path.
+- Idempotent via processed message-ids at /data/x_transcribe_email.json, persisted
+  after EACH reply so an abort mid-scan cannot re-send a delivered one.
 - Per-email link cap (cost guard); the 60-min duration + size caps live inside
   learn_digest.extract_x_post_audio.
 - Never fabricates: a link that cannot be transcribed is reported honestly in the
@@ -33,8 +68,7 @@ import html
 import base64
 import shutil
 import logging
-import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import email_pipeline_sync as eps
 import learn_digest as ld
@@ -52,24 +86,63 @@ _DATA_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspa
 STORE_PATH = os.path.join(_DATA_DIR, "x_transcribe_email.json")
 STATUS_PATH = os.path.join(_DATA_DIR, "x_transcribe_email_status.json")
 
+# Per-conversation transcript cache -- lets a follow-up question cost one Claude
+# call instead of a re-transcription.
+THREADS_PATH = os.path.join(_DATA_DIR, "x_transcribe_threads.json")
+XTE_THREAD_TTL_DAYS = int(os.environ.get("XTE_THREAD_TTL_DAYS", "30"))
+XTE_THREAD_MAX = int(os.environ.get("XTE_THREAD_MAX", "200"))
+# Loop breaker, NOT a usage limit: Sara answers link-less mail in threads she
+# owns, so an autoresponder on the other end could ping-pong indefinitely.
+XTE_THREAD_MAX_QUESTIONS = int(os.environ.get("XTE_THREAD_MAX_QUESTIONS", "20"))
+
 # Inbox scan window (most recent N messages) and per-email link cap (cost guard).
 XTE_MAX_MESSAGES = int(os.environ.get("XTE_MAX_MESSAGES", "25"))
 XTE_MAX_LINKS = int(os.environ.get("XTE_MAX_LINKS", "5"))
 XTE_SUMMARY_MODEL = os.environ.get("XTE_SUMMARY_MODEL", ld.SUMMARY_MODEL)
 
-# In-process guard so the scheduled scan and a manual trigger never overlap.
-_run_lock = threading.Lock()
+# Extra addresses served beyond the internal domains -- for a team member's
+# personal address. Empty by default; config.is_internal_email already covers
+# every corporate address, so nothing needs to be set for the team or for
+# vu@negevcap.com.
+XTE_TEAM_EXTRA = [a.strip().lower() for a in os.environ.get("XTE_TEAM_EXTRA", "").split(",") if a.strip()]
 
+# The X ITEM markers. A shareable post always carries /status/<id> (numeric),
+# and a Space or a live broadcast carries /i/spaces/<id> or /i/broadcasts/<id>
+# (alphanumeric) -- all three name ONE item that can carry audio. Any other
+# path is a profile or a navigation page: a CONTAINER, not an item (see
+# _is_container_url). Subsumes the old _X_NONPOST bare-domain/nav list.
 _STATUS_LINK_RE = re.compile(r"/status/(\d+)")
-# Bare domain + navigation pages that are not a shareable post -> ignored.
-_X_NONPOST = re.compile(
-    r"^https?://(?:www\.|mobile\.)?(?:twitter|x)\.com/?"
-    r"(?:home|explore|notifications|messages|settings|search|compose|i/grok)?/?$", re.I)
+# The negative lookahead excludes ONLY the exact literal "start" -- X's own
+# "start a Space" nav page (x.com/i/spaces/start), not a real id -- so it must
+# be followed by a non-id character or end of string; "start123abc" still
+# matches as an id, since a genuine Space/broadcast id is any alphanumeric
+# token and could in principle begin with those letters.
+_X_LIVE_ITEM_RE = re.compile(r"/i/(?:spaces|broadcasts)/(?!start(?:[^A-Za-z0-9_-]|$))([A-Za-z0-9_-]+)", re.I)
+# Podcast container shapes. An /episode/ URL is an ITEM and stays detected --
+# it still earns the honest "podcasts not supported yet" reply.
+_PODCAST_CONTAINER_RE = re.compile(r"/(?:show|playlist)/", re.I)
+# The two single-video YouTube forms ld._youtube_video_id does NOT cover:
+# /live/<id> (the address-bar form for livestreams and premieres) and the
+# legacy /v/<id>. See _youtube_id.
+_YT_EXTRA_ID_RE = re.compile(r"youtube\.com/(?:live|v)/([A-Za-z0-9_-]{6,})", re.I)
+# A /clip/<id> URL names one item too, but its id is a CLIP id, not a watch id
+# (the underlying video id is not in the URL at all). See _youtube_clip_id.
+_YT_CLIP_RE = re.compile(r"youtube\.com/clip/([A-Za-z0-9_-]+)", re.I)
 
 
 # ======================================================================
 #  STORE
 # ======================================================================
+
+
+def _as_int(value, default: int = 0) -> int:
+    """Read a persisted counter without ever raising. A corrupted value in the
+    thread cache must degrade to the default -- raising here would abort the
+    whole scan and re-send every reply already delivered in it."""
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _load() -> dict:
@@ -94,6 +167,17 @@ def _save(data: dict):
         logger.warning(f"[xte] could not write store: {e}")
 
 
+def _persist_processed(store: dict, processed: set, dry_run: bool = False):
+    """Write the processed-id set out NOW. Called after every reply, not just
+    once at the end of the scan: a container restart (or any abort) mid-scan
+    would otherwise lose the ids of messages already replied to, and the next
+    run would re-send every one of them. A dry run still writes nothing."""
+    if dry_run:
+        return
+    store["processed_ids"] = sorted(processed)[-1000:]
+    _save(store)
+
+
 def _write_status(result: dict):
     try:
         os.makedirs(os.path.dirname(STATUS_PATH), exist_ok=True)
@@ -111,29 +195,317 @@ def read_status() -> dict:
         return {}
 
 
+def _load_threads() -> dict:
+    try:
+        with open(THREADS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    except Exception as e:
+        logger.warning(f"[xte] could not read thread cache ({e}); starting empty")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_threads(threads: dict):
+    try:
+        os.makedirs(os.path.dirname(THREADS_PATH), exist_ok=True)
+        with open(THREADS_PATH, "w", encoding="utf-8") as f:
+            json.dump(threads, f, default=str, indent=2)
+    except Exception as e:
+        logger.warning(f"[xte] could not write thread cache: {e}")
+
+
+def _prune_threads(threads: dict, now: datetime = None) -> dict:
+    """Drop conversations past the TTL, then keep only the newest
+    XTE_THREAD_MAX by updated_at. An unparseable timestamp is dropped."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=XTE_THREAD_TTL_DAYS)
+    kept = {}
+    for cid, entry in (threads or {}).items():
+        try:
+            updated = datetime.fromisoformat(str((entry or {}).get("updated_at")).replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if updated >= cutoff:
+            kept[cid] = entry
+    if len(kept) > XTE_THREAD_MAX:
+        ordered = sorted(kept.items(), key=lambda kv: str(kv[1].get("updated_at")), reverse=True)
+        kept = dict(ordered[:XTE_THREAD_MAX])
+    return kept
+
+
+def remember_thread(conversation_id: str, results: list):
+    """Cache successful transcripts so follow-up questions in this conversation
+    cost one Claude call. A conversation where every link failed is NOT cached --
+    there would be nothing to answer from, and a reply to it correctly falls
+    through to the existing skip."""
+    ok = [r for r in results if r.get("ok")]
+    if not conversation_id or not ok:
+        return
+    threads = _prune_threads(_load_threads())
+    now = datetime.now(timezone.utc).isoformat()
+    entry = threads.get(conversation_id) or {"created_at": now, "questions": 0, "links": []}
+    entry["updated_at"] = now
+    # A persisted non-list links value would make the append below raise, which
+    # (before the caller's guard) un-sent an already-delivered reply.
+    prior = entry.get("links")
+    if not isinstance(prior, list):
+        prior = []
+    entry["links"] = prior + [
+        {"url": r["url"], "title": r.get("title") or r["url"],
+         "transcript": r.get("transcript") or ""}
+        for r in ok
+    ]
+    threads[conversation_id] = entry
+    _save_threads(_prune_threads(threads))
+
+
 # ======================================================================
 #  LINK DETECTION
 # ======================================================================
 
 
-def find_x_links(body_html: str) -> list:
-    """Return de-duped x.com / twitter.com content links found in the HTML.
-    Reuses learn_digest.extract_urls (handles both hrefs and plain text). ANY X
-    link the sender includes is returned (not just /status/), so a link with no
-    video still earns an honest "no video found" reply; only the bare domain and
-    navigation pages (home/search/settings/...) are ignored."""
+# Kinds this module acts on. An article link is not a transcription request and
+# is omitted entirely, so a message carrying only articles falls through to the
+# existing skip and is left for other handlers.
+#
+# TRANSCRIBABLE is the subset that can actually produce a transcript. podcast is
+# DETECTED (so a podcast-only email earns its honest "not supported yet" reply
+# rather than silence) but can never yield one, so it never counts as a new
+# transcription request when choosing the follow-up branch -- see _has_new_link.
+_TRANSCRIBABLE_KINDS = ("x", "youtube")
+_SUPPORTED_KINDS = _TRANSCRIBABLE_KINDS + ("podcast",)
+
+
+def _x_item_id(url: str):
+    """The id of a single X ITEM: a post's /status/<id>, or a Space's or live
+    broadcast's /i/spaces|broadcasts/<id>. None for a profile or a navigation
+    page. The module's ONE notion of "this X url names one item", used by the
+    container check and by _status_id's attachment name so both agree.
+
+    Spaces and broadcasts are items, not containers: they carry audio and may
+    genuinely transcribe. Sweeping them into the no-/status/ container rule
+    produced TOTAL SILENCE for a sender who asked about one -- worse than the
+    honest capped/failed reply they used to get. Never raises."""
+    u = str(url or "")
+    m = _STATUS_LINK_RE.search(u)
+    if m:
+        return m.group(1)
+    m = _X_LIVE_ITEM_RE.search(u)
+    return m.group(1) if m else None
+
+
+def _youtube_clip_id(url: str):
+    """The id of a YouTube /clip/<id> -- a user-trimmed excerpt of one video,
+    a single ITEM. Kept SEPARATE from _youtube_id (and namespaced everywhere it
+    is used as an identity) because a clip URL does not carry the underlying
+    watch id at all: _youtube_id can never resolve one, and a clip id must
+    never be mistaken for, or collide with, a watch id of the same characters.
+
+    yt-dlp can fetch a clip, so a clip reaches the audio path instead of the
+    "channel or playlist" refusal; captions cannot be looked up (they are keyed
+    by watch id), so that lookup simply returns None first. Never raises."""
+    m = _YT_CLIP_RE.search(str(url or ""))
+    return m.group(1) if m else None
+
+
+def _youtube_id(url: str):
+    """The SINGLE notion of "the YouTube video id" inside this module. Used by
+    the container check, transcribe_link's non-video guard, _link_key's identity
+    and _status_id's attachment name, so all four agree on what a video is.
+
+    Delegates to the shared ld._youtube_video_id FIRST (youtu.be/, v=, /shorts/,
+    /embed/), then recognizes the two single-video forms its regex does not
+    cover: /live/<id> and the legacy /v/<id>. learn_digest is deployed and
+    shared with the Read/Learn digest, so its regex is deliberately NOT widened
+    from here -- both forms transcribed fine before container URLs started being
+    dropped, and /live/ is what the address bar shows for a livestream or
+    premiere, so dropping them silently would be worse than the old
+    wrong-reason refusal.
+
+    Never raises: a lookup failure degrades to None (no id -> refused as a
+    container), never an exception in the middle of a scan."""
+    u = url or ""
+    try:
+        vid = ld._youtube_video_id(u)
+    except Exception as e:
+        logger.warning(f"[xte] youtube id parse failed {str(u)[:70]}: {e}")
+        vid = None
+    if vid:
+        return vid
+    m = _YT_EXTRA_ID_RE.search(u)
+    return m.group(1) if m else None
+
+
+def _is_container_url(url: str, kind: str) -> bool:
+    """True when a URL names a CHANNEL, PROFILE, PLAYLIST or SHOW rather than a
+    single item. find_media_links drops these entirely, exactly like an article
+    URL -- they are not transcription requests.
+
+    "Single item" is deliberately WIDER than "a post or a watch id": an X Space
+    and a live broadcast are items, and so is a YouTube /clip/<id>. All three
+    can carry audio and may genuinely transcribe, so sweeping them in here
+    produced total silence for the sender -- worse than the honest capped or
+    failed reply they used to get, and against this module's rule that a link
+    it cannot handle is reported, never ignored.
+
+    This REVERSES the original decision that ANY X link is returned "so a link
+    with no video still earns an honest no-video reply". That was safe while the
+    only way to reach Sara was to deliberately email her a link. Ordinary mail
+    and follow-up questions now flow through this same gate (and Sara's inbox is
+    SHARED -- sara_corrections.py scans the same folder), so a signature's
+    channel/profile/show link dropped the question and sent an unsolicited
+    reply. The already-cached-link gate in _has_new_link cannot rescue these: a
+    container URL can NEVER be cached -- a channel cannot transcribe, a profile
+    has no video, a show is always unsupported -- so it could never self-heal.
+
+    Never raises: an unparseable URL counts as NOT a container, so a real
+    request is never silently swallowed."""
+    u = url or ""
+    try:
+        if kind == "x":
+            return not _x_item_id(u)               # post, Space or broadcast -> item
+        if kind == "youtube":
+            # A watch id (incl. /live/ and /v/), or a /clip/<id> -- whose watch
+            # id is not in the URL, so _youtube_id alone would drop a real item.
+            return not (_youtube_id(u) or _youtube_clip_id(u))
+        if kind == "podcast":
+            return bool(_PODCAST_CONTAINER_RE.search(u))
+    except Exception as e:
+        logger.warning(f"[xte] container check failed {u[:70]}: {e}")
+    return False
+
+
+def _link_key(url: str, kind: str = None) -> str:
+    """Normalized identity for one media link -- the SINGLE definition of "the
+    same link", used both to de-dup within a message and to decide whether a
+    message added a NEW link to a conversation. Never raises.
+
+    X: via ld._normalize_x_url. YouTube: by video ID, so youtu.be/ID and
+    youtube.com/watch?v=ID are the same video; a /clip/<id> keys on the CLIP id
+    under its own "youtube:clip:" namespace, since a clip URL carries no watch
+    id and its id must never collide with a watch id of the same characters
+    (lexical fallback when neither can be parsed). Podcast: scheme+host
+    lowercased, path/query/fragment preserved as-is -- rebuilt with urlunsplit
+    so the '?' separator survives (concatenating
+    path+query collided /episode/xy?zsi=abc with /episode/xyz?si=abc)."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    u = url or ""
+    try:
+        kind = kind or ld.classify_url(u)
+        if kind == "x":
+            return ld._normalize_x_url(u)
+        if kind == "youtube":
+            vid = _youtube_id(u)
+            if vid:
+                return f"youtube:{vid}"
+            clip = _youtube_clip_id(u)
+            if clip:
+                return f"youtube:clip:{clip}"
+            return u.rstrip("/").lower()
+        if kind == "podcast":
+            p = urlsplit(u)
+            return urlunsplit((p.scheme.lower(), p.netloc.lower(),
+                               p.path, p.query, p.fragment)).rstrip("/")
+    except Exception:
+        pass
+    return u.rstrip("/").lower()
+
+
+def _has_new_link(links: list, entry: dict) -> bool:
+    """True when the message carries a TRANSCRIBABLE media link this
+    conversation has NOT already transcribed -- i.e. when it is a new
+    transcription request rather than a follow-up question.
+
+    Load-bearing: uniqueBody strips quoted history but KEEPS the sender's
+    signature, so a signature link makes a follow-up look like a fresh
+    transcription request -- dropping the question AND sending an unsolicited
+    failure reply. find_media_links drops CONTAINER URLs outright (a
+    signature's "our channel" / "follow us on X" / "our show"), so this gate
+    handles the rest:
+    - a signature link to a real ITEM this conversation already transcribed;
+    - ANY podcast link. A podcast can never be transcribed, so its result is
+      never ok and remember_thread can never cache it: letting one count would
+      keep this True forever and drop EVERY follow-up question in the
+      conversation in favour of a repeat "not supported yet" reply. Fixed here,
+      at the gate, and NOT by widening the podcast container regex -- a regex
+      enumerating podcast hosts (Apple, anchor.fm, pod.link, overcast, castbox,
+      podbean, ...) rots with every new host. Detection is untouched, so a
+      podcast link in a conversation with nothing cached still reads as a
+      request and still earns its honest unsupported reply.
+
+    Not every unreadable entry hits the `except` below and reads as "new" --
+    that only fires when reading the entry itself raises (e.g. `entry` is not
+    a dict, or its `links` value is not iterable at all). A `links` value
+    that is merely the WRONG type but still iterable -- a string, say --
+    raises nothing: each character it yields fails the `isinstance(l, dict)`
+    filter, so `cached` quietly comes back empty instead, and control falls
+    through to the ordinary candidate check below, which then depends on
+    THIS message's own links -- a link-less follow-up against such an entry
+    returns False (NOT new), not True."""
+    if not entry:
+        return True
+    try:
+        cached = {_link_key((l or {}).get("url") or "")
+                  for l in (entry.get("links") or []) if isinstance(l, dict)}
+    except Exception:
+        return True
+    candidates = [(u, k) for u, k in (links or []) if k in _TRANSCRIBABLE_KINDS]
+    return any(_link_key(u, k) not in cached for u, k in candidates)
+
+
+def find_media_links(body_html: str) -> list:
+    """Return de-duped (url, kind) pairs for x / youtube / podcast links found
+    in the HTML, in first-seen order. Reuses learn_digest.extract_urls (handles
+    both hrefs and plain text, strips trailing punctuation, removes boilerplate)
+    and classify_url for link detection; identity comes from _link_key. Note:
+    extract_urls deduplicates case-insensitively (learn_digest.py:554), so
+    case-variant URLs collapse upstream.
+
+    Only single ITEMS are returned. A CONTAINER URL -- one naming a channel,
+    profile, playlist or show -- produces no entry at all, exactly like an
+    article URL, so a message carrying only those is not a transcription
+    request (see _is_container_url for why that reverses the original
+    "any X link earns an honest no-video reply" decision, and for what still
+    counts as an item: posts, Spaces, broadcasts, watch ids, clips, and a
+    podcast episode).
+
+    Detection is NOT where the podcast-vs-follow-up question is settled: a
+    podcast link stays detected here so a podcast-only email still gets its
+    honest unsupported reply, and _has_new_link decides whether it counts as a
+    new request."""
     out, seen = [], set()
     for u in ld.extract_urls(body_html or ""):
-        if ld.classify_url(u) != "x":
+        kind = ld.classify_url(u)
+        if kind not in _SUPPORTED_KINDS:
             continue
-        if _X_NONPOST.match(u):
+        if _is_container_url(u, kind):
             continue
-        norm = ld._normalize_x_url(u)
+        norm = _link_key(u, kind)
         if norm in seen:
             continue
         seen.add(norm)
-        out.append(u)
+        out.append((u, kind))
     return out
+
+
+def extract_note(body_html: str, urls: list = None) -> str:
+    """The sender's own prose from THIS message (uniqueBody), with links
+    removed -- used as an optional question about the video.
+
+    Deliberately does NOT decide whether the prose is a question: forwarded-mail
+    boilerplate would fool any heuristic. The model judges, and a note that
+    turns out to be a greeting simply produces the normal summary."""
+    text = eps.html_to_text(body_html or "")
+    for u in (urls or []):
+        text = text.replace(u, " ")
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:2000]
 
 
 # ======================================================================
@@ -141,15 +513,23 @@ def find_x_links(body_html: str) -> list:
 # ======================================================================
 
 
-def transcribe_link(url: str) -> dict:
-    """Transcribe one X post's video audio. Returns a result dict; never raises.
-    ok=False carries a specific, honest error reason (no fabrication)."""
-    result = {"url": url, "ok": False, "error": "", "transcript": "", "chars": 0}
+PODCAST_UNSUPPORTED = (
+    "Spotify and other podcast links are not supported yet -- podcast audio is "
+    "DRM-protected and cannot be downloaded for transcription."
+)
+
+
+def _transcribe_audio_url(url: str) -> dict:
+    """Shared yt-dlp + Grok STT path. ld.extract_x_post_audio is a generic
+    yt-dlp wrapper despite its name -- it takes any URL and enforces the
+    duration and size caps -- so this serves X and YouTube alike.
+    Never raises; ok=False carries a specific, honest reason."""
+    result = {"url": url, "ok": False, "error": "", "transcript": "", "chars": 0, "source": ""}
     tmpdir = None
     try:
         audio_path, _duration, err, tmpdir = ld.extract_x_post_audio(url)
         if err or not audio_path:
-            result["error"] = err or "no audio could be extracted from this post"
+            result["error"] = err or "no audio could be extracted from this link"
             return result
         text, stt_err = ld._grok_stt_from_file(audio_path)
         if stt_err or not text:
@@ -158,6 +538,7 @@ def transcribe_link(url: str) -> dict:
         result["ok"] = True
         result["transcript"] = text
         result["chars"] = len(text)
+        result["source"] = "xAI Grok STT"
         return result
     except Exception as e:
         logger.warning(f"[xte] transcribe failed {url[:70]}: {e}")
@@ -166,6 +547,46 @@ def transcribe_link(url: str) -> dict:
     finally:
         if tmpdir and os.path.isdir(tmpdir):
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def transcribe_link(url: str, kind: str = "x") -> dict:
+    """Transcribe one link by kind. Never raises; ok=False carries a specific,
+    honest error reason (no fabrication).
+
+    youtube: captions first (fast, free, and most videos have them), falling
+    back to the same yt-dlp + STT path as X only when there are none. A URL with
+    no video id (channel / playlist / @handle) is rejected up front and NEVER
+    reaches yt-dlp.
+    podcast: reported unsupported without calling any resolver."""
+    if kind == "podcast":
+        return {"url": url, "ok": False, "error": PODCAST_UNSUPPORTED,
+                "transcript": "", "chars": 0, "source": ""}
+    if kind == "youtube":
+        # A channel / playlist / @handle URL classifies as youtube but names no
+        # single video: captions return None immediately and the audio path
+        # would hand yt-dlp a whole listing to walk. The duration cap cannot
+        # bound that (a channel has no duration) and the download runs on a
+        # daemon thread that outlives its join, so it must be refused here.
+        # Defense in depth -- find_media_links already drops these before the
+        # scan gets here, but transcribe_link is called directly too.
+        #
+        # A /clip/<id> IS one item and must NOT be refused: yt-dlp fetches the
+        # clip, so it falls through to the audio path (its captions lookup is
+        # keyed by watch id, which a clip URL does not carry, and returns None).
+        if not (_youtube_id(url) or _youtube_clip_id(url)):
+            return {"url": url, "ok": False,
+                    "error": "that YouTube link points to a channel or playlist, "
+                             "not a single video",
+                    "transcript": "", "chars": 0, "source": ""}
+        try:
+            captions = ld._fetch_youtube_transcript(url)
+        except Exception as e:
+            logger.warning(f"[xte] youtube captions failed {url[:70]}: {e}")
+            captions = None
+        if captions:
+            return {"url": url, "ok": True, "error": "", "transcript": captions,
+                    "chars": len(captions), "source": "YouTube captions"}
+    return _transcribe_audio_url(url)
 
 
 _SUMMARY_INSTRUCTIONS = (
@@ -180,14 +601,89 @@ _SUMMARY_INSTRUCTIONS = (
 )
 
 
-def summarize_transcript(url: str, transcript: str) -> str:
-    """Claude summary of the transcript in the fixed TITLE/TL;DR/KEY POINTS shape.
+_QUESTION_INSTRUCTIONS = (
+    "The requester included this note with the link:\n\"\"\"\n{note}\n\"\"\"\n"
+    "If it asks something about the video, BEGIN your reply with a single line:\n"
+    "ANSWER: <direct answer, grounded ONLY in the transcript>\n"
+    "If the transcript does not cover it, say exactly that on the ANSWER line -- never guess "
+    "and never draw on outside knowledge.\n"
+    "If the note is not a question (a greeting, a signature, forwarded boilerplate), omit the "
+    "ANSWER line entirely and just summarize.\n\n"
+)
+
+
+def summarize_transcript(url: str, transcript: str, note: str = "") -> str:
+    """Claude summary in the fixed TITLE/TL;DR/KEY POINTS shape, optionally
+    preceded by an ANSWER line when the sender asked something.
     Returns '' on failure (caller still sends the transcript)."""
-    prompt = _SUMMARY_INSTRUCTIONS + f"Source: {url}\n\nTranscript:\n{transcript[:14000]}"
+    prompt = _SUMMARY_INSTRUCTIONS
+    if (note or "").strip():
+        prompt += _QUESTION_INSTRUCTIONS.format(note=note.strip())
+    prompt += f"Source: {url}\n\nTranscript:\n{transcript[:14000]}"
     try:
         return (ld._call_claude_text(prompt, XTE_SUMMARY_MODEL, max_tokens=1200) or "").strip()
     except Exception as e:
         logger.warning(f"[xte] summarize failed {url[:70]}: {e}")
+        return ""
+
+
+_AUTO_REPLY_HEADERS = ("x-autoreply", "x-autorespond", "x-autoresponder")
+
+
+def is_auto_reply(m: dict) -> bool:
+    """True for out-of-office / ticketing autoresponders. Load-bearing: Sara
+    now answers link-less mail in threads she owns, so without this an
+    autoresponder could ping-pong with her indefinitely."""
+    for h in (m.get("internetMessageHeaders") or []):
+        name = (h.get("name") or "").strip().lower()
+        value = (h.get("value") or "").strip().lower()
+        if name == "auto-submitted":
+            if value and value != "no":
+                return True
+        elif name in _AUTO_REPLY_HEADERS:
+            return True
+        elif name == "precedence" and value in ("auto_reply", "auto-reply", "bulk", "junk"):
+            return True
+    return False
+
+
+NO_QUESTION_MARKER = "NO_QUESTION"
+
+
+def _is_no_question(answer: str) -> bool:
+    """True when the model judged the sender's note was not a question about the
+    video. Matches only an exact first-line marker so a real answer that merely
+    mentions the words is never suppressed."""
+    first = (answer or "").strip().splitlines()[0] if (answer or "").strip() else ""
+    return first.strip().rstrip(".!:;,").upper() == NO_QUESTION_MARKER
+
+
+_ANSWER_INSTRUCTIONS = (
+    "You are Sara. Answer the colleague's question about a video you already transcribed for "
+    "them. Use ONLY the transcript(s) below -- no outside knowledge. Return PLAIN TEXT (no "
+    "markdown symbols) starting with a single line:\n"
+    "ANSWER: <direct answer in one short paragraph, or a few '- ' bullets if it is genuinely a list>\n"
+    "If the transcript does not cover the question, say exactly that and do not guess.\n"
+    "If the note is NOT a question about the video -- a thank-you, an acknowledgement, a "
+    "signature, or forwarded boilerplate -- reply with exactly NO_QUESTION on the first "
+    "line and nothing else.\n\n"
+)
+
+
+def answer_question(question: str, links: list) -> str:
+    """Claude answer grounded strictly in the cached transcript(s).
+    Returns '' on failure (caller says so rather than inventing an answer).
+    Returns exactly NO_QUESTION_MARKER (see _is_no_question) when the model
+    judges the sender's note was not actually a question about the video."""
+    blocks = []
+    for l in (links or []):
+        blocks.append(f"--- {l.get('title') or l.get('url')} ({l.get('url')}) ---\n"
+                      f"{(l.get('transcript') or '')[:14000]}")
+    prompt = _ANSWER_INSTRUCTIONS + f"Question: {question}\n\nTranscript(s):\n" + "\n\n".join(blocks)
+    try:
+        return (ld._call_claude_text(prompt, XTE_SUMMARY_MODEL, max_tokens=1200) or "").strip()
+    except Exception as e:
+        logger.warning(f"[xte] answer failed: {e}")
         return ""
 
 
@@ -209,7 +705,7 @@ def _summary_to_html(summary: str) -> str:
     """Escape + lightly format the labeled summary text into readable HTML
     (bold section labels, real bullet lists). The TITLE line is dropped -- it is
     surfaced as the section heading instead."""
-    labels = ("TL;DR:", "KEY POINTS:", "NOTABLE QUOTES:")
+    labels = ("ANSWER:", "TL;DR:", "KEY POINTS:", "NOTABLE QUOTES:")
     parts, bullets = [], []
 
     def flush():
@@ -236,15 +732,25 @@ def _summary_to_html(summary: str) -> str:
 
 
 def _status_id(url: str) -> str:
-    m = _STATUS_LINK_RE.search(url or "")
-    return m.group(1) if m else "post"
+    """Stable short id for the attachment filename: X item id (post status,
+    Space or broadcast), else YouTube watch id, else a clip id under its own
+    "clip_" prefix (so a clip and a watch id of the same characters cannot
+    produce the same filename), else 'post'."""
+    xid = _x_item_id(url)
+    if xid:
+        return xid
+    vid = _youtube_id(url)
+    if vid:
+        return vid
+    clip = _youtube_clip_id(url)
+    return f"clip_{clip}" if clip else "post"
 
 
-def _transcript_md(title: str, url: str, transcript: str) -> str:
+def _transcript_md(title: str, url: str, transcript: str, source: str = "xAI Grok STT") -> str:
     return (
         f"# Transcript -- {title}\n\n"
         f"- Source: {url}\n"
-        f"- Transcribed by: Sara (xAI Grok STT)\n\n"
+        f"- Transcribed by: Sara ({source})\n\n"
         f"---\n\n{transcript}\n"
     )
 
@@ -261,11 +767,23 @@ def _attachment(name: str, text: str) -> dict:
 def _failure_message(error: str) -> str:
     """Turn a per-link failure reason into a clear sentence for the reply."""
     low = (error or "").lower()
+    if "not supported yet" in low:
+        return error or PODCAST_UNSUPPORTED
+    if "channel or playlist" in low:
+        return ("That YouTube link points to a channel or playlist, not a single video -- "
+                "send the link to one video and I'll transcribe it.")
     if any(k in low for k in ("no video", "no audio", "no downloadable", "no media", "no transcribable")):
         return "No video was found at this link, so there was nothing to transcribe."
     if any(k in low for k in ("timeout", "guest token", "429", "502", "503", "504", "temporar")):
         return "Could not fetch the video just now (temporary issue) -- try re-sending in a moment."
     return "Could not transcribe this link: " + (error or "unknown reason")
+
+
+_FOOTER_HTML = (
+    "<p style='color:#888;font-size:12px;'>-- Sara<br>"
+    "I transcribe X and YouTube links. Reply to this email to ask a question about the video. "
+    "Spotify podcasts aren't supported yet.</p>"
+)
 
 
 def render_reply(results: list, truncated: int = 0) -> str:
@@ -293,20 +811,56 @@ def render_reply(results: list, truncated: int = 0) -> str:
     if truncated:
         parts.append(f"<p><em>{truncated} additional link(s) in your email were not processed "
                      f"(max {XTE_MAX_LINKS} per email).</em></p>")
-    parts.append("<p style='color:#888;'>-- Sara</p></div>")
+    parts.append(_FOOTER_HTML + "</div>")
     return "".join(parts)
 
 
-def send_reply(to_addr: str, subject: str, html_body: str, attachments: list):
-    message = {
-        "subject": subject,
-        "body": {"contentType": "HTML", "content": html_body},
-        "toRecipients": [{"emailAddress": {"address": to_addr}}],
-    }
-    if attachments:
-        message["attachments"] = attachments
-    eps.graph_post(f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/sendMail",
-                   {"message": message, "saveToSentItems": True})
+def render_answer(question: str, answer: str) -> str:
+    """HTML body for a follow-up answer: no attachment, they already have the
+    transcript."""
+    parts = ['<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;line-height:1.5;max-width:720px;">']
+    parts.append(f"<p><b>You asked:</b> {html.escape(question)}</p>")
+    parts.append(_summary_to_html(answer)
+                 or "<p>I couldn't produce an answer just now -- try re-sending your question.</p>")
+    parts.append(_FOOTER_HTML)
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def send_threaded_reply(source_message_id: str, html_body: str, attachments: list = None):
+    """Reply in-thread via createReply so the reply inherits conversationId,
+    subject and recipient. sendMail would thread only by subject heuristics,
+    which breaks the conversationId match that follow-up questions rely on.
+
+    Sequence: createReply (draft) -> PATCH the body -> POST each attachment ->
+    send. Raises on a missing draft id so the caller does NOT mark the message
+    processed and the next run retries it.
+
+    If PATCH/attach/send fails after the draft was created, the draft would
+    otherwise be orphaned (never sent, never deleted) -- and since a retry
+    calls createReply again, a persistent failure would leave a fresh
+    abandoned draft in Sara's mailbox on every scan cycle. So on any failure
+    past this point, best-effort DELETE the draft we just created, then
+    re-raise the ORIGINAL error unchanged (the cleanup call's own failure is
+    swallowed -- it must never mask the real error or change retry
+    semantics)."""
+    base = f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/messages"
+    draft = eps.graph_post(f"{base}/{source_message_id}/createReply", {}) or {}
+    draft_id = draft.get("id")
+    if not draft_id:
+        raise RuntimeError("createReply returned no draft id")
+    try:
+        eps.graph_patch(f"{base}/{draft_id}",
+                        {"body": {"contentType": "HTML", "content": html_body}})
+        for att in (attachments or []):
+            eps.graph_post(f"{base}/{draft_id}/attachments", att)
+        eps.graph_post(f"{base}/{draft_id}/send", {})
+    except Exception:
+        try:
+            eps.graph_delete(f"{base}/{draft_id}")
+        except Exception as cleanup_err:
+            logger.warning(f"[xte] could not delete orphaned draft {draft_id}: {cleanup_err}")
+        raise
 
 
 # ======================================================================
@@ -320,32 +874,61 @@ def _process_message(m: dict) -> dict:
     sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "")
     subject = m.get("subject") or ""
     body_html = (m.get("uniqueBody") or {}).get("content", "")
-    links = find_x_links(body_html)
-    truncated = max(0, len(links) - XTE_MAX_LINKS)
-    links = links[:XTE_MAX_LINKS]
+    pairs = find_media_links(body_html)
+    truncated = max(0, len(pairs) - XTE_MAX_LINKS)
+    pairs = pairs[:XTE_MAX_LINKS]
+    note = extract_note(body_html, [u for u, _ in pairs])
 
     results = []
-    for url in links:
-        r = transcribe_link(url)
+    for url, kind in pairs:
+        r = transcribe_link(url, kind)
         if r["ok"]:
-            r["summary"] = summarize_transcript(url, r["transcript"])
+            r["summary"] = summarize_transcript(url, r["transcript"], note)
             r["title"] = _parse_title(r["summary"], url)
         else:
             r["title"] = url
+        r["kind"] = kind
         results.append(r)
 
     attachments = [
         _attachment(f"transcript_{_status_id(r['url'])}.md",
-                    _transcript_md(r["title"], r["url"], r["transcript"]))
+                    _transcript_md(r["title"], r["url"], r["transcript"],
+                                   source=r.get("source") or "xAI Grok STT"))
         for r in results if r["ok"]
     ]
-    first_title = next((r["title"] for r in results if r["ok"]), "X video")
-    subj = ("Re: " + subject) if subject.strip() else f"Transcript: {first_title}"
-    send_reply(sender, subj, render_reply(results, truncated), attachments)
+    send_threaded_reply(m.get("id"), render_reply(results, truncated), attachments)
+    # The reply is OUT. Nothing after this point may raise: the caller treats an
+    # exception as "not processed" and would re-send this email every scan.
+    # Losing the follow-up cache costs one re-transcription; re-sending costs
+    # the recipient a duplicate every 15 minutes, forever.
+    try:
+        remember_thread(m.get("conversationId") or "", results)
+    except Exception as e:
+        logger.warning(f"[xte] could not cache conversation {m.get('conversationId')}: {e}")
 
     return {"from": sender, "subject": subject, "replied": True,
-            "links": [{"url": r["url"], "ok": r["ok"], "chars": r.get("chars", 0),
-                       "error": r.get("error", "")} for r in results]}
+            "links": [{"url": r["url"], "kind": r.get("kind", ""), "ok": r["ok"],
+                       "chars": r.get("chars", 0), "error": r.get("error", "")} for r in results]}
+
+
+def _process_followup(m: dict, entry: dict) -> dict:
+    """Answer a link-free reply in a conversation we already transcribed.
+
+    Sends nothing when the model judges the note was not actually a question
+    (see _is_no_question) -- e.g. "thanks" or a signature. A Claude FAILURE
+    (answer_question returning '') is NOT a non-question: it still gets the
+    existing honest-failure reply via render_answer."""
+    sender = ((m.get("from") or {}).get("emailAddress") or {}).get("address", "")
+    question = extract_note((m.get("uniqueBody") or {}).get("content", ""))
+    answer = answer_question(question, entry.get("links") or [])
+    if _is_no_question(answer):
+        logger.info(f"[xte] follow-up from {sender} was not a question; not replying")
+        return {"from": sender, "subject": m.get("subject") or "", "followup": True,
+                "replied": False, "answered": False, "reason": "not a question",
+                "question": question[:200]}
+    send_threaded_reply(m.get("id"), render_answer(question, answer))
+    return {"from": sender, "subject": m.get("subject") or "", "followup": True,
+            "replied": True, "answered": True, "question": question[:200]}
 
 
 def run(dry_run: bool = False, limit: int = None) -> dict:
@@ -355,11 +938,12 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
     started = datetime.now(timezone.utc)
     store = _load()
     processed = set(store.get("processed_ids") or [])
+    threads = _prune_threads(_load_threads())
     limit = limit or XTE_MAX_MESSAGES
 
     url = f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/mailFolders/inbox/messages"
     params = {
-        "$select": "id,subject,from,receivedDateTime,uniqueBody,internetMessageId",
+        "$select": "id,subject,from,receivedDateTime,uniqueBody,internetMessageId,conversationId,internetMessageHeaders",
         "$top": str(limit),
         "$orderby": "receivedDateTime desc",
     }
@@ -376,22 +960,87 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
         if sender.strip().lower() == SARA_MAILBOX.strip().lower():
             continue
         # Links are read from uniqueBody so a quoted link in a reply never re-fires.
-        links = find_x_links((m.get("uniqueBody") or {}).get("content", ""))
+        links = find_media_links((m.get("uniqueBody") or {}).get("content", ""))
+        eligible = (config.is_internal_email(sender)
+                    or sender.strip().lower() in XTE_TEAM_EXTRA)
+        entry = threads.get(m.get("conversationId") or "") if m.get("conversationId") else None
+        # uniqueBody keeps the sender's SIGNATURE, and a signature link (company
+        # channel, X profile, podcast show) is a "supported" link. In a
+        # conversation we already transcribed, only a genuinely NEW
+        # TRANSCRIBABLE link is a new request -- otherwise this is a follow-up
+        # question and must be answered as one, not transcribed. Compared on the
+        # normalized key, so youtu.be/ID matches a cached youtube.com/watch?v=ID.
+        # A podcast link never counts (it can never be cached, so it would block
+        # every follow-up forever); with no cached conversation the branch below
+        # is not taken at all, so it still earns its honest unsupported reply.
+        if links and not _has_new_link(links, entry):
+            logger.info(f"[xte] no new link in known conversation {m.get('conversationId')}; "
+                        f"treating as a follow-up")
+            links = []
+
         if not links:
-            continue  # not a transcription request -- leave for other handlers
-        if not config.is_internal_email(sender):
-            logger.info(f"[xte] ignoring X-link mail from external sender {sender}")
+            # A link-free reply in a conversation we already transcribed is a
+            # follow-up question. Anything else is not a transcription request
+            # and is left for other handlers.
+            if not entry or not eligible or is_auto_reply(m):
+                continue
+            if _as_int(entry.get("questions")) >= XTE_THREAD_MAX_QUESTIONS:
+                logger.info(f"[xte] follow-up cap reached for {m.get('conversationId')}; staying silent")
+                continue
+            question = extract_note((m.get("uniqueBody") or {}).get("content", ""))
+            if not question:
+                continue
+            if dry_run:
+                outcomes.append({"from": sender, "followup": True,
+                                 "would_answer": question[:200], "dry_run": True})
+                continue
+            try:
+                outcome = _process_followup(m, entry)
+                outcomes.append(outcome)
+                # Re-read before writing: a link message processed earlier in
+                # THIS scan may have cached a conversation via remember_thread,
+                # which writes straight to disk -- saving the top-of-run snapshot
+                # back wholesale would drop it.
+                threads = _prune_threads(_load_threads())
+                entry = threads.get(m["conversationId"]) or entry
+                entry["questions"] = _as_int(entry.get("questions")) + 1
+                entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+                threads[m["conversationId"]] = entry
+                _save_threads(threads)
+                processed.add(mid)
+                _persist_processed(store, processed, dry_run)
+                if outcome.get("replied"):
+                    replied += 1
+            except Exception as e:
+                logger.error(f"[xte] follow-up failed for {sender}: {e}", exc_info=True)
+                outcomes.append({"from": sender, "followup": True, "replied": False,
+                                 "error": f"{type(e).__name__}: {e}"})
+            continue
+
+        if not eligible:
+            logger.info(f"[xte] ignoring media-link mail from external sender {sender}")
             processed.add(mid)  # do not reconsider every run
+            continue
+
+        # Loop breaker on the LINK path too. is_auto_reply used to guard only
+        # the follow-up path, so an autoresponder whose template carries a media
+        # link bypassed BOTH breakers and earned a reply -- which the
+        # autoresponder answers, forever. Marked processed so it is not
+        # re-evaluated on every scan.
+        if is_auto_reply(m):
+            logger.info(f"[xte] skipping autoresponder carrying a media link from {sender}")
+            processed.add(mid)
             continue
 
         if dry_run:
             outcomes.append({"from": sender, "subject": m.get("subject") or "",
-                             "would_transcribe": links[:XTE_MAX_LINKS], "dry_run": True})
+                             "would_transcribe": [u for u, _ in links[:XTE_MAX_LINKS]], "dry_run": True})
             continue
 
         try:
             outcomes.append(_process_message(m))
             processed.add(mid)
+            _persist_processed(store, processed, dry_run)
             replied += 1
         except Exception as e:
             # Reply/transcribe failed at the message level -> do NOT mark processed
@@ -400,9 +1049,9 @@ def run(dry_run: bool = False, limit: int = None) -> dict:
             outcomes.append({"from": sender, "subject": m.get("subject") or "",
                              "replied": False, "error": f"{type(e).__name__}: {e}"})
 
-    if not dry_run:
-        store["processed_ids"] = sorted(processed)[-1000:]
-        _save(store)
+    # End-of-loop save also captures the ids added by the gating branches
+    # (external sender, autoresponder), which need no incremental write.
+    _persist_processed(store, processed, dry_run)
 
     result = {"status": "ok", "dry_run": dry_run, "scanned": len(messages),
               "replied": replied, "outcomes": outcomes,

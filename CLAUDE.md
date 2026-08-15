@@ -145,7 +145,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/learn/stt-replay` | Manual X-video STT replay (`?dry_run=&sync=&send_email=`); reads `/data/learn_pending_stt.json` |
 | `/fyi/run` | Manual FYI Triage run; DRY by default (`?days=N&live=1&backlog=&force=&sync=&email=`) |
 | `/fyi/status` | Last FYI Triage run outcome (scanned/important/moved + per-message decisions) + heartbeat + `fyi_live_env` |
-| `/transcribe-email/run` | Email-to-transcript: scan Sara's inbox for team mail with x.com links, reply with transcript+summary (`?dry_run=&sync=&limit=`) |
+| `/transcribe-email/run` | Email-to-transcript: scan Sara's inbox for team mail with x.com/YouTube links, reply with transcript+summary (`?dry_run=&sync=&limit=`) |
 | `/transcribe-email/status` | Last x-transcribe-email scan outcome (scanned/replied + per-message links) |
 
 ## Architecture Notes
@@ -163,7 +163,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Daily Pipeline Digest:** daily 06:45 IST (03:45 UTC), compiles every change + new activity in the NL 2026 Fundraise HubSpot pipeline over the trailing window (default 24h, resilient to missed runs), narrates deltas rather than state, applies Negev operating rules (stale-deal / overdue-task / wire-watch flags), and emails Ken a single morning brief (`daily_pipeline_digest.py`). See the daily-pipeline-digest Module section.
 - **Read/Learn Digest:** Friday 06:00 Asia/Jerusalem, drains Ken's Outlook "read/learn" folder, resolves each saved link, Opus cluster+curate against a Ken's-needs profile, emails one HTML digest + creates Asana keeper tasks (`learn_digest.py`). See the Read/Learn Digest Module section.
 - **FYI Triage:** daily 06:00 Asia/Jerusalem, scans the two high-volume auto-filed folders "4: notification" + "8: marketing", classifies each message IMPORTANT vs NOISE with Sonnet (reading the body, not just the from-address), and MOVES the important ones to "2: FYI". Dual-gated (`?live=1` AND env `FYI_LIVE=1`) -- ships DRY, auto-promotes to live once Ken sets `FYI_LIVE` (`fyi_triage.py`). See the FYI Triage Module section + ROLLOUT.md.
-- **X-transcribe-email:** any internal teammate emails Sara (`sara@palomar-labs.com`) an x.com/twitter.com post link; a 15-min inbox scan transcribes each X video (reuses `learn_digest.extract_x_post_audio` + `_grok_stt_from_file`), summarizes with Claude, and REPLIES to the sender with a structured summary in the body + the full transcript as a `.md` attachment per link (`x_transcribe_email.py`). See the x-transcribe-email Module section.
+- **X-transcribe-email:** any internal teammate emails Sara (`sara@palomar-labs.com`) an x.com/twitter.com or youtube.com/youtu.be link to a single post/video (a podcast episode link is detected too and reported unsupported; a container URL -- channel, profile, playlist, show -- is not a request at all); a 15-min inbox scan transcribes each video (YouTube captions first, falling back to yt-dlp + Grok STT; X always via yt-dlp + Grok STT), summarizes with Claude, and REPLIES in-thread (Graph `createReply`) with a structured summary in the body + the full transcript as a `.md` attachment per link. A question asked alongside the link, or a link-free follow-up reply in an already-transcribed conversation, is answered from the cached transcript (`x_transcribe_email.py`). See the x-transcribe-email Module section.
 
 ## email-pipeline-sync Module
 
@@ -358,26 +358,95 @@ html_to_text), the Claude client, the send-email path, the Pulse-style atomic
 
 ## x-transcribe-email Module
 
-Standalone module (`x_transcribe_email.py`) -- lets any internal teammate get an X-video
-transcript by emailing Sara a link. Imported lazily by app.py (route + cron handlers only),
-never at module load. Reuses deployed machinery, no duplication: `email_pipeline_sync` Graph
-helpers (app-only token, graph_get / graph_post, html_to_text); `learn_digest`
-`extract_x_post_audio` + `_grok_stt_from_file` (the 2.22.0 STT path) + `_call_claude_text` +
-`SUMMARY_MODEL`; `config.is_internal_email` (the team allow-list).
+Standalone module (`x_transcribe_email.py`) -- lets any internal teammate get an X or YouTube
+video transcript, and ask follow-up questions about it, by emailing Sara a link. Imported
+lazily by app.py (route + cron handlers only), never at module load. Reuses deployed
+machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, `graph_get` /
+`graph_post` / `graph_patch` / `graph_delete`, `html_to_text`); `learn_digest`
+`extract_x_post_audio` + `_grok_stt_from_file` (the 2.22.0 STT path) + `_fetch_youtube_transcript`
++ `_call_claude_text` + `SUMMARY_MODEL`; `config.is_internal_email` (the team allow-list).
 
-- **Trigger:** any inbox message from an INTERNAL sender carrying an x.com/twitter.com
-  link (any content link, not just /status/; only the bare domain + nav pages are ignored).
-  Links are read from `uniqueBody` ONLY, so a link quoted in a reply's thread history never
-  re-fires. A link with no downloadable video still earns an honest "no video found" reply.
-- **Flow:** per link -> `extract_x_post_audio` (yt-dlp+ffmpeg, 60-min cap) ->
-  `_grok_stt_from_file` (xAI Grok STT) -> Claude summary (TITLE/TL;DR/KEY POINTS/NOTABLE
-  QUOTES) -> reply to the sender via `sendMail` with the summary in the HTML body + one `.md`
-  transcript attachment per link. A link that cannot be transcribed is reported honestly in
-  the reply (specific reason), never faked.
+- **Trigger:** any inbox message from an INTERNAL sender (or `XTE_TEAM_EXTRA`) carrying an
+  x.com/twitter.com or youtube.com/youtu.be link to a single ITEM. A **container** URL --
+  one naming a channel, profile, playlist or show rather than one item -- is NOT a request
+  and yields no entry at all, exactly like an article URL (`_is_container_url`): an X path
+  naming no item (profiles, the bare domain, nav pages), a YouTube URL with neither a
+  parseable video id nor a `/clip/<id>` (`@handle`, `/c/`, `/user/`, `/channel/`,
+  `/playlist?list=`), and a podcast `/show/` or `/playlist/` page. That REVERSES the original
+  "any X link earns an honest no-video reply" rule -- ordinary mail and follow-up questions
+  pass through this same gate, Sara's inbox is SHARED with `sara_corrections.py`, and a
+  container URL can never be cached, so a signature link dropped the question and sent an
+  unsolicited reply. ITEM is deliberately wider than "post or watch id": `/status/<id>`,
+  `/i/spaces/<id>` and `/i/broadcasts/<id>` are X items (`_x_item_id`), a YouTube
+  `/clip/<id>` is an item (`_youtube_clip_id` -- a clip URL carries no watch id, so its id is
+  namespaced `youtube:clip:` in `_link_key` and `clip_` in the attachment name), and a
+  podcast `/episode/` is an item: all reach the resolvers and produce a transcript or an
+  honest failure, never silence. The podcast container regex is Spotify path-shaped, so a
+  SHOW page on Apple / anchor.fm / pod.link / overcast / castbox / podbean is still detected
+  as an item and answered "not supported yet" -- accepted deliberately (a per-host regex
+  would rot). Links are read from `uniqueBody` ONLY, so
+  a link quoted in a reply's thread history never re-fires. An ITEM link with no downloadable
+  video still earns an honest "no video found" reply. A reply in a conversation Sara already
+  transcribed is treated as a follow-up question unless it adds a **transcribable** (`x` /
+  `youtube`) link that conversation has NOT already transcribed (`_has_new_link`, compared on
+  the normalized `_link_key` so `youtu.be/ID` matches a cached `youtube.com/watch?v=ID`) --
+  `uniqueBody` strips quoted history but KEEPS the sender's SIGNATURE, so a signature link
+  would otherwise hijack the follow-up path: the question dropped, an unsolicited failure
+  reply sent (see State). The container rule covers the common signature link (channel /
+  profile / Spotify show); `_has_new_link` covers the rest -- a signature link to a real ITEM
+  this conversation already transcribed, and ANY podcast link (a podcast never transcribes,
+  so it can never be cached; letting it count would drop every follow-up in that conversation
+  forever). With no cached conversation the follow-up branch is not taken at all, so a
+  podcast-only email still gets its honest unsupported reply.
+- **Flow:** per link, `transcribe_link` dispatches by kind -- YouTube tries captions first
+  (`_fetch_youtube_transcript`, fast and free) and falls back to the same yt-dlp + Grok STT
+  path as X only when there are none, but a YouTube URL naming no single video (channel /
+  playlist / `@handle`) is refused up front and NEVER reaches yt-dlp (a channel has no
+  duration for the cap to bound, and the download thread is a daemon that outlives its join)
+  -- defense in depth, since detection now drops those before the scan gets here. A
+  `/clip/<id>` is NOT refused: yt-dlp can fetch a clip, so it skips straight to the audio path
+  (captions are keyed by watch id, which a clip URL does not carry, so that lookup returns
+  None). Every YouTube WATCH id in this module comes from ONE local resolver, `_youtube_id`:
+  it delegates to the shared `ld._youtube_video_id` and additionally recognizes `/live/<id>`
+  (the address-bar form for livestreams and premieres) and the legacy `/v/<id>`, which that
+  regex does not cover; a clip id comes from `_youtube_clip_id` and is kept separate so it can
+  never collide with a watch id.
+  `learn_digest` is shared with the Read/Learn digest and is deliberately NOT widened;
+  podcast returns `PODCAST_UNSUPPORTED` without calling
+  any resolver -- then a Claude summary (TITLE/TL;DR/KEY POINTS/NOTABLE QUOTES) goes out via
+  `send_threaded_reply` with the transcript(s) attached as `.md` (the attachment header records
+  the real source, "YouTube captions" or "xAI Grok STT"). A note asked alongside the link
+  (`extract_note`) is answered first on an `ANSWER:` line grounded only in the transcript, when
+  the model judges it is actually a question -- no heuristic decides this. A later link-free
+  reply in that conversation is answered from the cached transcript (`answer_question`, one
+  Claude call, no re-transcription) unless the model judges the note is not a question either
+  (see Safety). A link that cannot be transcribed is reported honestly in the reply (specific
+  reason), never faked.
 - **Safety:** Sara's own outbound is skipped (loop guard); external senders are ignored (and
   marked processed so they are not reconsidered); per-email link cap `XTE_MAX_LINKS` (default
-  5). Idempotent via processed message-ids at `/data/x_transcribe_email.json`; a reply-send
-  failure is NOT marked processed so it retries. Status at `/data/x_transcribe_email_status.json`.
+  5). Replies go out via Graph `createReply` (never `sendMail`) so the reply inherits
+  `conversationId` -- the match the follow-up path depends on. Two loop breakers guard BOTH
+  paths: `is_auto_reply` skips a message carrying an autoresponder header (`Auto-Submitted`,
+  `X-Autoreply`/`X-Autorespond`/`X-Autoresponder`, or
+  `Precedence: bulk/auto_reply/auto-reply/junk`) -- checked on the LINK path too, where such a
+  message is marked processed so it is not re-evaluated every scan, since an autoresponder
+  whose template carries a media link would otherwise bypass both breakers -- and
+  `XTE_THREAD_MAX_QUESTIONS` (default 20) caps follow-ups per conversation -- at the cap Sara
+  goes silent on purpose, since a "limit reached" reply would itself feed the loop. A follow-up
+  the model judges is not actually a question (returns the `NO_QUESTION` marker -- a thank-you,
+  acknowledgement, or forwarded boilerplate) gets no reply either, but the conversation's
+  `questions` counter still increments, so the same cap bounds Claude spend as well as replies.
+  Idempotent via processed message-ids at `/data/x_transcribe_email.json`; a reply-send failure
+  is NOT marked processed so it retries. That retry rule cuts both ways, so NOTHING after the
+  send may raise: the `remember_thread` cache write is wrapped, persisted counters are read
+  through `_as_int`, and ids are persisted after EACH reply (`_persist_processed`), not only at
+  the end of the scan -- otherwise one post-send exception, or a restart mid-scan, re-sends a
+  delivered reply every 15 minutes. Status at `/data/x_transcribe_email_status.json`.
+- **State:** per-conversation transcript cache at `/data/x_transcribe_threads.json`, keyed on
+  `conversationId`, written by `remember_thread` only when at least one link in the message
+  transcribed successfully (nothing cached means nothing to answer a follow-up from). Evicted
+  by `XTE_THREAD_TTL_DAYS` (default 30), then capped at `XTE_THREAD_MAX` (default 200)
+  newest-by-`updated_at` entries.
 - **Scheduler:** every 15 min (`XTE_INTERVAL_MINUTES`) via APScheduler (`x_transcribe_email_run`),
   sharing `_xte_trigger_lock` with the manual route so a scheduled scan never overlaps
   `/transcribe-email/run`. CLI: `python x_transcribe_email.py [--dry-run] [--limit N]`.
@@ -401,7 +470,12 @@ helpers (app-only token, graph_get / graph_post, html_to_text); `learn_digest`
 | X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
 | Read/Learn digest silently empty ("no unread items") | Saved items are forwarded-to-self and arrive READ; pre-2.23.0 runs were unread-only and skipped them | Fixed @2.23.0: normal runs use a trailing `LEARN_LOOKBACK_DAYS` window, read/unread agnostic. For older-than-window backlog use `/learn/run?backlog=1` |
 | Read/Learn X-video shows "content not retrieved" / STT never arrives | Post has no NATIVE downloadable video (Grok VIDEO_WITH_AUDIO over-fired), or video > 60-min cap; yt-dlp can't fetch it | Expected for those posts -- @2.25.0 the digest now surfaces Grok's visual/text summary (prefixed `[x-video audio pending STT replay]`) instead of discarding it; unfetchable entries cycle to `failed` after 3 attempts. Only genuinely-short native X clips transcribe |
-| Email-to-transcript never replies | Sender not on an internal domain, or no x.com link in the new (unquoted) body | Send from an `INTERNAL_DOMAINS` address with an x.com link in the body (not just quoted); a link with no video still gets a "no video found" reply. Check `/transcribe-email/status` |
+| Email-to-transcript never replies | Sender not on an internal domain, or no x.com/YouTube ITEM link in the new (unquoted) body -- a container URL (channel / profile / playlist / Spotify show) is not a request | Send from an `INTERNAL_DOMAINS` address with a link to one post, Space, broadcast, video or clip in the body (not just quoted); an ITEM link with no video still gets a "no video found" reply. Check `/transcribe-email/status` |
+| Follow-up question gets no reply | The reply landed in a different Exchange conversation, or the first run's transcripts were never cached (every link failed) | Replies must be sent via `createReply` so `conversationId` is inherited; check `/data/x_transcribe_threads.json` for the conversation |
+| Spotify link replies "not supported yet" | By design -- podcast audio is DRM'd, yt-dlp cannot fetch it and `_fetch_spoken` has no key and an unvalidated request shape | Expected. Deferred work, not a bug |
+| Sara keeps replying to an autoresponder | Autoresponder sends no `Auto-Submitted`/`Precedence` header | `is_auto_reply` guards BOTH paths (a media link in the autoresponder's template no longer bypasses it), and the per-conversation cap `XTE_THREAD_MAX_QUESTIONS` stops a header-less one after 20 and goes silent; lower it if needed |
+| Follow-up question gets a transcription reply instead of an answer | A link in the sender's signature made the message look like a new request -- `uniqueBody` strips quoted history but KEEPS signatures | Two guards. A CONTAINER link (channel / profile / Spotify show) is not a request at all, so a signature carrying one is inert; and no podcast link of any host ever counts as a new request. What still reads as new is a signature link to a real TRANSCRIBABLE ITEM (X post / Space / broadcast, YouTube video or clip) Sara has never transcribed -- transcribe it once, or drop it from the signature |
+| Channel / profile / playlist / Spotify-show link gets no reply at all | By design -- a container URL is not a transcription request (`_is_container_url`), so the message is left for other handlers exactly like an article link | Send the link to ONE post or video. Reversed the old "any X link earns an honest no-video reply" rule: ordinary mail and follow-ups share this gate, and a container can never be cached, so it could never self-heal. NOT containers (these do get a reply): `/i/spaces/<id>`, `/i/broadcasts/<id>`, `youtube.com/clip/<id>`. A podcast `/episode/` or a show page on a non-Spotify host is ALSO detected and answered -- but ONLY in a conversation Sara has not already cached: once this conversation has a cached transcript, a podcast link no longer counts as a request at all (`_has_new_link`), so a podcast-only message gets no reply, and a podcast link plus words answers the PREVIOUSLY transcribed video, never mentioning that podcasts are unsupported |
 
 ## Environment Variables (Railway)
 
@@ -411,7 +485,7 @@ Read/Learn: optional `LEARN_LOOKBACK_DAYS` (trailing window for normal/cron runs
 
 FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY` / `FYI_BROADCAST_DOMAINS` (broker/ESP blast domains -> deterministic NOISE) / `FYI_HELD_DOMAINS` + `FYI_HELD_NAMES` (tracked holdings -> material IR is deterministic IMPORTANT) and `INTERNAL_DOMAINS` (own-outbound -> deterministic NOISE).
 
-x-transcribe-email: reuses `BOT_SENDER_EMAIL` (Sara's mailbox), `XAI_API_KEY` (STT), `CLAUDE_API_KEY` (summary), `INTERNAL_DOMAINS` (sender allow-list); optional `XTE_INTERVAL_MINUTES` (scan cadence, default 15), `XTE_MAX_MESSAGES` (scan window, default 25), `XTE_MAX_LINKS` (per-email cap, default 5), `XTE_SUMMARY_MODEL`.
+x-transcribe-email: reuses `BOT_SENDER_EMAIL` (Sara's mailbox), `XAI_API_KEY` (STT), `CLAUDE_API_KEY` (summary), `INTERNAL_DOMAINS` (sender allow-list); optional `XTE_TEAM_EXTRA` (extra served addresses beyond INTERNAL_DOMAINS, comma-separated, default empty), `XTE_INTERVAL_MINUTES` (scan cadence, default 15), `XTE_MAX_MESSAGES` (scan window, default 25), `XTE_MAX_LINKS` (per-email cap, default 5), `XTE_SUMMARY_MODEL`, `XTE_THREAD_TTL_DAYS` (follow-up transcript cache eviction, default 30), `XTE_THREAD_MAX` (cached-conversation cap, default 200), `XTE_THREAD_MAX_QUESTIONS` (per-conversation follow-up loop breaker, default 20).
 
 ## Current Known Issues
 

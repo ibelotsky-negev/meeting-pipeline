@@ -175,6 +175,18 @@ def graph_post(url: str, json_body: dict) -> dict:
     return resp.json() if resp.content else {}
 
 
+def graph_patch(url: str, json_body: dict) -> dict:
+    headers = {"Authorization": f"Bearer {get_graph_token()}", "Content-Type": "application/json"}
+    resp = _request_with_retry("PATCH", url, headers, json_body)
+    return resp.json() if resp.content else {}
+
+
+def graph_delete(url: str) -> dict:
+    headers = {"Authorization": f"Bearer {get_graph_token()}"}
+    resp = _request_with_retry("DELETE", url, headers)
+    return resp.json() if resp.content else {}
+
+
 # ======================================================================
 #  RUN LEDGER (SQLite)
 # ======================================================================
