@@ -1503,8 +1503,19 @@ class TestTransientClassification:
             assert not ld._is_transient_yt_error(_named_lib_error(name)("x")), name
 
     def test_network_errors_outside_the_library_are_transient(self):
+        import requests
         assert ld._is_transient_yt_error(TimeoutError("read timed out"))
         assert ld._is_transient_yt_error(ConnectionError("dns"))
+        assert ld._is_transient_yt_error(OSError("socket"))
+        assert ld._is_transient_yt_error(requests.RequestException("boom"))
+
+    def test_unrecognized_exceptions_are_permanent_not_retried(self):
+        """A code-level break is deterministic -- retrying it just multiplies a
+        guaranteed failure. The 0.6.2 incident raised a bare Exception for EVERY
+        video; that must fail fast, not three times per video."""
+        assert not ld._is_transient_yt_error(Exception("no element found: line 1, column 0"))
+        assert not ld._is_transient_yt_error(AttributeError("fetch"))
+        assert not ld._is_transient_yt_error(TypeError("bad arg"))
 
 
 class TestCaptionRetry:
@@ -1530,11 +1541,20 @@ class TestCaptionRetry:
         return Api, calls
 
     def test_transient_failure_is_retried_and_succeeds(self, monkeypatch):
+        monkeypatch.setattr(ld, "LEARN_YT_ATTEMPTS", 3)
         Api, calls = self._api_failing_then(2, _named_lib_error("RequestBlocked")("429"))
         _install_fake_yta(monkeypatch, Api)
         text, err = ld.fetch_youtube_transcript(self._URL)
         assert text == "ok" and err == ""
         assert calls["n"] == 3  # two failures then success
+
+    def test_unrecognized_exception_fails_fast(self, monkeypatch):
+        """The 0.6.2 breakage shape. Deterministic, so one attempt only."""
+        Api, calls = self._api_failing_then(99, Exception("no element found: line 1, column 0"))
+        _install_fake_yta(monkeypatch, Api)
+        text, err = ld.fetch_youtube_transcript(self._URL)
+        assert text is None and err == ""
+        assert calls["n"] == 1
 
     def test_permanent_failure_is_not_retried(self, monkeypatch):
         Api, calls = self._api_failing_then(99, _named_lib_error("TranscriptsDisabled")("off"))

@@ -677,12 +677,19 @@ LEARN_YT_RETRY_WAIT = float(os.environ.get("LEARN_YT_RETRY_WAIT", "2"))
 
 
 def _is_transient_yt_error(exc) -> bool:
-    """True when another attempt could plausibly succeed."""
+    """True when another attempt could plausibly succeed.
+
+    Anything not recognized here is treated as PERMANENT on purpose. An earlier
+    draft retried every non-library exception as "probably network", which would
+    have quietly retried a code-level break three times per video: when the 0.6.2
+    pin broke against YouTube's response format it raised a bare
+    Exception("no element found: line 1, column 0") for EVERY video, and retrying
+    that just multiplies a deterministic failure across a whole batch."""
     if type(exc).__name__ in _YT_TRANSIENT_ERRORS:
         return True
-    if type(exc).__module__.split(".")[0] == "youtube_transcript_api":
-        return False  # a named, permanent library error
-    return True  # network / timeout / DNS -- worth another try
+    # OSError covers TimeoutError, ConnectionError and socket errors; requests
+    # raises its own family below the library's wrapping.
+    return isinstance(exc, (OSError, requests.RequestException))
 
 
 def fetch_youtube_transcript(url: str):

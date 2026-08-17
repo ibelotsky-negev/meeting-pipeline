@@ -301,7 +301,8 @@ class TestTranscribeLink:
     def test_transient_caption_error_beats_the_audio_error(self, monkeypatch, tmp_path):
         """The bug a real user hit: captions were rate-limited, the audio path
         then failed on the duration cap, and the reply blamed the video's LENGTH
-        -- so they concluded there was an hour limit. The captions reason must win."""
+        -- so they concluded there was an hour limit. The captions reason must win
+        in what the USER reads, while the audio detail survives for debugging."""
         monkeypatch.setattr(ld, "fetch_youtube_transcript",
                             lambda u: (None, "captions fetch failed (temporary): RequestBlocked"))
         monkeypatch.setattr(ld, "extract_x_post_audio",
@@ -310,7 +311,22 @@ class TestTranscribeLink:
         r = xte.transcribe_link(_YT_VIDEO, "youtube")
         assert not r["ok"]
         assert "captions fetch failed (temporary)" in r["error"]
-        assert "exceeds cap" not in r["error"]
+        assert "exceeds cap" in r["error"]          # kept for /status and logs
+        shown = xte._failure_message(r["error"])
+        assert "not a length limit" in shown        # what the user actually reads
+        assert "exceeds cap" not in shown
+        assert "5940" not in shown
+
+    def test_transient_caption_error_never_touches_a_successful_audio_result(
+            self, monkeypatch, tmp_path):
+        """The override is guarded on failure. A transient captions blip followed
+        by a working STT run must return the transcript untouched."""
+        monkeypatch.setattr(ld, "fetch_youtube_transcript",
+                            lambda u: (None, "captions fetch failed (temporary): IpBlocked"))
+        self._audio_ok(monkeypatch, tmp_path, text="spoken words")
+        r = xte.transcribe_link(_YT_VIDEO, "youtube")
+        assert r["ok"] and r["transcript"] == "spoken words"
+        assert r["error"] == ""
 
     def test_genuine_no_captions_keeps_the_audio_error(self, monkeypatch, tmp_path):
         """A video that truly has no captions SHOULD report the audio failure --
