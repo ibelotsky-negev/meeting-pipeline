@@ -1369,6 +1369,12 @@ def _install_fake_yta(monkeypatch, api_cls):
 class TestFetchYoutubeTranscript:
     _URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch):
+        """Transient failures retry with a real sleep in production. Tests must
+        exercise the retry path without paying for it."""
+        monkeypatch.setattr(ld, "LEARN_YT_RETRY_WAIT", 0)
+
     def test_modern_1x_instance_api_with_snippet_objects(self, monkeypatch):
         _install_fake_yta(monkeypatch,
                           _api_with_tracks(_Track("en", True, ["hello", "world"])))
@@ -1464,3 +1470,97 @@ class TestFetchYoutubeTranscript:
 
         _install_fake_yta(monkeypatch, ApiNever)
         assert ld._fetch_youtube_transcript("https://www.youtube.com/@somechannel") is None
+
+
+# ----------------------------------------------------------------------
+#  Transient-vs-permanent caption failures
+#
+#  A rate-limited fetch used to be indistinguishable from "this video has no
+#  captions": both returned None, the caller fell through to yt-dlp, and the
+#  reply carried whatever THAT failed with -- usually "duration exceeds cap".
+#  A real user read that and concluded there was an hour limit on videos.
+# ----------------------------------------------------------------------
+
+class _LibError(Exception):
+    """Stand-in for a youtube_transcript_api exception: what matters to the
+    classifier is the class name and its defining module."""
+    __module__ = "youtube_transcript_api._errors"
+
+
+def _named_lib_error(name):
+    return type(name, (_LibError,), {"__module__": "youtube_transcript_api._errors"})
+
+
+class TestTransientClassification:
+    def test_rate_limit_and_request_errors_are_transient(self):
+        for name in ("RequestBlocked", "IpBlocked", "YouTubeRequestFailed",
+                     "YouTubeDataUnparsable"):
+            assert ld._is_transient_yt_error(_named_lib_error(name)("x")), name
+
+    def test_settled_facts_about_the_video_are_permanent(self):
+        for name in ("TranscriptsDisabled", "VideoUnavailable", "InvalidVideoId",
+                     "AgeRestricted", "NoTranscriptFound"):
+            assert not ld._is_transient_yt_error(_named_lib_error(name)("x")), name
+
+    def test_network_errors_outside_the_library_are_transient(self):
+        assert ld._is_transient_yt_error(TimeoutError("read timed out"))
+        assert ld._is_transient_yt_error(ConnectionError("dns"))
+
+
+class TestCaptionRetry:
+    _URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch):
+        monkeypatch.setattr(ld, "LEARN_YT_RETRY_WAIT", 0)
+
+    def _api_failing_then(self, fails, exc, texts=("ok",)):
+        calls = {"n": 0}
+
+        class Api:
+            def list(self, vid):
+                calls["n"] += 1
+                if calls["n"] <= fails:
+                    raise exc
+                return [_Track("en", True, list(texts))]
+
+            def fetch(self, vid):
+                raise AssertionError("must go through list()")
+
+        return Api, calls
+
+    def test_transient_failure_is_retried_and_succeeds(self, monkeypatch):
+        Api, calls = self._api_failing_then(2, _named_lib_error("RequestBlocked")("429"))
+        _install_fake_yta(monkeypatch, Api)
+        text, err = ld.fetch_youtube_transcript(self._URL)
+        assert text == "ok" and err == ""
+        assert calls["n"] == 3  # two failures then success
+
+    def test_permanent_failure_is_not_retried(self, monkeypatch):
+        Api, calls = self._api_failing_then(99, _named_lib_error("TranscriptsDisabled")("off"))
+        _install_fake_yta(monkeypatch, Api)
+        text, err = ld.fetch_youtube_transcript(self._URL)
+        assert text is None
+        assert err == ""          # not transient -> caller uses its audio fallback
+        assert calls["n"] == 1    # fail fast, do not waste the caller's time
+
+    def test_exhausted_retries_report_a_transient_reason(self, monkeypatch):
+        Api, calls = self._api_failing_then(99, _named_lib_error("IpBlocked")("blocked"))
+        _install_fake_yta(monkeypatch, Api)
+        text, err = ld.fetch_youtube_transcript(self._URL)
+        assert text is None
+        assert "captions fetch failed (temporary)" in err
+        assert "IpBlocked" in err
+        assert calls["n"] == ld.LEARN_YT_ATTEMPTS
+
+    def test_success_first_try_reports_no_error(self, monkeypatch):
+        _install_fake_yta(monkeypatch, _api_with_tracks(_Track("ru", True, ["privet"])))
+        assert ld.fetch_youtube_transcript(self._URL) == ("privet", "")
+
+    def test_video_without_captions_is_not_an_error(self, monkeypatch):
+        _install_fake_yta(monkeypatch, _api_with_tracks())
+        assert ld.fetch_youtube_transcript(self._URL) == (None, "")
+
+    def test_text_only_wrapper_still_returns_a_string(self, monkeypatch):
+        _install_fake_yta(monkeypatch, _api_with_tracks(_Track("en", True, ["hi"])))
+        assert ld._fetch_youtube_transcript(self._URL) == "hi"

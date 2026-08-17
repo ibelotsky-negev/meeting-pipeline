@@ -665,8 +665,39 @@ def _fetch_transcript_any_language(api, vid: str):
     return chosen.fetch()
 
 
-def _fetch_youtube_transcript(url: str):
-    """Primary YouTube resolver: youtube-transcript-api. Lazy import.
+# Library errors worth another attempt: YouTube rate-limiting or blocking this
+# IP, a failed HTTP request, an unparsable response. Everything else the library
+# raises (captions disabled, video unavailable, bad id, age-restricted) is a
+# settled fact about the video -- retrying only delays the caller.
+_YT_TRANSIENT_ERRORS = (
+    "RequestBlocked", "IpBlocked", "YouTubeRequestFailed", "YouTubeDataUnparsable",
+)
+LEARN_YT_ATTEMPTS = int(os.environ.get("LEARN_YT_ATTEMPTS", "3"))
+LEARN_YT_RETRY_WAIT = float(os.environ.get("LEARN_YT_RETRY_WAIT", "2"))
+
+
+def _is_transient_yt_error(exc) -> bool:
+    """True when another attempt could plausibly succeed."""
+    if type(exc).__name__ in _YT_TRANSIENT_ERRORS:
+        return True
+    if type(exc).__module__.split(".")[0] == "youtube_transcript_api":
+        return False  # a named, permanent library error
+    return True  # network / timeout / DNS -- worth another try
+
+
+def fetch_youtube_transcript(url: str):
+    """Primary YouTube resolver. Returns (text, transient_error).
+
+    - success            -> (text, "")
+    - no captions exist  -> (None, "")   caller should try its audio fallback
+    - transient failure  -> (None, reason)
+
+    `transient_error` is non-empty ONLY when captions might well exist and
+    YouTube simply would not hand them over right now. That distinction is the
+    point of this function: a rate-limited fetch used to be indistinguishable
+    from "this video has no captions", so the caller fell through to yt-dlp and
+    reported whatever THAT failed with -- usually the duration cap -- which sent
+    users chasing an imaginary length limit.
 
     Handles BOTH library generations, because the API changed incompatibly at
     1.0 and the pin was raised 0.6.2 -> 1.2.4:
@@ -679,29 +710,47 @@ def _fetch_youtube_transcript(url: str):
     degrades to the yt-dlp fallback instead of failing in a confusing way."""
     vid = _youtube_video_id(url)
     if not vid:
-        return None
+        return None, ""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
     except Exception:
         logger.info("[learn] youtube-transcript-api not available; will fall back")
-        return None
-    try:
-        if hasattr(YouTubeTranscriptApi, "fetch"):
-            chunks = _fetch_transcript_any_language(YouTubeTranscriptApi(), vid)
-        else:
-            chunks = YouTubeTranscriptApi.get_transcript(vid)
-        parts = []
-        for c in (chunks or []):
-            piece = getattr(c, "text", None)
-            if piece is None and isinstance(c, dict):
-                piece = c.get("text", "")
-            if piece:
-                parts.append(piece)
-        text = " ".join(parts)
-        return text or None
-    except Exception as e:
-        logger.warning(f"[learn] youtube transcript failed {vid}: {e}")
-        return None
+        return None, ""
+
+    attempts = max(1, LEARN_YT_ATTEMPTS)
+    last_transient = ""
+    for attempt in range(attempts):
+        try:
+            if hasattr(YouTubeTranscriptApi, "fetch"):
+                chunks = _fetch_transcript_any_language(YouTubeTranscriptApi(), vid)
+            else:
+                chunks = YouTubeTranscriptApi.get_transcript(vid)
+            parts = []
+            for c in (chunks or []):
+                piece = getattr(c, "text", None)
+                if piece is None and isinstance(c, dict):
+                    piece = c.get("text", "")
+                if piece:
+                    parts.append(piece)
+            text = " ".join(parts)
+            return (text, "") if text else (None, "")
+        except Exception as e:
+            if not _is_transient_yt_error(e):
+                logger.info(f"[learn] youtube transcript unavailable {vid}: "
+                            f"{type(e).__name__}")
+                return None, ""
+            last_transient = f"captions fetch failed (temporary): {type(e).__name__}"
+            logger.warning(f"[learn] youtube transcript {vid} attempt "
+                           f"{attempt + 1}/{attempts} failed: {type(e).__name__}: {e}")
+            if attempt < attempts - 1:
+                time.sleep(LEARN_YT_RETRY_WAIT * (attempt + 1))
+    return None, last_transient
+
+
+def _fetch_youtube_transcript(url: str):
+    """Text-only wrapper -- keeps resolve_youtube and older callers unchanged."""
+    text, _ = fetch_youtube_transcript(url)
+    return text
 
 
 def _fetch_spoken(url: str):

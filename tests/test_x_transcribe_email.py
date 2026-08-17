@@ -274,7 +274,7 @@ class TestTranscribeLink:
         assert not r["ok"] and "400" in r["error"]
 
     def test_youtube_prefers_captions_and_never_calls_stt(self, monkeypatch):
-        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: "caption text")
+        monkeypatch.setattr(ld, "fetch_youtube_transcript", lambda u: ("caption text", ""))
 
         def _never(*a, **k):
             raise AssertionError("STT must not run when captions exist")
@@ -284,7 +284,7 @@ class TestTranscribeLink:
         assert r["source"] == "YouTube captions"
 
     def test_youtube_falls_back_to_stt_when_no_captions(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: None)
+        monkeypatch.setattr(ld, "fetch_youtube_transcript", lambda u: (None, ""))
         self._audio_ok(monkeypatch, tmp_path, text="spoken words")
         r = xte.transcribe_link(_YT_VIDEO, "youtube")
         assert r["ok"] and r["transcript"] == "spoken words"
@@ -293,16 +293,41 @@ class TestTranscribeLink:
     def test_youtube_caption_error_falls_back_not_crashes(self, monkeypatch, tmp_path):
         def _boom(u):
             raise RuntimeError("captions api down")
-        monkeypatch.setattr(ld, "_fetch_youtube_transcript", _boom)
+        monkeypatch.setattr(ld, "fetch_youtube_transcript", _boom)
         self._audio_ok(monkeypatch, tmp_path, text="spoken words")
         r = xte.transcribe_link(_YT_VIDEO, "youtube")
         assert r["ok"] and r["transcript"] == "spoken words"
+
+    def test_transient_caption_error_beats_the_audio_error(self, monkeypatch, tmp_path):
+        """The bug a real user hit: captions were rate-limited, the audio path
+        then failed on the duration cap, and the reply blamed the video's LENGTH
+        -- so they concluded there was an hour limit. The captions reason must win."""
+        monkeypatch.setattr(ld, "fetch_youtube_transcript",
+                            lambda u: (None, "captions fetch failed (temporary): RequestBlocked"))
+        monkeypatch.setattr(ld, "extract_x_post_audio",
+                            lambda u, timeout=None: (None, 0, "duration 5940s exceeds cap (3600s)",
+                                                     str(tmp_path / "x")))
+        r = xte.transcribe_link(_YT_VIDEO, "youtube")
+        assert not r["ok"]
+        assert "captions fetch failed (temporary)" in r["error"]
+        assert "exceeds cap" not in r["error"]
+
+    def test_genuine_no_captions_keeps_the_audio_error(self, monkeypatch, tmp_path):
+        """A video that truly has no captions SHOULD report the audio failure --
+        the duration cap is the real reason there."""
+        monkeypatch.setattr(ld, "fetch_youtube_transcript", lambda u: (None, ""))
+        monkeypatch.setattr(ld, "extract_x_post_audio",
+                            lambda u, timeout=None: (None, 0, "duration 5940s exceeds cap (3600s)",
+                                                     str(tmp_path / "x")))
+        r = xte.transcribe_link(_YT_VIDEO, "youtube")
+        assert not r["ok"]
+        assert "exceeds cap" in r["error"]
 
     def test_podcast_unsupported_without_calling_any_resolver(self, monkeypatch):
         def _never(*a, **k):
             raise AssertionError("no resolver may run for a podcast link")
         monkeypatch.setattr(ld, "extract_x_post_audio", _never)
-        monkeypatch.setattr(ld, "_fetch_youtube_transcript", _never)
+        monkeypatch.setattr(ld, "fetch_youtube_transcript", _never)
         r = xte.transcribe_link("https://open.spotify.com/episode/xyz", "podcast")
         assert not r["ok"]
         assert "not supported yet" in r["error"]
@@ -1033,8 +1058,8 @@ class TestYouTubeNonVideoLinks:
         called = []
         monkeypatch.setattr(ld, "extract_x_post_audio",
                             lambda u, timeout=None: called.append(u) or (None, 0, "err", None))
-        monkeypatch.setattr(ld, "_fetch_youtube_transcript",
-                            lambda u: called.append(u) or None)
+        monkeypatch.setattr(ld, "fetch_youtube_transcript",
+                            lambda u: called.append(u) or (None, ""))
         r = xte.transcribe_link(url, "youtube")
         assert called == []                      # resolver never invoked
         assert not r["ok"]
@@ -1042,7 +1067,7 @@ class TestYouTubeNonVideoLinks:
         assert "channel or playlist" in xte._failure_message(r["error"])
 
     def test_a_real_video_url_still_reaches_the_resolvers(self, monkeypatch):
-        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: "caption text")
+        monkeypatch.setattr(ld, "fetch_youtube_transcript", lambda u: ("caption text", ""))
         r = xte.transcribe_link("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube")
         assert r["ok"] and r["transcript"] == "caption text"
 
@@ -1331,7 +1356,7 @@ class TestYouTubeLiveAndLegacyForms:
 
     @pytest.mark.parametrize("url", [LIVE, LEGACY])
     def test_reaches_the_transcription_path(self, monkeypatch, url):
-        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: "caption text")
+        monkeypatch.setattr(ld, "fetch_youtube_transcript", lambda u: ("caption text", ""))
         r = xte.transcribe_link(url, "youtube")
         assert r["ok"] and r["transcript"] == "caption text"
 
@@ -1346,7 +1371,7 @@ class TestYouTubeLiveAndLegacyForms:
                 == xte._link_key("https://www.youtube.com/watch?v=dQw4w9WgXcQ"))
 
     def test_live_url_transcribes_end_to_end(self, xte_files, monkeypatch):
-        monkeypatch.setattr(ld, "_fetch_youtube_transcript", lambda u: "live caption text")
+        monkeypatch.setattr(ld, "fetch_youtube_transcript", lambda u: ("live caption text", ""))
         monkeypatch.setattr(xte, "summarize_transcript",
                             lambda u, t, note="": "TITLE: Stream\nTL;DR: ok")
         _mock_inbox(monkeypatch, [_msg("lv1", "bk@negevlabs.com", "stream", self.LIVE)])
