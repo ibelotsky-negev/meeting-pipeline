@@ -18,7 +18,7 @@ Reuses existing, deployed machinery -- single source of truth, no duplication:
 - email_pipeline_sync (eps): Graph app-only token, graph_get / graph_post /
   graph_patch / graph_delete, html_to_text.
 - learn_digest (ld): extract_urls, classify_url, _normalize_x_url,
-  _youtube_video_id, _fetch_youtube_transcript, extract_x_post_audio,
+  _youtube_video_id, fetch_youtube_transcript, extract_x_post_audio,
   _grok_stt_from_file, _call_claude_text, SUMMARY_MODEL (the 2.22.0 STT path).
 - config.is_internal_email: the team allow-list.
 
@@ -578,14 +578,30 @@ def transcribe_link(url: str, kind: str = "x") -> dict:
                     "error": "that YouTube link points to a channel or playlist, "
                              "not a single video",
                     "transcript": "", "chars": 0, "source": ""}
+        captions, captions_err = "", ""
         try:
-            captions = ld._fetch_youtube_transcript(url)
+            captions, captions_err = ld.fetch_youtube_transcript(url)
         except Exception as e:
             logger.warning(f"[xte] youtube captions failed {url[:70]}: {e}")
-            captions = None
         if captions:
             return {"url": url, "ok": True, "error": "", "transcript": captions,
                     "chars": len(captions), "source": "YouTube captions"}
+        result = _transcribe_audio_url(url)
+        # A transient captions failure IS the story. Without this, the audio
+        # path's own error claims the failure -- and for a video over the STT
+        # duration cap that reads "duration NNNNs exceeds cap", which sent a
+        # user chasing a length limit that was never the problem.
+        #
+        # The audio reason is APPENDED rather than discarded: the reply keys off
+        # the captions prefix and shows the temporary-captions wording, while
+        # /transcribe-email/status and the logs keep the full picture for
+        # debugging. A genuinely dead video never reaches here anyway --
+        # VideoUnavailable is classified permanent, so captions_err is empty and
+        # the audio error stands on its own.
+        if not result["ok"] and captions_err:
+            audio_err = result.get("error") or "no reason given"
+            result["error"] = f"{captions_err}; audio fallback also failed: {audio_err}"
+        return result
     return _transcribe_audio_url(url)
 
 
@@ -772,6 +788,11 @@ def _failure_message(error: str) -> str:
     if "channel or playlist" in low:
         return ("That YouTube link points to a channel or playlist, not a single video -- "
                 "send the link to one video and I'll transcribe it.")
+    if "captions fetch failed" in low:
+        return ("YouTube would not hand over the captions just now (temporary) -- "
+                "re-send the link in a few minutes and it should go through. "
+                "This is not a length limit: a long video transcribes fine once "
+                "its captions come back.")
     if any(k in low for k in ("no video", "no audio", "no downloadable", "no media", "no transcribable")):
         return "No video was found at this link, so there was nothing to transcribe."
     if any(k in low for k in ("timeout", "guest token", "429", "502", "503", "504", "temporar")):
