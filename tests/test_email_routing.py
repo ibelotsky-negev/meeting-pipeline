@@ -95,3 +95,56 @@ class TestResolveHubspotOwner:
         second = app_module.resolve_hubspot_owner("new.hire@negevlabs.com")
         assert first == second == "99001"
         assert call_count["n"] == 1
+
+
+class TestResolveInternalOrganizerCanonicalIdentity:
+    """resolve_internal_organizer must hand downstream systems the CANONICAL
+    team address.
+
+    HUBSPOT_OWNER_MAP, Asana and the To-Do sync are all keyed on
+    @negevlabs.com. Returning a raw @palomar-labs.com alias was silent
+    breakage: HubSpot normalizes internally so it looked fine, but
+    find_asana_user_by_email() missed the user and the To-Do sync dropped the
+    task (it filters on @negevlabs.com).
+    """
+
+    def test_palomar_organizer_resolves_to_canonical(self):
+        assert app_module.resolve_internal_organizer("ken@palomar-labs.com", []) == "bk@negevlabs.com"
+
+    def test_negevlabs_organizer_is_unchanged(self):
+        assert app_module.resolve_internal_organizer("bk@negevlabs.com", []) == "bk@negevlabs.com"
+
+    def test_organizer_is_lowercased(self):
+        assert app_module.resolve_internal_organizer("BK@NegevLabs.com", []) == "bk@negevlabs.com"
+
+    def test_palomar_internal_lead_resolves_to_canonical(self):
+        resolved = app_module.resolve_internal_organizer(
+            "outsider@example.com", [], internal_lead_email="shlomi@palomar-labs.com"
+        )
+        assert resolved == "shlomi@negevlabs.com"
+
+    def test_palomar_participant_matches_owner_map(self):
+        """The owner-map fallback is keyed on canonical addresses, so a
+        palomar participant has to be normalized BEFORE the membership test --
+        otherwise it never matches and routing falls through."""
+        resolved = app_module.resolve_internal_organizer(
+            "outsider@example.com", ["guest@example.com", "dan@palomar-labs.com"]
+        )
+        assert resolved == "dan@negevlabs.com"
+
+    def test_palomar_participant_fallback_resolves_to_canonical(self):
+        """kostia has no HubSpot seat, so this exercises the any-internal
+        fallback rather than the owner-map branch."""
+        resolved = app_module.resolve_internal_organizer(
+            "outsider@example.com", ["kostia@palomar-labs.com"]
+        )
+        assert resolved == "ka@negevlabs.com"
+
+    def test_external_organizer_with_no_internal_participant_is_kept(self):
+        assert app_module.resolve_internal_organizer("outsider@example.com", []) == "outsider@example.com"
+
+    def test_notification_recipient_stays_internal_after_normalization(self):
+        """Guard the notify_organizer filter: the canonical form must still
+        pass is_internal_email, or the fix would silently suppress mail."""
+        resolved = app_module.resolve_internal_organizer("ken@palomar-labs.com", [])
+        assert app_module.is_internal_email(resolved)

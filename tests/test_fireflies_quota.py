@@ -382,3 +382,30 @@ def test_webhook_parks_instead_of_retrying_on_quota(monkeypatch, flask_client):
     assert "01M00NDKDYP0ZN1FRZYV2KA0TX" in app_module.load_fireflies_deferred()
     # Never burn 15/30/45s of retries against a quota that resets at midnight.
     assert slept == []
+
+
+# ------------------------------------------------------- /fireflies/status
+
+
+def test_status_endpoint_reports_clear_state(flask_client):
+    body = flask_client.get("/fireflies/status").get_json()
+    assert body["quota_blocked"] is False
+    assert body["quota_frees_up"] is None
+    assert body["deferred_count"] == 0
+    assert body["poll_calls_per_day"] == round(1440 / app_module.POLL_INTERVAL_MINUTES)
+
+
+def test_status_endpoint_reports_block_and_parked_queue(flask_client):
+    """The endpoint exists so this state is visible without trawling Railway
+    logs -- it must make no Fireflies call, so it is safe while blocked."""
+    reset = datetime.now(timezone.utc) + timedelta(hours=7)
+    fc._save_quota_block(reset)
+    app_module.defer_transcript("t-parked", "quota exhausted when webhook arrived")
+
+    body = flask_client.get("/fireflies/status").get_json()
+
+    assert body["quota_blocked"] is True
+    assert body["quota_frees_up"].startswith(reset.isoformat()[:19])
+    assert body["deferred_count"] == 1
+    assert body["deferred"]["t-parked"]["reason"] == "quota exhausted when webhook arrived"
+    assert body["deferred"]["t-parked"]["attempts"] == 0

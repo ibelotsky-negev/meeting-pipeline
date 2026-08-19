@@ -3334,6 +3334,36 @@ def config_check():
 
 
 
+@app.route("/fireflies/status", methods=["GET"])
+def fireflies_status():
+    """Diagnostic: Fireflies quota state and the parked-transcript queue.
+
+    Exists because diagnosing the 2026-08 outage meant reading thousands of
+    Railway log lines -- the quota block and the parked queue live on the
+    /data volume, which is not otherwise reachable from outside the
+    container. Read-only, no Fireflies API call (so it is safe to hit while
+    the quota is spent).
+    """
+    blocked = quota_blocked_until()
+    deferred = load_fireflies_deferred()
+    return jsonify({
+        "quota_blocked": bool(blocked),
+        "quota_frees_up": blocked.isoformat() if blocked else None,
+        "poll_interval_minutes": POLL_INTERVAL_MINUTES,
+        "poll_calls_per_day": round(1440 / POLL_INTERVAL_MINUTES) if POLL_INTERVAL_MINUTES else None,
+        "deferred_count": len(deferred),
+        "deferred": {
+            tid: {
+                "queued_at": (entry or {}).get("queued_at"),
+                "attempts": (entry or {}).get("attempts"),
+                "reason": (entry or {}).get("reason"),
+            }
+            for tid, entry in list(deferred.items())[:25]
+        },
+        "processed_count": len(load_processed()),
+    })
+
+
 @app.route("/test", methods=["GET"])
 def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""

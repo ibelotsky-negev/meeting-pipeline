@@ -123,6 +123,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | Endpoint | Purpose |
 |----------|---------|
 | `/version` | Version check (deploy verification) |
+| `/fireflies/status` | Fireflies quota state + parked-transcript queue (read-only, makes no API call) |
 | `/config` | Non-sensitive config summary |
 | `/test` | Dry-run critical path, no side effects |
 | `/webhook/fireflies` | Fireflies auto-trigger |
