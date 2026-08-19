@@ -256,12 +256,17 @@ def parse_instruction(subject: str, body_text: str) -> dict:
 # ----------------------------------------------------------------------
 
 _SUBJECT_PREFIX_RE = re.compile(r"^\s*(re|fw|fwd)\s*:\s*", re.I)
+# A leading tenant/gateway tag, e.g. "[EXTERNAL]" -- many Exchange tenants
+# prepend this to exactly the externally-sourced mail this feature watches.
+# Anchored at the start only: a bracket appearing mid-subject is untouched.
+_SUBJECT_TAG_RE = re.compile(r"^\s*\[[^\[\]]+\]\s*")
 
 
 def _normalize_subject(s: str) -> str:
     s = (s or "").strip()
     while True:
         stripped = _SUBJECT_PREFIX_RE.sub("", s, count=1)
+        stripped = _SUBJECT_TAG_RE.sub("", stripped, count=1)
         if stripped == s:
             return s.strip()
         s = stripped
@@ -311,6 +316,10 @@ def resolve_thread(mailbox: str, subject_hint: str, counterparties: list):
         newest = max(m.get("receivedDateTime") or "" for m in entry["messages"])
         return (overlap, newest)
 
+    if not convs:
+        # Every message lacked a usable conversationId -- nothing to
+        # score. max() on an empty sequence would raise; refuse instead.
+        return None
     cid, entry = max(convs.items(), key=_score)
     if wanted and not (wanted & entry["participants"]):
         # Counterparties were named but no candidate conversation contains

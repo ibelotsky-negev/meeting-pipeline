@@ -355,3 +355,41 @@ def test_participants_handles_graph_nulls():
     }
     assert fue._participants(msg) == {"salim@vimta.com"}
     assert fue._participants({}) == set()
+
+
+# Review-round fixes below: regressions for two Important findings inherited
+# verbatim from the brief's Step 3 code (thread resolution).
+
+
+def test_resolve_thread_no_usable_conversation_id_returns_none(monkeypatch):
+    # Every message in a non-empty Graph response lacks a usable
+    # conversationId (blank string, and the key missing entirely) -- convs
+    # ends up empty, and max() on an empty sequence must not raise;
+    # resolve_thread must refuse (None) instead of crashing the caller.
+    no_cid_blank = _graph_msg("m1", "", "Dog tox study", "a@b.com",
+                              "2026-08-01T10:00:00Z")
+    no_cid_missing = _graph_msg("m2", "cid-x", "RE: Dog tox study", "c@d.com",
+                                "2026-08-02T10:00:00Z")
+    del no_cid_missing["conversationId"]
+    monkeypatch.setattr(eps, "graph_get",
+                        lambda url, params=None: {"value": [no_cid_blank, no_cid_missing]})
+    assert fue.resolve_thread("dan@negevlabs.com", "Dog tox study", []) is None
+
+
+def test_normalize_subject_strips_leading_tags_interleaved_with_prefixes():
+    # A leading tenant/gateway tag (e.g. Exchange's "[EXTERNAL]") must not
+    # block the Re:/Fw:/Fwd: strip, in either relative order, and stacked
+    # re/fw/fwd prefixes must still fully collapse.
+    plain = fue._normalize_subject("Dog tox study")
+    assert plain == "Dog tox study"
+    for s in ["RE: FW: Dog tox study",
+              "[EXTERNAL] FW: Dog tox study",
+              "[EXTERNAL] RE: FW: Dog tox study",
+              "RE: [EXTERNAL] FW: Dog tox study"]:
+        assert fue._normalize_subject(s) == plain, s
+
+
+def test_normalize_subject_keeps_mid_string_bracket():
+    # Only a LEADING bracketed tag is noise; a bracket appearing after real
+    # subject text must survive untouched.
+    assert fue._normalize_subject("RE: mid [EXTERNAL] string") == "mid [EXTERNAL] string"
