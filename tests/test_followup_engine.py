@@ -928,3 +928,253 @@ def test_run_intake_retry_dry_run_reconfirmation_sends_and_writes_nothing(monkey
     assert out["registered"] == 0
     assert fue._load_registry()["watches"] == watches_before  # unchanged
     assert fue._load_processed() == set()  # dry run persists nothing
+
+
+def _watch_in_registry(**over):
+    w = fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid-right", anchor_message_id="m2",
+        anchor_received="2026-08-05T07:23:00Z", subject="Dog tox",
+        ask="investigation status", recipients=["salim.tamboli@vimta.com"],
+        interval_days=2, deadline=date(2026, 8, 7),
+        intake_conversation_id="conv-intake-1")
+    w.update(over)
+    return w
+
+
+def _thread_reply(mid, sender, body, received="2026-08-06T09:00:00Z", headers=None):
+    return {"id": mid, "conversationId": "cid-right",
+            "from": {"emailAddress": {"address": sender}},
+            "receivedDateTime": received,
+            "uniqueBody": {"content": f"<html><body>{body}</body></html>"},
+            "internetMessageHeaders": headers or []}
+
+
+def test_check_replies_answered_closes_watch(monkeypatch, fue_files):
+    reg = {"watches": [_watch_in_registry()]}
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [
+        _thread_reply("r1", "salim.tamboli@vimta.com",
+                      "Investigation complete, root cause was a pipetting error.")]})
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "ANSWERED")
+    events = fue.check_replies(reg)
+    assert reg["watches"][0]["status"] == "answered"
+    assert events[0]["type"] == "reply_answered"
+    assert reg["watches"][0]["last_checked"] is not None
+    assert reg["watches"][0]["latest_message_id"] == "r1"
+
+
+def test_check_replies_human_nonanswer_pauses(monkeypatch, fue_files):
+    reg = {"watches": [_watch_in_registry()]}
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [
+        _thread_reply("r2", "salim.tamboli@vimta.com", "We will get back to you next week.")]})
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "NOT_ANSWERED")
+    events = fue.check_replies(reg)
+    assert reg["watches"][0]["status"] == "paused"
+    assert events[0]["type"] == "reply_paused"
+
+
+def test_check_replies_autoreply_and_internal_ignored(monkeypatch, fue_files):
+    reg = {"watches": [_watch_in_registry()]}
+    ooo = _thread_reply("r3", "salim.tamboli@vimta.com", "Out of office",
+                        headers=[{"name": "Auto-Submitted", "value": "auto-replied"}])
+    own = _thread_reply("r4", "dan@negevlabs.com", "bumping this myself")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [ooo, own]})
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("no verdict for auto/internal"))
+    events = fue.check_replies(reg)
+    assert events == [] and reg["watches"][0]["status"] == "active"
+
+
+def test_check_replies_no_new_messages(monkeypatch, fue_files):
+    reg = {"watches": [_watch_in_registry()]}
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    assert fue.check_replies(reg) == []
+    assert reg["watches"][0]["status"] == "active"
+
+
+# Task 5 self-review additions -- direct filter/format pinning, isolated gate
+# tests (the brief's own combined test exercises both gates in one call),
+# verdict-default mutation coverage, and multi-watch continuation. See
+# task-5-report.md for the mutation-testing narrative these back up.
+
+
+def test_fetch_new_messages_builds_filter_from_anchor_on_first_check(monkeypatch, fue_files):
+    # No test above inspects the actual $filter/url/params reaching Graph --
+    # they all stub graph_get with lambdas that ignore params. That is
+    # precisely the gap the mandated correction warns about; pin the shape
+    # directly so a broken filter string cannot ship unnoticed again.
+    w = _watch_in_registry()
+    captured = {}
+
+    def _graph_get(url, params=None):
+        captured["url"] = url
+        captured["params"] = params
+        return {"value": []}
+
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    fue._fetch_new_messages(w)
+    assert captured["url"] == f"{eps.MS_GRAPH_BASE}/users/dan@negevlabs.com/messages"
+    assert captured["params"]["$filter"] == (
+        "conversationId eq 'cid-right' and receivedDateTime gt 2026-08-05T07:23:00Z")
+    assert captured["params"]["$top"] == "50"
+    assert captured["params"]["$select"] == (
+        "id,subject,from,receivedDateTime,uniqueBody,internetMessageHeaders,conversationId")
+
+
+def test_fetch_new_messages_sorts_ascending_and_tracks_latest(monkeypatch, fue_files):
+    w = _watch_in_registry()
+    newer = _thread_reply("r20", "salim.tamboli@vimta.com", "second",
+                          received="2026-08-06T10:00:00Z")
+    older = _thread_reply("r21", "salim.tamboli@vimta.com", "first",
+                          received="2026-08-06T09:00:00Z")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [newer, older]})
+    msgs = fue._fetch_new_messages(w)
+    assert [m["id"] for m in msgs] == ["r21", "r20"]
+    assert w["latest_message_id"] == "r20"
+
+
+def test_check_replies_second_check_uses_graph_format_timestamp(monkeypatch, fue_files):
+    # MANDATED CORRECTION: last_checked must be written in Graph's own
+    # Z-suffixed format (no microseconds, no +00:00) so a SECOND check's
+    # $filter is well-formed. .isoformat() on a tz-aware datetime produces
+    # "+00:00" plus microseconds, which breaks the Graph $filter on every
+    # check after the first (the FIRST check's "since" comes from
+    # anchor_received, Graph's own literal, so it always works regardless of
+    # this bug -- only a SECOND check exercises the stored value).
+    from datetime import datetime
+
+    reg = {"watches": [_watch_in_registry()]}
+    calls = []
+
+    def _graph_get(url, params=None):
+        calls.append(params)
+        return {"value": []}
+
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("no verdict expected"))
+
+    assert fue.check_replies(reg) == []  # first check: since = anchor_received
+    assert reg["watches"][0]["status"] == "active"
+    assert reg["watches"][0]["last_checked"] is not None
+
+    assert fue.check_replies(reg) == []  # second check: since = last_checked
+    assert len(calls) == 2
+    second_filter = calls[1]["$filter"]
+    since_clause = second_filter.split("receivedDateTime gt ")[1]
+    datetime.strptime(since_clause, "%Y-%m-%dT%H:%M:%SZ")  # raises if not this exact shape
+    assert "+00:00" not in since_clause
+    assert "." not in since_clause
+
+
+def test_check_replies_autoreply_alone_ignored(monkeypatch, fue_files):
+    # Isolates the auto-reply gate from the internal-sender gate (the brief's
+    # own test exercises both at once via two different messages, so either
+    # gate alone breaking still leaves the other filtering the list to empty).
+    reg = {"watches": [_watch_in_registry()]}
+    ooo = _thread_reply("r5", "salim.tamboli@vimta.com", "Out of office until Monday",
+                        headers=[{"name": "Auto-Submitted", "value": "auto-replied"}])
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [ooo]})
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("auto-reply must not reach verdict"))
+    events = fue.check_replies(reg)
+    assert events == [] and reg["watches"][0]["status"] == "active"
+
+
+def test_check_replies_internal_alone_ignored(monkeypatch, fue_files):
+    # Isolates the internal-sender gate from the auto-reply gate.
+    reg = {"watches": [_watch_in_registry()]}
+    own = _thread_reply("r6", "dan@negevlabs.com", "bumping this myself, no reply yet")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [own]})
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("internal sender must not reach verdict"))
+    events = fue.check_replies(reg)
+    assert events == [] and reg["watches"][0]["status"] == "active"
+
+
+def test_check_replies_verdict_prompt_excludes_noise_messages(monkeypatch, fue_files):
+    # Confirms the FILTERED subset (not the raw fetch) is what reaches Claude
+    # -- a regression here would leak auto-reply/internal noise into the
+    # verdict prompt even though the brief's own all-noise test has nothing
+    # left to filter down TO and so cannot catch this class of bug.
+    reg = {"watches": [_watch_in_registry()]}
+    ooo = _thread_reply("r7", "salim.tamboli@vimta.com", "Out of office until Monday",
+                        headers=[{"name": "Auto-Submitted", "value": "auto-replied"}])
+    own = _thread_reply("r8", "dan@negevlabs.com", "bumping this myself")
+    real = _thread_reply("r9", "salim.tamboli@vimta.com",
+                         "Investigation complete, root cause was a pipetting error.",
+                         received="2026-08-06T11:00:00Z")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [ooo, own, real]})
+    captured = {}
+
+    def _capture(prompt, model, max_tokens=10, **kw):
+        captured["prompt"] = prompt
+        return "ANSWERED"
+
+    monkeypatch.setattr(ld, "_call_claude_text", _capture)
+    events = fue.check_replies(reg)
+    assert "Out of office" not in captured["prompt"]
+    assert "bumping this myself" not in captured["prompt"]
+    assert "pipetting error" in captured["prompt"]
+    assert events[0]["who"] == "salim.tamboli@vimta.com"
+    assert events[0]["when"] == "2026-08-06T11:00:00Z"
+
+
+def test_verdict_default_on_claude_exception_is_not_answered(monkeypatch):
+    w = _watch_in_registry()
+    msgs = [_thread_reply("r10", "salim.tamboli@vimta.com", "some update, unclear if final")]
+
+    def _boom_claude(*a, **kw):
+        raise RuntimeError("claude down")
+
+    monkeypatch.setattr(ld, "_call_claude_text", _boom_claude)
+    assert fue._verdict(w, msgs) == "NOT_ANSWERED"
+
+
+def test_verdict_default_on_unparseable_response_is_not_answered(monkeypatch):
+    w = _watch_in_registry()
+    msgs = [_thread_reply("r11", "salim.tamboli@vimta.com", "some update, unclear if final")]
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "MAYBE, hard to say")
+    assert fue._verdict(w, msgs) == "NOT_ANSWERED"
+
+
+def test_check_replies_skips_paused_watch(monkeypatch, fue_files):
+    reg = {"watches": [_watch_in_registry(status="paused")]}
+    monkeypatch.setattr(eps, "graph_get",
+                        lambda url, params=None: pytest.fail(
+                            "check_replies must not fetch for a non-active watch"))
+    events = fue.check_replies(reg)
+    assert events == []
+    assert reg["watches"][0]["status"] == "paused"
+    assert reg["watches"][0]["last_checked"] is None
+
+
+def test_check_replies_skips_cancelled_watch(monkeypatch, fue_files):
+    # A cancelled watch must never be revived by anything in this module.
+    reg = {"watches": [_watch_in_registry(status="cancelled")]}
+    monkeypatch.setattr(eps, "graph_get",
+                        lambda url, params=None: pytest.fail(
+                            "cancelled watch must never be revisited"))
+    events = fue.check_replies(reg)
+    assert events == []
+    assert reg["watches"][0]["status"] == "cancelled"
+
+
+def test_check_replies_one_watch_fetch_failure_does_not_stop_others(monkeypatch, fue_files):
+    broken = _watch_in_registry(mailbox="broken@negevlabs.com")
+    ok = _watch_in_registry(mailbox="dan@negevlabs.com")
+    reg = {"watches": [broken, ok]}
+
+    def _graph_get(url, params=None):
+        if "broken@negevlabs.com" in url:
+            raise RuntimeError("graph down")
+        return {"value": [_thread_reply("r12", "salim.tamboli@vimta.com",
+                                        "all done, confirmed resolved")]}
+
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "ANSWERED")
+    events = fue.check_replies(reg)
+    assert reg["watches"][0]["status"] == "active"   # broken watch untouched
+    assert reg["watches"][0]["last_checked"] is None
+    assert reg["watches"][1]["status"] == "answered"  # second watch still processed
+    assert len(events) == 1 and events[0]["watch_id"] == ok["id"]

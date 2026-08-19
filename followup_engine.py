@@ -587,3 +587,90 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
     logger.info(f"[followup] intake: {registered} registered, {commands} commands, "
                 f"{failures} failures of {len(messages)} scanned (dry={dry_run})")
     return result
+
+
+# ----------------------------------------------------------------------
+#  Daily check part 1: reply detection
+# ----------------------------------------------------------------------
+
+
+def _fetch_new_messages(watch: dict) -> list:
+    since = watch.get("last_checked") or watch.get("anchor_received") or ""
+    url = f"{eps.MS_GRAPH_BASE}/users/{watch['mailbox']}/messages"
+    params = {
+        "$filter": f"conversationId eq '{watch['conversation_id']}' "
+                   f"and receivedDateTime gt {since}",
+        "$select": "id,subject,from,receivedDateTime,uniqueBody,internetMessageHeaders,conversationId",
+        "$top": "50",
+    }
+    msgs = (eps.graph_get(url, params=params) or {}).get("value") or []
+    msgs.sort(key=lambda m: m.get("receivedDateTime") or "")
+    if msgs:
+        watch["latest_message_id"] = msgs[-1].get("id") or watch.get("latest_message_id")
+    return msgs
+
+
+_VERDICT_PROMPT = """A follow-up watch awaits this from an email thread:
+ASK: {ask}
+
+New messages on the thread:
+{messages}
+
+Does any of these messages substantively answer the ASK? A promise to answer
+later ("we will get back to you") is NOT an answer. Reply with exactly one
+word: ANSWERED or NOT_ANSWERED."""
+
+
+def _verdict(watch: dict, msgs: list) -> str:
+    blocks = []
+    for m in msgs:
+        frm = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "?")
+        text = eps.html_to_text((m.get("uniqueBody") or {}).get("content") or "")[:2000]
+        blocks.append(f"From {frm} at {m.get('receivedDateTime')}:\n{text}")
+    try:
+        raw = ld._call_claude_text(
+            _VERDICT_PROMPT.format(ask=watch["ask"], messages="\n---\n".join(blocks)),
+            VERDICT_MODEL, max_tokens=10)
+    except Exception as e:
+        logger.warning(f"[followup] verdict failed for {watch['id']}: {e}")
+        return "NOT_ANSWERED"  # degrade to pause, never to a silent close
+    return "ANSWERED" if (raw or "").strip().upper().startswith("ANSWERED") else "NOT_ANSWERED"
+
+
+def check_replies(reg: dict) -> list:
+    events = []
+    # Graph's own Z-suffixed format (no microseconds, no +00:00) -- NOT
+    # .isoformat(), which on a tz-aware UTC datetime yields "+00:00" plus
+    # microseconds. This value feeds straight into _fetch_new_messages'
+    # "receivedDateTime gt {since}" $filter on the NEXT check, and Graph
+    # rejects that shape. Same convention as learn_digest.py and
+    # fyi_triage.py's own receivedDateTime filters.
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for w in reg.get("watches") or []:
+        if w.get("status") != "active":
+            continue
+        try:
+            msgs = _fetch_new_messages(w)
+        except Exception as e:
+            logger.warning(f"[followup] fetch failed for {w['id']}: {e}")
+            continue
+        w["last_checked"] = now
+        ext = [m for m in msgs
+               if not config.is_internal_email(
+                   (((m.get("from") or {}).get("emailAddress") or {}).get("address") or ""))
+               and not xte.is_auto_reply(m)]
+        if not ext:
+            continue
+        who = (((ext[-1].get("from") or {}).get("emailAddress") or {}).get("address") or "")
+        when = ext[-1].get("receivedDateTime") or ""
+        if _verdict(w, ext) == "ANSWERED":
+            w["status"] = "answered"
+            _note(w, f"answered by {who} at {when}")
+            events.append({"type": "reply_answered", "owner": w["owner"],
+                           "watch_id": w["id"], "ask": w["ask"], "who": who, "when": when})
+        else:
+            w["status"] = "paused"
+            _note(w, f"human reply from {who} at {when} did not answer; paused")
+            events.append({"type": "reply_paused", "owner": w["owner"],
+                           "watch_id": w["id"], "ask": w["ask"], "who": who, "when": when})
+    return events
