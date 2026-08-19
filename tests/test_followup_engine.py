@@ -54,6 +54,24 @@ def test_registry_roundtrip(fue_files):
     assert again["watches"][0]["ask"] == "status of the investigation"
 
 
+def test_new_watch_interval_days_zero_vs_none():
+    # Explicit 0 ("chase same-day") is a valid business-day count and must
+    # survive as 0, not be silently upgraded to the default -- only an
+    # actual None ("caller did not specify") should fall back.
+    kwargs = dict(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid1", anchor_message_id="m1",
+        anchor_received="2026-08-05T04:23:00Z",
+        subject="Negev_28-Day dog tox", ask="status of the investigation",
+        recipients=["salim.tamboli@vimta.com"],
+        deadline=date(2026, 8, 7), intake_conversation_id="conv-intake",
+    )
+    w_zero = fue.new_watch(interval_days=0, **kwargs)
+    assert w_zero["interval_days"] == 0
+    w_none = fue.new_watch(interval_days=None, **kwargs)
+    assert w_none["interval_days"] == fue.FOLLOWUP_DEFAULT_BUSINESS_DAYS
+
+
 def test_registry_corrupt_file_degrades_empty(fue_files, tmp_path):
     (tmp_path / "followups.json").write_text("{not json", encoding="utf-8")
     assert fue._load_registry() == {"watches": []}

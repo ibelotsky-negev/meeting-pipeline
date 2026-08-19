@@ -147,7 +147,7 @@ def new_watch(owner: str, mailbox: str, conversation_id: str, anchor_message_id:
         "subject": subject,
         "ask": ask,
         "recipients": recipients or [],
-        "interval_days": int(interval_days or FOLLOWUP_DEFAULT_BUSINESS_DAYS),
+        "interval_days": FOLLOWUP_DEFAULT_BUSINESS_DAYS if interval_days is None else int(interval_days),
         "deadline": deadline.isoformat(),
         "max_nudges": FOLLOWUP_MAX_NUDGES,
         "nudges_sent": 0,
