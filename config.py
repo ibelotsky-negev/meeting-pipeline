@@ -136,6 +136,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 PROCESSED_FILE = os.path.join(DATA_DIR, "processed_transcripts.json")
 PENDING_FILE = os.path.join(DATA_DIR, "pending_approvals.json")
 SYNC_MAP_FILE = os.path.join(DATA_DIR, "asana_todo_map.json")
+# Fireflies transcript ids whose fetch was deferred because the daily API
+# quota was spent. Drained once the quota frees up -- without this a
+# webhook arriving inside a dead window is lost for good.
+FIREFLIES_DEFERRED_FILE = os.path.join(DATA_DIR, "fireflies_deferred.json")
 
 # To-Do sync config
 TODO_LIST_NAME = os.environ.get("TODO_LIST_NAME", "Asana Tasks")

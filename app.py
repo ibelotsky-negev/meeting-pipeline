@@ -36,8 +36,8 @@ from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_AP
 from prompts import (PULSE_SCOPE, PULSE_ANTI_HALLUCINATION, PULSE_EMAIL_PROMPT, PULSE_TEAMS_PROMPT, PULSE_MEETINGS_PROMPT, PULSE_SYNTHESIS_PROMPT, PULSE_BRIEFING_UPDATE_PROMPT)  # noqa: F401
 from templates import REVIEW_TEMPLATE, RESULT_TEMPLATE  # noqa: F401
 from datetime_utils import to_hubspot_ms, to_graph_datetime, resolve_due_date  # noqa: F401
-from stores import load_pending, save_pending, load_processed, save_processed, load_sync_map, save_sync_map  # noqa: F401
-from fireflies_client import fireflies_query, get_recent_transcripts, get_transcript_by_id  # noqa: F401
+from stores import load_pending, save_pending, load_processed, save_processed, load_sync_map, save_sync_map, load_fireflies_deferred, save_fireflies_deferred  # noqa: F401
+from fireflies_client import fireflies_query, get_recent_transcripts, get_transcript_by_id, FirefliesQuotaExceeded, duration_to_minutes, quota_blocked_until, clear_quota_block  # noqa: F401
 from hubspot_client import (hubspot_request, find_hubspot_contact, _hubspot_owner_cache, resolve_hubspot_owner, create_hubspot_contact, get_contact_associations, log_hubspot_meeting, create_hubspot_task)  # noqa: F401
 from asana_client import asana_request, create_asana_task, find_asana_user_by_email  # noqa: F401
 
@@ -428,7 +428,7 @@ def pulse_collect_meetings(start_dt, end_dt):
             meetings.append({
                 "title": t.get("title", ""),
                 "date": str(raw_date),
-                "duration_minutes": round(duration / 60) if duration else 0,
+                "duration_minutes": round(duration_to_minutes(duration)),
                 "summary": summary.get("overview") or summary.get("shorthand_bullet") or "",
                 "action_items": summary.get("action_items") or "",
                 "fireflies_id": ff_id,
@@ -3301,7 +3301,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.28.3-yt-retry", "deployed": "2026-08-17"})
+    return jsonify({"version": "2.29.0-fireflies-quota", "deployed": "2026-08-19"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3339,14 +3339,16 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.28.3-yt-retry", "steps": {}}
+    results = {"version": "2.29.0-fireflies-quota", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
         recent = get_recent_transcripts(since_minutes=10080)
         if not recent:
             return jsonify({"status": "skip", "reason": "No transcripts in last 7 days"}), 200
-        transcript = recent[0]
+        # The list query is metadata-only now (summary/sentences were pure
+        # waste there), so fetch the body by id for the null-safety probe.
+        transcript = get_transcript_by_id(recent[0]["id"]) or recent[0]
         results["steps"]["fetch"] = {"status": "ok", "title": transcript.get("title","?"), "ms": int((_time.time()-t0)*1000)}
 
         # Step 2: Null-safety check
@@ -3844,21 +3846,33 @@ def fireflies_webhook():
         try:
             logger.info(f"Webhook thread: fetching transcript {transcript_id}")
             transcript = None
- # Retry up to 3 times with increasing delay -> webhook may fire before transcript is ready
+            # Retry a few times -> the webhook can fire before Fireflies has
+            # finished processing the transcript. A quota block is NOT that
+            # case: it clears at midnight UTC, so retrying in seconds only
+            # burns the attempts and drops the meeting. Park it instead.
             for attempt in range(1, 4):
                 try:
                     transcript = get_transcript_by_id(transcript_id)
+                except FirefliesQuotaExceeded as quota_err:
+                    defer_transcript(transcript_id, "quota exhausted when webhook arrived")
+                    logger.warning(
+                        f"Webhook thread: Fireflies quota spent (frees up "
+                        f"{getattr(quota_err, 'retry_after', None)}) -- {transcript_id} parked for retry"
+                    )
+                    return
                 except Exception as fetch_err:
                     logger.warning(f"Webhook thread: fetch attempt {attempt}/3 failed: {fetch_err}")
                     transcript = None
                 if transcript:
                     break
-                wait_seconds = attempt * 15  # 15s, 30s, 45s
-                logger.info(f"Webhook thread: transcript not available, retry {attempt}/3 in {wait_seconds}s...")
-                import time
-                time.sleep(wait_seconds)
+                if attempt < 3:
+                    wait_seconds = attempt * 15  # 15s, 30s -- no sleep after the last try
+                    logger.info(f"Webhook thread: transcript not available, retry {attempt}/3 in {wait_seconds}s...")
+                    import time
+                    time.sleep(wait_seconds)
             if not transcript:
                 logger.error(f"Webhook thread: transcript not found after 3 attempts: {transcript_id}")
+                defer_transcript(transcript_id, "not available after 3 webhook attempts")
                 return
             logger.info(f"Webhook thread: got transcript '{transcript.get('title', '?')}', starting Phase 1")
             approval_id = process_transcript_phase1(transcript)
@@ -3997,8 +4011,98 @@ def manual_process(transcript_id: str):
 
 # ======================================================================
 
+# Give up on a parked transcript after this many failed fetch attempts.
+FIREFLIES_DEFER_MAX_ATTEMPTS = 5
+
+
+def defer_transcript(transcript_id: str, reason: str = "") -> None:
+    """Park a transcript whose fetch could not complete, for later retry.
+
+    Without this a meeting that arrives while the Fireflies quota is spent is
+    lost for good: the poll window is only POLL_INTERVAL + 10 minutes, so by
+    the time the quota resets at midnight UTC the meeting has scrolled out of
+    range and nothing ever looks at it again."""
+    try:
+        deferred = load_fireflies_deferred()
+        entry = deferred.get(transcript_id) or {}
+        entry["queued_at"] = entry.get("queued_at") or datetime.now(timezone.utc).isoformat()
+        entry["attempts"] = int(entry.get("attempts") or 0)
+        entry["reason"] = reason
+        deferred[transcript_id] = entry
+        save_fireflies_deferred(deferred)
+        logger.info(f"[fireflies] Parked {transcript_id} for later retry ({reason})")
+    except Exception as e:
+        logger.error(f"[fireflies] Could not park {transcript_id}: {e}", exc_info=True)
+
+
+def drain_deferred_transcripts(limit: int = 5) -> int:
+    """Retry transcripts parked by an earlier quota block. Returns count done.
+
+    Bounded per run so recovering a backlog cannot itself exhaust the daily
+    quota the live pipeline depends on."""
+    deferred = load_fireflies_deferred()
+    if not deferred:
+        return 0
+    processed = load_processed()
+    done = 0
+    # Oldest first -- those are the ones someone is still waiting on.
+    for tid in sorted(deferred, key=lambda k: str((deferred.get(k) or {}).get("queued_at") or "")):
+        if done >= limit:
+            break
+        if tid in processed:
+            deferred.pop(tid, None)
+            save_fireflies_deferred(deferred)
+            continue
+        entry = deferred.get(tid) or {}
+        try:
+            transcript = get_transcript_by_id(tid)
+        except FirefliesQuotaExceeded:
+            logger.warning("[fireflies] Quota spent again -- leaving the rest parked")
+            return done
+        except Exception as e:
+            logger.error(f"[fireflies] Parked fetch failed for {tid}: {e}")
+            transcript = None
+        attempts = int(entry.get("attempts") or 0) + 1
+        if not transcript:
+            if attempts >= FIREFLIES_DEFER_MAX_ATTEMPTS:
+                logger.error(f"[fireflies] Giving up on parked {tid} after {attempts} attempts")
+                deferred.pop(tid, None)
+            else:
+                entry["attempts"] = attempts
+                deferred[tid] = entry
+            save_fireflies_deferred(deferred)
+            continue
+        try:
+            approval_id = process_transcript_phase1(transcript)
+            processed.add(tid)
+            save_processed(processed)
+            deferred.pop(tid, None)
+            save_fireflies_deferred(deferred)
+            done += 1
+            logger.info(f"[fireflies] Recovered parked meeting {tid} -> approval {approval_id}")
+        except Exception as e:
+            entry["attempts"] = attempts
+            deferred[tid] = entry
+            save_fireflies_deferred(deferred)
+            logger.error(f"[fireflies] Phase 1 failed for parked {tid}: {e}", exc_info=True)
+    return done
+
+
 def poll_and_process():
+    # Do not spend a request to learn what we already know. The quota is
+    # daily and workspace-wide, so every wasted call is one the webhook path
+    # no longer has.
+    blocked = quota_blocked_until()
+    if blocked:
+        logger.info(f"[poll] Fireflies quota spent until {blocked.isoformat()} -- skipping poll, no request sent")
+        return
     logger.info("Polling Fireflies for new transcripts...")
+    # Parked transcripts go first: they are older than anything in the current
+    # window, and the window has already moved past them.
+    try:
+        drain_deferred_transcripts()
+    except Exception as e:
+        logger.error(f"[poll] Parked-transcript drain failed: {e}", exc_info=True)
     processed = load_processed()
     try:
         transcripts = get_recent_transcripts(since_minutes=POLL_INTERVAL_MINUTES + 10)
@@ -4006,12 +4110,20 @@ def poll_and_process():
             tid = transcript["id"]
             if tid in processed:
                 continue
-            full_transcript = get_transcript_by_id(tid)
+            try:
+                full_transcript = get_transcript_by_id(tid)
+            except FirefliesQuotaExceeded:
+                # Park it rather than lose it, then stop for this window.
+                defer_transcript(tid, "quota exhausted during poll")
+                raise
             if not full_transcript:
                 continue
             process_transcript_phase1(full_transcript)
             processed.add(tid)
             save_processed(processed)
+    except FirefliesQuotaExceeded as e:
+        # Expected and self-limiting -- not a stack-trace-worthy event.
+        logger.warning(f"[poll] Fireflies quota exhausted; polling suspended until {getattr(e, 'retry_after', None)}")
     except Exception as e:
         logger.error(f"Polling error: {e}", exc_info=True)
 
