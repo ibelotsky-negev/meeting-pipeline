@@ -722,3 +722,130 @@ def test_run_intake_persists_incrementally_survives_mid_scan_crash(monkeypatch, 
     assert out["commands"] == 1  # only c2 this scan; c1 was skipped outright
     assert replies == ["c1", "c2"]  # c1 not resent
     assert fue._load_processed() == {"c1", "c2"}
+
+
+# Fix round 1 (review findings A, B, C) below.
+
+
+def _boom(*a, **kw):
+    raise RuntimeError("send failed")
+
+
+def test_run_intake_registration_retry_after_reply_failure_does_not_duplicate(monkeypatch, fue_files):
+    # FINDING A: _save_registry runs before send_threaded_reply, so a raise
+    # from the reply-send leaves the new watch already persisted but mid
+    # never marked processed. A retry must not call new_watch() again for
+    # the same ask.
+    instruction = _intake_msg(
+        "im3", "dan@negevlabs.com", "FW: Dog tox study",
+        "Sara: if Vimta does not reply within 2 days, follow up on the "
+        "investigation status.")
+    thread_newest = _graph_msg("m2", "cid-right", "RE: Dog tox study",
+                               "upendra.kumar@adgyllifesciences.com",
+                               "2026-08-05T07:23:00Z",
+                               to=["salim.tamboli@vimta.com"])
+
+    def _graph_get(url, params=None):
+        if f"/users/{fue.SARA_MAILBOX}/mailFolders/inbox/messages" in url:
+            return {"value": [instruction]}
+        if "/users/dan@negevlabs.com/messages" in url:
+            return {"value": [thread_newest]}
+        return {"value": []}
+
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    canned = json.dumps({
+        "is_request": True, "thread_subject": "Dog tox study",
+        "counterparties": ["salim.tamboli@vimta.com"],
+        "asks": [{"ask": "investigation status",
+                  "recipients": ["salim.tamboli@vimta.com"], "days": 2, "date": None}],
+    })
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
+    monkeypatch.setattr(xte, "send_threaded_reply", _boom)
+
+    with pytest.raises(RuntimeError):
+        fue.run_intake()
+
+    reg_after_crash = fue._load_registry()["watches"]
+    assert len(reg_after_crash) == 1  # registry save landed before the raise
+    original_id = reg_after_crash[0]["id"]
+    assert "im3" not in fue._load_processed()  # crash happened before this line
+
+    # Retry with a healthy send: must not duplicate the already-registered ask.
+    monkeypatch.setattr(xte, "send_threaded_reply", lambda *a, **kw: None)
+    out = fue.run_intake()
+    reg_after_retry = fue._load_registry()["watches"]
+    assert len(reg_after_retry) == 1  # still one watch, not two
+    assert reg_after_retry[0]["id"] == original_id  # the SAME watch, not a new id
+    assert out["registered"] == 0  # nothing new -- the ask already existed
+
+
+def test_find_existing_watch_ignores_cancelled_prior_watch():
+    # A deliberate re-registration after a cancel must still be allowed --
+    # only a non-cancelled watch with the same conversation+ask blocks it.
+    w = fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid1", anchor_message_id="m1",
+        anchor_received="2026-08-05T04:23:00Z", subject="s", ask="status",
+        recipients=[], interval_days=2, deadline=date(2026, 8, 7),
+        intake_conversation_id="conv-x")
+    w["status"] = "cancelled"
+    reg = {"watches": [w]}
+    assert fue._find_existing_watch(reg, [], "conv-x", "status") is None
+    w["status"] = "active"
+    assert fue._find_existing_watch(reg, [], "conv-x", "status") is w
+    assert fue._find_existing_watch(reg, [], "conv-x", "a different ask") is None
+    assert fue._find_existing_watch(reg, [], "conv-other", "status") is None
+
+
+def test_run_intake_unknown_watch_id_replies_honestly_and_cancels_nothing(monkeypatch, fue_files):
+    # FINDING B: a command word plus an fw_ id matching no real watch is
+    # almost certainly a typo -- honest failure, never silence, and nothing
+    # gets cancelled.
+    reg = {"watches": [fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid-right", anchor_message_id="m2",
+        anchor_received="2026-08-05T07:23:00Z", subject="Dog tox",
+        ask="investigation status", recipients=[], interval_days=2,
+        deadline=date(2026, 8, 7), intake_conversation_id="conv-intake-1")]}
+    fue._save_registry(reg)
+    cmd = _intake_msg("c9", "dan@negevlabs.com", "RE: registered",
+                      "please stop fw_deadbeef", cid="conv-other")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [cmd]})
+    replies = []
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda mid, html_body, attachments=None: replies.append((mid, html_body)))
+    out = fue.run_intake()
+    assert out["failures"] == 1 and out["commands"] == 0
+    assert fue._load_registry()["watches"][0]["status"] == "active"  # untouched
+    assert len(replies) == 1 and replies[0][0] == "c9"
+    assert "fw_deadbeef" in replies[0][1]
+
+
+def test_parse_command_requires_leading_word_without_explicit_id():
+    # FINDING C (human-approved deviation from spec line 53's literal
+    # "reply CONTAINING stop|cancel|done" -- see followup-engine-spec.md;
+    # to be reconciled in Task 9). All 5 required MUST-match cases.
+    assert fue._parse_command("stop") == "cancel"
+    assert fue._parse_command("Stop.") == "cancel"
+    assert fue._parse_command("Hi Sara, stop") == "cancel"
+    assert fue._parse_command("Thanks for the reminder.\ncancel") == "cancel"
+    assert fue._parse_command("Please CANCEL fw_1234abcd") == "cancel"  # explicit id
+
+
+def test_parse_command_ignores_command_words_not_leading():
+    # FINDING C. All 5 required MUST-NOT-match cases -- ordinary English
+    # sentences that happen to contain done/keep/continue nowhere near the
+    # start must never be read as a command.
+    assert fue._parse_command("once the report's done, loop in Legal") is None
+    assert fue._parse_command("I'll keep you posted on the Vimta thread") is None
+    assert fue._parse_command("we can continue this next week") is None
+    assert fue._parse_command("Let me know when you're done with the draft") is None
+    assert fue._parse_command("thanks!") is None
+
+
+def test_parse_command_cancel_wins_across_lines():
+    # "cancel wins over resume" (the function's own documented rule) must
+    # hold body-wide, not just within whichever line happens to be checked
+    # first -- a naive per-line short-circuit would return "resume" here
+    # since line 1 leads with "keep", never reaching line 2's "cancel".
+    assert fue._parse_command("keep going\ncancel it") == "cancel"

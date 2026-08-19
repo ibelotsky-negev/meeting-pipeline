@@ -178,13 +178,36 @@ _MEDIA_RE = re.compile(r"(?<!\w)(?:x\.com|twitter\.com|youtube\.com|youtu\.be)/"
 _WATCH_ID_RE = re.compile(r"\bfw_[0-9a-f]{8}\b")
 _CANCEL_RE = re.compile(r"\b(stop|cancel|done)\b", re.I)
 _RESUME_RE = re.compile(r"\b(resume|continue|keep|re-?arm)\b", re.I)
+# Command word must LEAD the body or one of its lines (after an optional
+# short greeting) UNLESS an explicit fw_ id is present -- see _parse_command.
+_GREETING_RE = re.compile(r"^\s*(?:hi|hello|hey|thanks?|dear)\b[^,\n]{0,20},\s*", re.I)
+_CANCEL_LEAD_RE = re.compile(r"^\s*(stop|cancel|done)\b", re.I)
+_RESUME_LEAD_RE = re.compile(r"^\s*(resume|continue|keep|re-?arm)\b", re.I)
 
 
 def _parse_command(body_text: str) -> str:
-    # Deterministic, no LLM: cancel wins over resume on a conflicting message.
-    if _CANCEL_RE.search(body_text or ""):
+    """Deterministic, no LLM. Cancel wins over resume on a conflicting
+    message. Human-approved deviation from spec line 53's literal "a reply
+    CONTAINING stop|cancel|done": an ordinary reply can contain "done" /
+    "continue" / "keep" as plain English nowhere related to a command (e.g.
+    "once the report's done, loop in Legal"), and Sara's own confirmation
+    reply invites replies in the very thread these words show up in -- so
+    absent an explicit fw_ id, the command word must actually LEAD the
+    message or one of its lines (after an optional short greeting), not
+    merely appear anywhere. An explicit fw_ id is unambiguous enough that
+    the original anywhere-in-body match still applies."""
+    text = body_text or ""
+    if _WATCH_ID_RE.search(text):
+        if _CANCEL_RE.search(text):
+            return "cancel"
+        if _RESUME_RE.search(text):
+            return "resume"
+        return None
+    lines = text.splitlines() or [text]
+    stripped = [_GREETING_RE.sub("", ln, count=1) for ln in lines]
+    if any(_CANCEL_LEAD_RE.match(ln) for ln in stripped):
         return "cancel"
-    if _RESUME_RE.search(body_text or ""):
+    if any(_RESUME_LEAD_RE.match(ln) for ln in stripped):
         return "resume"
     return None
 
@@ -386,6 +409,23 @@ def _apply_command(reg: dict, watches: list, cmd: str) -> list:
     return changed
 
 
+def _find_existing_watch(reg: dict, new: list, intake_conversation_id: str, ask_text: str):
+    """An equivalent watch already exists for this intake conversation + ask
+    text. Guards against duplicate registration on a retry -- if
+    send_threaded_reply raised on a prior scan, mid never got marked
+    processed (the registry save already landed, before the failed reply),
+    so the SAME instruction gets re-parsed from scratch and would otherwise
+    call new_watch() again with a fresh random id. A CANCELLED prior watch
+    does not block re-registration -- the owner may deliberately cancel and
+    re-ask for the same thing. Compares only fields already in the watch
+    schema (intake_conversation_id, ask, status); adds no new field."""
+    for w in (reg.get("watches") or []) + new:
+        if (w.get("intake_conversation_id") == intake_conversation_id
+                and w.get("ask") == ask_text and w.get("status") != "cancelled"):
+            return w
+    return None
+
+
 def run_intake(dry_run: bool = False, limit: int = None) -> dict:
     """Scan Sara's inbox for follow-up registrations and owner commands.
     Idempotent via processed internetMessageIds, persisted after each
@@ -442,6 +482,20 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
             _persist_processed(processed, dry_run)
             continue
 
+        if cmd and ids_in_body and not cmd_watches:
+            # A command word plus an explicit fw_ id that matches no known
+            # watch -- almost certainly a typo. "Honest failure, never
+            # silence" per the module's own rule; same reply-then-mark
+            # ordering as the resolve_thread failure path below.
+            failures += 1
+            if not dry_run:
+                xte.send_threaded_reply(m.get("id"), _failure_html(
+                    f"I do not recognize watch id(s) {', '.join(sorted(ids_in_body))}."))
+            outcomes.append({"from": sender, "kind": "unknown_watch_id"})
+            processed.add(mid)
+            _persist_processed(processed, dry_run)
+            continue
+
         if not _TRIGGER_RE.search(body_text) or _MEDIA_RE.search(body_text):
             continue  # not ours; leave for other handlers, do not mark
 
@@ -468,6 +522,14 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
         today = _today_il()
         new = []
         for ask in parsed["asks"]:
+            ask_text = ask["ask"].strip()
+            if _find_existing_watch(reg, new, conv, ask_text):
+                # Already registered -- e.g. a retry after send_threaded_reply
+                # raised on a prior scan (the registry save happens before the
+                # reply is sent, so mid never got marked processed and this
+                # instruction is being re-parsed from scratch). Skipping keeps
+                # the registry idempotent without adding a new watch field.
+                continue
             if len(reg["watches"]) + len(new) >= FOLLOWUP_MAX_WATCHES:
                 logger.warning("[followup] watch cap reached; skipping remaining asks")
                 break
@@ -489,7 +551,7 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
                 conversation_id=thread["conversation_id"],
                 anchor_message_id=thread["anchor_id"],
                 anchor_received=thread["anchor_received"],
-                subject=thread["subject"], ask=ask["ask"].strip(),
+                subject=thread["subject"], ask=ask_text,
                 recipients=[r.strip() for r in (ask.get("recipients") or []) if r] or externals,
                 interval_days=interval, deadline=deadline,
                 intake_conversation_id=conv))
