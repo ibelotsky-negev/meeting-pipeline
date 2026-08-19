@@ -1178,3 +1178,401 @@ def test_check_replies_one_watch_fetch_failure_does_not_stop_others(monkeypatch,
     assert reg["watches"][0]["last_checked"] is None
     assert reg["watches"][1]["status"] == "answered"  # second watch still processed
     assert len(events) == 1 and events[0]["watch_id"] == ok["id"]
+
+
+def _capture_writes(monkeypatch, draft_id="d1", web_link="https://outlook.example/d1"):
+    calls = []
+    def _post(url, json_body):
+        calls.append({"method": "POST", "url": url, "body": json_body})
+        if url.endswith("/createReplyAll"):
+            return {"id": draft_id, "webLink": web_link}
+        return {}
+    def _patch(url, json_body):
+        calls.append({"method": "PATCH", "url": url, "body": json_body})
+        return {}
+    monkeypatch.setattr(eps, "graph_post", _post)
+    monkeypatch.setattr(eps, "graph_patch", _patch)
+    monkeypatch.setattr(eps, "graph_delete", lambda url: calls.append({"method": "DELETE", "url": url}))
+    return calls
+
+
+def test_process_deadlines_creates_draft_when_live(monkeypatch, fue_files):
+    monkeypatch.setenv("FOLLOWUP_LIVE", "1")
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07")]}
+    calls = _capture_writes(monkeypatch)
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: "Dear Dr. Salim,\n\nA gentle reminder on the investigation status.\n\nBest regards")
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    w = reg["watches"][0]
+    assert events[0]["type"] == "draft" and events[0]["web_link"]
+    assert w["nudges_sent"] == 1 and w["deadline"] == "2026-08-11"  # Fri + 2bd -> Tue
+    assert w["drafts"][0] == {"message_id": "d1",
+                              "web_link": "https://outlook.example/d1",
+                              "created": w["drafts"][0]["created"], "sent": False}
+    post = [c for c in calls if c["method"] == "POST"]
+    assert post[0]["url"].endswith("/users/dan@negevlabs.com/messages/m2/createReplyAll")
+    assert not any(c["url"].endswith("/send") for c in post)  # NEVER sends
+    patch = [c for c in calls if c["method"] == "PATCH"][0]
+    assert patch["body"]["toRecipients"] == [
+        {"emailAddress": {"address": "salim.tamboli@vimta.com"}}]
+    assert "reminder" in patch["body"]["body"]["content"].lower()
+
+
+def test_process_deadlines_report_only_without_live(monkeypatch, fue_files):
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07")]}
+    monkeypatch.setattr(eps, "graph_post", lambda *a, **kw: pytest.fail("no Graph writes in report-only"))
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    # AUTHORIZED FIX to the brief's literal test: _compose_draft's own given
+    # implementation (and its documented "-> str (HTML body)" signature)
+    # always wraps Claude's text in <p> tags, so the event body can never
+    # equal the brief's literal raw-text expectation "Reminder body" -- it
+    # is always "<p>Reminder body</p>". Confirmed this fails against the
+    # brief's own unmodified code (see task-6-report.md). Fixing the
+    # expected value to match the documented HTML-body contract, not
+    # weakening what is asserted: still an exact match, still proves the
+    # report-only body carries Claude's real content.
+    assert events[0]["type"] == "would_draft" and events[0]["body"] == "<p>Reminder body</p>"
+    assert reg["watches"][0]["nudges_sent"] == 1
+
+
+def test_process_deadlines_before_deadline_noop(monkeypatch, fue_files):
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07")]}
+    assert fue.process_deadlines(reg, date(2026, 8, 6), dry_run=False) == []
+    assert reg["watches"][0]["nudges_sent"] == 0
+
+
+def test_process_deadlines_exhaustion(monkeypatch, fue_files):
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", nudges_sent=3)]}
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert events[0]["type"] == "exhausted"
+    assert reg["watches"][0]["status"] == "exhausted"
+
+
+def test_sweep_unsent_marks_sent_on_404(monkeypatch, fue_files):
+    w = _watch_in_registry()
+    w["drafts"] = [{"message_id": "d1", "web_link": "L1", "created": "c", "sent": False},
+                   {"message_id": "d2", "web_link": "L2", "created": "c", "sent": False}]
+    reg = {"watches": [w]}
+    def _get(url, params=None):
+        if "/messages/d1" in url:
+            raise RuntimeError("404 Not Found")   # sent or deleted -> gone
+        return {"id": "d2", "isDraft": True}
+    monkeypatch.setattr(eps, "graph_get", _get)
+    unsent = fue.sweep_unsent(reg)
+    assert w["drafts"][0]["sent"] is True
+    assert [u["web_link"] for u in unsent] == ["L2"]
+
+
+# Task 6 self-review additions -- mutation-testing driven. The brief's own
+# given tests (above) never exercise: an explicit interval_days=0 through
+# process_deadlines (the exact x-or-default anti-pattern this module's
+# standing rule forbids, reintroduced in the brief's literal Step 3 code and
+# fixed here the same way as Tasks 1 and 4), the dry_run=True parameter in
+# combination with FOLLOWUP_LIVE=1, the OTHER side of the max_nudges
+# boundary, non-active-watch skipping, the unparseable-deadline branch, a
+# compose/draft-creation failure's effect on registry state, multi-run
+# escalation, or any direct unit coverage of _create_draft/_compose_draft's
+# own internal branches (target selection, recipients, webLink fallback,
+# missing draft id, orphan-delete-on-failure, cleanup-failure-does-not-mask).
+# See task-6-report.md for the full mutation-testing narrative.
+
+
+def test_process_deadlines_interval_days_zero_survives_deadline_advance(monkeypatch, fue_files):
+    # AUTHORIZED FIX (Global Constraints, not the one mandated correction):
+    # the brief's literal code computes the next deadline via
+    # `w.get("interval_days") or FOLLOWUP_DEFAULT_BUSINESS_DAYS` -- the exact
+    # `x or default` anti-pattern already fixed in new_watch (Task 1) and
+    # _apply_command's resume (Task 4). An explicit interval_days=0
+    # ("chase same day") would be silently upgraded to the 2-day default.
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=0)]}
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert reg["watches"][0]["deadline"] == "2026-08-07"  # same day, NOT +2 business days
+
+
+def test_process_deadlines_unparseable_deadline_reset_respects_interval_days_zero(monkeypatch, fue_files):
+    # Same anti-pattern, second occurrence -- the unparseable-deadline reset
+    # branch has its own independent `w.get("interval_days") or DEFAULT`.
+    reg = {"watches": [_watch_in_registry(deadline="not-a-date", interval_days=0)]}
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("unparseable deadline must reset before drafting"))
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert events == []
+    assert reg["watches"][0]["deadline"] == "2026-08-07"  # same day, NOT +2
+    assert reg["watches"][0]["nudges_sent"] == 0  # this run only resets, never drafts
+
+
+def test_process_deadlines_dry_run_true_forces_report_only_even_when_live(monkeypatch, fue_files):
+    # Isolates the "not dry_run" half of `if _live() and not dry_run:` --
+    # the brief's own creates_draft_when_live test never passes dry_run=True,
+    # so a mutation dropping that half (leaving only `if _live():`) would
+    # pass every OTHER test in this file undetected.
+    monkeypatch.setenv("FOLLOWUP_LIVE", "1")
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07")]}
+    monkeypatch.setattr(eps, "graph_post",
+                        lambda *a, **kw: pytest.fail("dry_run=True must make zero Graph writes"))
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=True)
+    assert events[0]["type"] == "would_draft"
+    # In-memory bookkeeping still advances -- process_deadlines has no
+    # _save_registry call at all (same pattern as check_replies/Task 5);
+    # gating PERSISTENCE on dry_run is the future orchestrator's job, not
+    # this function's. Pinned here so that split of responsibility is
+    # documented and any accidental change is visible.
+    assert reg["watches"][0]["nudges_sent"] == 1
+
+
+def test_process_deadlines_exhaustion_leaves_nudges_and_deadline_unchanged(monkeypatch, fue_files):
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", nudges_sent=3)]}
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("an exhausted watch must never be drafted for"))
+    fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert reg["watches"][0]["nudges_sent"] == 3  # unchanged, not incremented to 4
+    assert reg["watches"][0]["deadline"] == "2026-08-07"  # unchanged
+
+
+def test_process_deadlines_one_below_max_nudges_still_drafts(monkeypatch, fue_files):
+    # The exhaustion boundary's OTHER side: nudges_sent == max_nudges - 1
+    # must still draft (escalation level == max_nudges), not exhaust early.
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", nudges_sent=2)]}
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert events[0]["type"] == "would_draft" and events[0]["escalation"] == 3
+    assert reg["watches"][0]["nudges_sent"] == 3
+    assert reg["watches"][0]["status"] == "active"  # not exhausted yet
+
+
+def test_process_deadlines_skips_non_active_watches(monkeypatch, fue_files):
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("a non-active watch must never be drafted for"))
+    for status in ("paused", "answered", "exhausted", "cancelled"):
+        reg = {"watches": [_watch_in_registry(deadline="2026-08-07", status=status)]}
+        events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+        assert events == [], f"status={status} must produce no events"
+        assert reg["watches"][0]["nudges_sent"] == 0, f"status={status} must not advance nudges_sent"
+
+
+def test_process_deadlines_unparseable_deadline_resets_and_skips(monkeypatch, fue_files):
+    reg = {"watches": [_watch_in_registry(deadline="not-a-date")]}
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("must reset the bad deadline, not draft"))
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert events == []
+    assert reg["watches"][0]["deadline"] == "2026-08-11"  # today (Fri) + 2 business days -> Tue
+    assert any("unparseable" in n["text"] for n in reg["watches"][0]["notes"])
+
+
+def test_process_deadlines_compose_failure_skips_that_watch_only(monkeypatch, fue_files):
+    broken = _watch_in_registry(deadline="2026-08-07")
+    ok = _watch_in_registry(deadline="2026-08-07")
+    reg = {"watches": [broken, ok]}
+    calls = {"n": 0}
+
+    def _claude(prompt, model, max_tokens=1200, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("claude down")
+        return "Reminder body"
+
+    monkeypatch.setattr(ld, "_call_claude_text", _claude)
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert reg["watches"][0]["nudges_sent"] == 0  # broken watch untouched, retried next run
+    assert reg["watches"][0]["deadline"] == "2026-08-07"  # unchanged
+    assert reg["watches"][1]["nudges_sent"] == 1  # ok watch still processed
+    assert len(events) == 1 and events[0]["watch_id"] == ok["id"]
+
+
+def test_process_deadlines_draft_creation_failure_leaves_nudges_and_deadline_unchanged(monkeypatch, fue_files):
+    monkeypatch.setenv("FOLLOWUP_LIVE", "1")
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07")]}
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+
+    def _boom(*a, **kw):
+        raise RuntimeError("graph down")
+
+    monkeypatch.setattr(eps, "graph_post", _boom)
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert events == []
+    assert reg["watches"][0]["nudges_sent"] == 0
+    assert reg["watches"][0]["deadline"] == "2026-08-07"
+    assert reg["watches"][0]["drafts"] == []
+
+
+def test_process_deadlines_second_reminder_escalates_to_2(monkeypatch, fue_files):
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=2)]}
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    first = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert first[0]["escalation"] == 1
+    assert reg["watches"][0]["deadline"] == "2026-08-11"  # Fri + 2bd -> Tue
+    second = fue.process_deadlines(reg, date(2026, 8, 11), dry_run=False)
+    assert second[0]["escalation"] == 2
+    assert reg["watches"][0]["nudges_sent"] == 2
+
+
+def test_create_draft_uses_latest_message_id_over_anchor(monkeypatch, fue_files):
+    w = _watch_in_registry()
+    w["anchor_message_id"] = "m2"
+    w["latest_message_id"] = "m5"  # advanced by a prior check_replies run
+    calls = _capture_writes(monkeypatch)
+    fue._create_draft(w, "<p>body</p>")
+    post = [c for c in calls if c["method"] == "POST"][0]
+    assert post["url"].endswith("/users/dan@negevlabs.com/messages/m5/createReplyAll")
+
+
+def test_create_draft_no_recipients_omits_to_field(monkeypatch, fue_files):
+    w = _watch_in_registry(recipients=[])
+    calls = _capture_writes(monkeypatch)
+    fue._create_draft(w, "<p>body</p>")
+    patch = [c for c in calls if c["method"] == "PATCH"][0]
+    assert "toRecipients" not in patch["body"]
+
+
+def test_create_draft_fetches_weblink_when_missing_from_create_response(monkeypatch, fue_files):
+    w = _watch_in_registry()
+
+    def _post(url, json_body):
+        assert url.endswith("/createReplyAll")
+        return {"id": "d7"}  # no webLink this time
+
+    def _get(url, params=None):
+        assert url.endswith("/messages/d7")
+        return {"webLink": "https://outlook.example/d7"}
+
+    monkeypatch.setattr(eps, "graph_post", _post)
+    monkeypatch.setattr(eps, "graph_patch", lambda url, json_body: {})
+    monkeypatch.setattr(eps, "graph_get", _get)
+    result = fue._create_draft(w, "<p>body</p>")
+    assert result["web_link"] == "https://outlook.example/d7"
+
+
+def test_create_draft_no_draft_id_raises_without_patch_or_delete(monkeypatch, fue_files):
+    w = _watch_in_registry()
+    calls = _capture_writes(monkeypatch, draft_id=None)
+    with pytest.raises(RuntimeError, match="no draft id"):
+        fue._create_draft(w, "<p>body</p>")
+    assert not any(c["method"] in ("PATCH", "DELETE") for c in calls)
+    assert len(calls) == 1  # only the createReplyAll POST happened
+
+
+def test_create_draft_patch_failure_deletes_orphan_and_reraises(monkeypatch, fue_files):
+    w = _watch_in_registry()
+    deleted = []
+
+    def _patch_boom(url, json_body):
+        raise RuntimeError("patch boom")
+
+    monkeypatch.setattr(eps, "graph_post",
+                        lambda url, json_body: {"id": "d9", "webLink": "https://outlook.example/d9"})
+    monkeypatch.setattr(eps, "graph_patch", _patch_boom)
+    monkeypatch.setattr(eps, "graph_delete", lambda url: deleted.append(url))
+    with pytest.raises(RuntimeError, match="patch boom"):
+        fue._create_draft(w, "<p>body</p>")
+    assert deleted == [f"{eps.MS_GRAPH_BASE}/users/dan@negevlabs.com/messages/d9"]
+
+
+def test_create_draft_cleanup_failure_does_not_mask_original_error(monkeypatch, fue_files):
+    w = _watch_in_registry()
+
+    def _patch_boom(url, json_body):
+        raise RuntimeError("patch boom")
+
+    def _delete_boom(url):
+        raise RuntimeError("delete boom")
+
+    monkeypatch.setattr(eps, "graph_post",
+                        lambda url, json_body: {"id": "d9", "webLink": "https://outlook.example/d9"})
+    monkeypatch.setattr(eps, "graph_patch", _patch_boom)
+    monkeypatch.setattr(eps, "graph_delete", _delete_boom)
+    with pytest.raises(RuntimeError, match="patch boom"):  # ORIGINAL error, not "delete boom"
+        fue._create_draft(w, "<p>body</p>")
+
+
+def test_create_draft_and_module_never_call_send(monkeypatch, fue_files):
+    # THE ABSOLUTE RULE: this module has no code path that sends to a
+    # counterparty. A runtime test can only prove "/send" is not called for
+    # the specific scenarios it exercises; a static source scan proves it
+    # for every scenario, including branches no test happens to hit.
+    import inspect
+    assert "/send" not in inspect.getsource(fue._create_draft)
+    assert "/send" not in inspect.getsource(fue)
+
+
+def test_compose_draft_wraps_paragraphs_and_escapes_html(monkeypatch):
+    w = _watch_in_registry()
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: "Dear colleagues,\n\nAny update on <status> & timing?\n\nBest")
+    body = fue._compose_draft(w)
+    assert body == ("<p>Dear colleagues,</p>"
+                    "<p>Any update on &lt;status&gt; &amp; timing?</p>"
+                    "<p>Best</p>")
+
+
+def test_compose_draft_empty_response_degrades_to_empty_paragraph(monkeypatch):
+    w = _watch_in_registry()
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "")
+    assert fue._compose_draft(w) == "<p></p>"
+
+
+def test_sweep_unsent_skips_cancelled_watch(monkeypatch, fue_files):
+    # MANDATED CORRECTION (pre-flight Ruling C): sweep_unsent must SKIP a
+    # cancelled watch even though Graph still reports isDraft=True on its
+    # draft -- the brief's literal code never reads w["status"], and
+    # _apply_command's cancel path (Task 4) only flips status, never
+    # touches w["drafts"], so an already-drafted watch that gets cancelled
+    # would otherwise be reported "still unsent" forever (spec line 47:
+    # re-report "daily until sent OR CANCELLED"). Paired with an otherwise-
+    # identical ACTIVE watch in the SAME test so the skip cannot be
+    # satisfied by sweep_unsent simply returning nothing.
+    cancelled = _watch_in_registry(status="cancelled")
+    cancelled["drafts"] = [{"message_id": "dc1", "web_link": "Lc1", "created": "c", "sent": False}]
+    active = _watch_in_registry(status="active")
+    active["drafts"] = [{"message_id": "da1", "web_link": "La1", "created": "c", "sent": False}]
+    reg = {"watches": [cancelled, active]}
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"id": "x", "isDraft": True})
+    unsent = fue.sweep_unsent(reg)
+    watch_ids = {u["watch_id"] for u in unsent}
+    assert cancelled["id"] not in watch_ids
+    assert active["id"] in watch_ids
+    assert [u["web_link"] for u in unsent] == ["La1"]
+    # Skipped entirely -- the draft itself is left alone, not force-marked sent.
+    assert cancelled["drafts"][0]["sent"] is False
+
+
+def test_sweep_unsent_still_reports_paused_watch_draft(monkeypatch, fue_files):
+    # Scope boundary of the mandated correction: ONLY "cancelled" is
+    # skipped. A paused watch (owner replied but did not answer) still has
+    # its stale draft reported -- nothing in the ruling or the spec says
+    # paused should be silenced too.
+    w = _watch_in_registry(status="paused")
+    w["drafts"] = [{"message_id": "dp1", "web_link": "Lp1", "created": "c", "sent": False}]
+    reg = {"watches": [w]}
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"isDraft": True})
+    unsent = fue.sweep_unsent(reg)
+    assert [u["web_link"] for u in unsent] == ["Lp1"]
+
+
+def test_sweep_unsent_skips_already_sent_draft_without_graph_call(monkeypatch, fue_files):
+    w = _watch_in_registry()
+    w["drafts"] = [{"message_id": "ds1", "web_link": "Ls1", "created": "c", "sent": True}]
+    reg = {"watches": [w]}
+    monkeypatch.setattr(eps, "graph_get",
+                        lambda url, params=None: pytest.fail("already-sent draft must not hit Graph"))
+    assert fue.sweep_unsent(reg) == []
+
+
+def test_sweep_unsent_isdraft_false_marks_sent_without_exception(monkeypatch, fue_files):
+    # Distinct from the 404 path: the message still exists but is no longer
+    # a draft (it was sent) -- no exception raised, just isDraft: False.
+    w = _watch_in_registry()
+    w["drafts"] = [{"message_id": "df1", "web_link": "Lf1", "created": "c", "sent": False}]
+    reg = {"watches": [w]}
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"id": "df1", "isDraft": False})
+    unsent = fue.sweep_unsent(reg)
+    assert unsent == []
+    assert w["drafts"][0]["sent"] is True
+    assert any("left the Drafts folder" in n["text"] for n in w["notes"])

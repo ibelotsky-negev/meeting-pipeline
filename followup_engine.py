@@ -674,3 +674,161 @@ def check_replies(reg: dict) -> list:
             events.append({"type": "reply_paused", "owner": w["owner"],
                            "watch_id": w["id"], "ask": w["ask"], "who": who, "when": when})
     return events
+
+
+# ----------------------------------------------------------------------
+#  Daily check part 2: drafting on silence -- never sending
+# ----------------------------------------------------------------------
+
+_DRAFT_PROMPT = """Write the body of a follow-up reminder email on an existing thread.
+
+Context: we are awaiting "{ask}" on the thread "{subject}". This is reminder
+number {escalation} of at most {max_nudges} (1 = gentle nudge, {max_nudges} =
+firm but professional, referencing prior reminders).
+
+Hard rules: request a status update ONLY. Do not invent facts, commitments,
+deadlines, or consequences. Do not mention automation. No subject line, no
+placeholders -- ready to send as-is. Address the recipients generically
+(e.g. "Dear colleagues") unless names are obvious from the ask. 80-150 words,
+plain paragraphs separated by blank lines."""
+
+
+def _compose_draft(watch: dict) -> str:
+    text = ld._call_claude_text(
+        _DRAFT_PROMPT.format(ask=watch["ask"], subject=watch["subject"],
+                             escalation=watch.get("nudges_sent", 0) + 1,
+                             max_nudges=watch.get("max_nudges", FOLLOWUP_MAX_NUDGES)),
+        DRAFT_MODEL, max_tokens=1200)
+    paras = [p.strip() for p in (text or "").split("\n\n") if p.strip()]
+    return "".join(f"<p>{_esc(p)}</p>" for p in paras) or "<p></p>"
+
+
+def _create_draft(watch: dict, body_html: str) -> dict:
+    """createReplyAll on the newest known thread message in the OWNER's
+    mailbox, then PATCH body (+ explicit recipients, keeping inherited CC so
+    the prime CRO stays in the loop). Leaves the message AS A DRAFT -- this
+    module has no code path that sends it. Orphan cleanup mirrors
+    x_transcribe_email.send_threaded_reply."""
+    base = f"{eps.MS_GRAPH_BASE}/users/{watch['mailbox']}/messages"
+    target = watch.get("latest_message_id") or watch["anchor_message_id"]
+    draft = eps.graph_post(f"{base}/{target}/createReplyAll", {}) or {}
+    draft_id = draft.get("id")
+    if not draft_id:
+        raise RuntimeError("createReplyAll returned no draft id")
+    patch_body = {"body": {"contentType": "HTML", "content": body_html}}
+    if watch.get("recipients"):
+        patch_body["toRecipients"] = [
+            {"emailAddress": {"address": r}} for r in watch["recipients"]]
+    try:
+        eps.graph_patch(f"{base}/{draft_id}", patch_body)
+    except Exception:
+        try:
+            eps.graph_delete(f"{base}/{draft_id}")
+        except Exception as cleanup_err:
+            logger.warning(f"[followup] could not delete orphaned draft {draft_id}: {cleanup_err}")
+        raise
+    web_link = draft.get("webLink") or ""
+    if not web_link:
+        try:
+            web_link = (eps.graph_get(f"{base}/{draft_id}", params={"$select": "webLink"}) or {}).get("webLink") or ""
+        except Exception:
+            web_link = ""
+    return {"message_id": draft_id, "web_link": web_link,
+            "created": datetime.now(timezone.utc).isoformat(), "sent": False}
+
+
+def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
+    events = []
+    for w in reg.get("watches") or []:
+        if w.get("status") != "active":
+            continue
+        try:
+            deadline = date.fromisoformat(w.get("deadline") or "")
+        except ValueError:
+            _note(w, f"unparseable deadline {w.get('deadline')!r}; resetting")
+            # is None (not falsy) check -- an explicit interval_days=0 must
+            # survive a deadline reset too; `x or default` would silently
+            # upgrade a same-day-chase watch to the 2-day default. Same fix
+            # as new_watch (Task 1) and _apply_command's resume (Task 4) --
+            # standing rule, do not reintroduce.
+            stored_interval = w.get("interval_days")
+            interval = (FOLLOWUP_DEFAULT_BUSINESS_DAYS if stored_interval is None
+                        else int(stored_interval))
+            w["deadline"] = add_business_days(today, interval).isoformat()
+            continue
+        if today < deadline:
+            continue
+        if w.get("nudges_sent", 0) >= w.get("max_nudges", FOLLOWUP_MAX_NUDGES):
+            w["status"] = "exhausted"
+            _note(w, "max reminders reached; escalated to owner")
+            events.append({"type": "exhausted", "owner": w["owner"], "watch_id": w["id"],
+                           "ask": w["ask"], "recipients": w["recipients"],
+                           "escalation": w.get("nudges_sent", 0)})
+            continue
+        try:
+            body_html = _compose_draft(w)
+        except Exception as e:
+            logger.warning(f"[followup] compose failed for {w['id']}: {e}")
+            continue  # try again next run; deadline unchanged
+        escalation = w.get("nudges_sent", 0) + 1
+        if _live() and not dry_run:
+            try:
+                d = _create_draft(w, body_html)
+            except Exception as e:
+                logger.warning(f"[followup] draft creation failed for {w['id']}: {e}")
+                continue  # try again next run
+            w.setdefault("drafts", []).append(d)
+            _note(w, f"reminder {escalation} drafted ({d['message_id']})")
+            events.append({"type": "draft", "owner": w["owner"], "watch_id": w["id"],
+                           "ask": w["ask"], "recipients": w["recipients"],
+                           "body": body_html, "web_link": d["web_link"],
+                           "escalation": escalation})
+        else:
+            _note(w, f"reminder {escalation} would be drafted (report-only)")
+            events.append({"type": "would_draft", "owner": w["owner"], "watch_id": w["id"],
+                           "ask": w["ask"], "recipients": w["recipients"],
+                           "body": body_html, "escalation": escalation})
+        w["nudges_sent"] = escalation
+        # is None check -- see comment above; same anti-pattern, same fix.
+        stored_interval = w.get("interval_days")
+        interval = (FOLLOWUP_DEFAULT_BUSINESS_DAYS if stored_interval is None
+                    else int(stored_interval))
+        w["deadline"] = add_business_days(today, interval).isoformat()
+    return events
+
+
+def sweep_unsent(reg: dict) -> list:
+    """A draft that no longer exists (404) or is no longer isDraft was sent or
+    deleted by the owner -- stop listing it. Anything still isDraft is UNSENT
+    and gets re-reported daily until acted on.
+
+    MANDATED CORRECTION (pre-flight Ruling C): a CANCELLED watch is skipped
+    entirely, even if Graph still reports isDraft=True on its draft. Spec
+    line 47 requires an unsent draft be re-reported "daily until sent or
+    cancelled" -- the brief's literal code here only ever looked at Graph's
+    isDraft/404 state and never read w["status"], so a watch cancelled AFTER
+    its draft was created would otherwise nag forever, since
+    _apply_command's cancel path (Task 4) only flips status and never
+    touches w["drafts"]. Only "cancelled" is skipped -- paused, answered,
+    and exhausted watches still get their stale drafts reported, unchanged
+    from the brief."""
+    unsent = []
+    for w in reg.get("watches") or []:
+        if w.get("status") == "cancelled":
+            continue
+        base = f"{eps.MS_GRAPH_BASE}/users/{w['mailbox']}/messages"
+        for d in (w.get("drafts") or []):
+            if d.get("sent"):
+                continue
+            try:
+                msg = eps.graph_get(f"{base}/{d['message_id']}", params={"$select": "isDraft"}) or {}
+                still_draft = bool(msg.get("isDraft"))
+            except Exception:
+                still_draft = False  # gone -> sent or deleted either way
+            if still_draft:
+                unsent.append({"owner": w["owner"], "watch_id": w["id"], "ask": w["ask"],
+                               "web_link": d.get("web_link") or "", "created": d.get("created") or ""})
+            else:
+                d["sent"] = True
+                _note(w, f"draft {d['message_id']} left the Drafts folder")
+    return unsent
