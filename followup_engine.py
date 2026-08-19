@@ -166,3 +166,85 @@ def _note(watch: dict, text: str):
     watch.setdefault("notes", []).append(
         {"ts": datetime.now(timezone.utc).isoformat(), "text": text})
     watch["updated"] = datetime.now(timezone.utc).isoformat()
+
+
+# ----------------------------------------------------------------------
+#  Intake: gates, commands, instruction parsing
+# ----------------------------------------------------------------------
+
+_TRIGGER_RE = re.compile(r"\b(follow[\s-]?up|remind(?:er)?|chase)\b", re.I)
+# Media links belong to x_transcribe_email; a follow-up request never needs one.
+_MEDIA_RE = re.compile(r"(?:x\.com|twitter\.com|youtube\.com|youtu\.be)/", re.I)
+_WATCH_ID_RE = re.compile(r"\bfw_[0-9a-f]{8}\b")
+_CANCEL_RE = re.compile(r"\b(stop|cancel|done)\b", re.I)
+_RESUME_RE = re.compile(r"\b(resume|continue|keep|re-?arm)\b", re.I)
+
+
+def _parse_command(body_text: str) -> str:
+    # Deterministic, no LLM: cancel wins over resume on a conflicting message.
+    if _CANCEL_RE.search(body_text or ""):
+        return "cancel"
+    if _RESUME_RE.search(body_text or ""):
+        return "resume"
+    return None
+
+
+def _extract_json(text: str):
+    if not text:
+        return None
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    candidate = m.group(1) if m else None
+    if candidate is None:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        candidate = text[start:end + 1]
+    try:
+        return json.loads(candidate)
+    except (ValueError, TypeError):
+        return None
+
+
+_PARSE_PROMPT = """You extract follow-up watch requests from a team member's email to Sara, \
+an email assistant. The member forwards an email thread and asks Sara to remind/chase \
+someone if they do not reply.
+
+Email subject: {subject}
+
+Email body (new text only, may include forwarded headers):
+---
+{body}
+---
+
+Reply with JSON ONLY, no prose:
+{{"is_request": true/false,
+  "thread_subject": "subject of the thread to watch, without FW:/RE: prefixes",
+  "counterparties": ["email addresses or names of who should reply"],
+  "asks": [{{"ask": "one specific thing awaited, in plain words",
+             "recipients": ["explicit reminder recipients if the sender named any, else []"],
+             "days": <integer business days to wait, or null>,
+             "date": "YYYY-MM-DD explicit deadline, or null"}}]}}
+
+Rules: is_request is false unless the sender clearly asks to follow up / remind / chase \
+if someone does not reply. Split independent awaited items into SEPARATE asks. Never \
+invent recipients or deadlines the sender did not give."""
+
+
+def parse_instruction(subject: str, body_text: str) -> dict:
+    try:
+        raw = ld._call_claude_text(
+            _PARSE_PROMPT.format(subject=subject or "", body=(body_text or "")[:6000]),
+            PARSE_MODEL, max_tokens=1000)
+    except Exception as e:
+        logger.warning(f"[followup] instruction parse failed: {e}")
+        return {"is_request": False}
+    out = _extract_json(raw)
+    if not out or not isinstance(out, dict) or not out.get("is_request"):
+        return {"is_request": False}
+    asks = [a for a in (out.get("asks") or []) if isinstance(a, dict) and (a.get("ask") or "").strip()]
+    if not asks:
+        return {"is_request": False}
+    out["asks"] = asks
+    out["thread_subject"] = (out.get("thread_subject") or "").strip()
+    out["counterparties"] = [c for c in (out.get("counterparties") or []) if c]
+    return out

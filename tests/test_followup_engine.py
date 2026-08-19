@@ -89,3 +89,105 @@ def test_live_gate_reads_env_at_call_time(monkeypatch):
     assert fue._live() is False
     monkeypatch.setenv("FOLLOWUP_LIVE", "1")
     assert fue._live() is True
+
+
+def test_trigger_and_media_regexes():
+    assert fue._TRIGGER_RE.search("please follow up if no reply")
+    assert fue._TRIGGER_RE.search("send a REMINDER on Thursday")
+    assert fue._TRIGGER_RE.search("chase Vimta on both points")
+    assert not fue._TRIGGER_RE.search("here are the meeting notes")
+    assert fue._MEDIA_RE.search("watch https://youtu.be/abc123")
+    assert not fue._MEDIA_RE.search("see https://vimta.com/about")
+
+
+def test_parse_command_words():
+    assert fue._parse_command("stop") == "cancel"
+    assert fue._parse_command("Please CANCEL fw_1234abcd") == "cancel"
+    assert fue._parse_command("done, they replied") == "cancel"
+    assert fue._parse_command("resume chasing") == "resume"
+    assert fue._parse_command("keep going") == "resume"
+    assert fue._parse_command("thanks!") is None
+
+
+def test_extract_json_fenced_and_bare():
+    assert fue._extract_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert fue._extract_json('noise {"a": {"b": 2}} trailing') == {"a": {"b": 2}}
+    assert fue._extract_json("no json here") is None
+
+
+def test_parse_instruction_happy(monkeypatch):
+    canned = json.dumps({
+        "is_request": True,
+        "thread_subject": "Negev_28-Day repeated dose toxicity study in dogs",
+        "counterparties": ["salim.tamboli@vimta.com", "habibur.khan@vimta.in"],
+        "asks": [
+            {"ask": "status of the investigation",
+             "recipients": ["salim.tamboli@vimta.com", "habibur.khan@vimta.in"],
+             "days": 2, "date": None},
+            {"ask": "summary report for the 28-day dog study",
+             "recipients": ["salim.tamboli@vimta.com", "habibur.khan@vimta.in"],
+             "days": 2, "date": None},
+        ],
+    })
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
+    out = fue.parse_instruction("FW: Negev_28-Day dog tox", "if Vimta does not reply within 2 days ...")
+    assert out["is_request"] is True and len(out["asks"]) == 2
+
+
+def test_parse_instruction_degrades_on_garbage(monkeypatch):
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: "NOT JSON")
+    assert fue.parse_instruction("s", "b") == {"is_request": False}
+    def _boom(p, m, max_tokens=2000, **kw):
+        raise RuntimeError("api down")
+    monkeypatch.setattr(ld, "_call_claude_text", _boom)
+    assert fue.parse_instruction("s", "b") == {"is_request": False}
+
+
+# Self-review additions below: real-behavior coverage the brief's tests did
+# not exercise -- fenced+nested JSON (parse_instruction's actual shape), the
+# asks-filter branch, and the days=0 contract called out in the Task 2 prompt.
+
+
+def test_extract_json_fenced_nested():
+    fenced = '```json\n{"is_request": true, "asks": [{"ask": "x"}, {"ask": "y"}]}\n```'
+    assert fue._extract_json(fenced) == {
+        "is_request": True,
+        "asks": [{"ask": "x"}, {"ask": "y"}],
+    }
+
+
+def test_parse_command_none_body():
+    assert fue._parse_command(None) is None
+
+
+def test_parse_instruction_preserves_days_zero(monkeypatch):
+    # Task 1 fixed new_watch to honor an explicit interval_days=0 (same-day
+    # chase) instead of upgrading it to the default; parse_instruction must
+    # not undo that with a truthiness check on the parsed "days".
+    canned = json.dumps({
+        "is_request": True,
+        "thread_subject": "s",
+        "counterparties": ["a@vimta.com"],
+        "asks": [{"ask": "status", "recipients": [], "days": 0, "date": None}],
+    })
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
+    out = fue.parse_instruction("s", "b")
+    assert out["asks"][0]["days"] == 0
+
+
+def test_parse_instruction_filters_blank_asks(monkeypatch):
+    canned = json.dumps({
+        "is_request": True,
+        "thread_subject": "s",
+        "counterparties": [],
+        "asks": [{"ask": "  "}, {"ask": "status"}, {"ask": ""}],
+    })
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
+    out = fue.parse_instruction("s", "b")
+    assert [a["ask"] for a in out["asks"]] == ["status"]
+
+
+def test_parse_instruction_all_blank_asks_degrades(monkeypatch):
+    canned = json.dumps({"is_request": True, "asks": [{"ask": ""}, {"ask": "   "}]})
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
+    assert fue.parse_instruction("s", "b") == {"is_request": False}
