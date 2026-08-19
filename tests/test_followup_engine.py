@@ -393,3 +393,332 @@ def test_normalize_subject_keeps_mid_string_bracket():
     # Only a LEADING bracketed tag is noise; a bracket appearing after real
     # subject text must survive untouched.
     assert fue._normalize_subject("RE: mid [EXTERNAL] string") == "mid [EXTERNAL] string"
+
+
+def _intake_msg(mid, sender, subject, body, cid="conv-intake-1"):
+    return {
+        "id": mid, "internetMessageId": mid, "subject": subject,
+        "from": {"emailAddress": {"address": sender}},
+        "receivedDateTime": "2026-08-18T08:00:00Z",
+        "conversationId": cid,
+        "uniqueBody": {"content": f"<html><body>{body}</body></html>"},
+        "internetMessageHeaders": [],
+    }
+
+
+@pytest.fixture
+def intake_world(monkeypatch, fue_files):
+    """Sara inbox has one forward-with-instruction; owner mailbox search
+    resolves one conversation. Claude parse returns two asks. Captures the
+    confirmation reply."""
+    instruction = _intake_msg(
+        "im1", "dan@negevlabs.com", "FW: Dog tox study",
+        "Sara: if Vimta does not reply within 2 days, follow up on the "
+        "investigation status and the summary report.")
+    thread_newest = _graph_msg("m2", "cid-right", "RE: Dog tox study",
+                               "upendra.kumar@adgyllifesciences.com",
+                               "2026-08-05T07:23:00Z",
+                               to=["salim.tamboli@vimta.com"],
+                               cc=["dan@negevlabs.com", "habibur.khan@vimta.in"])
+
+    def _graph_get(url, params=None):
+        if f"/users/{fue.SARA_MAILBOX}/mailFolders/inbox/messages" in url:
+            return {"value": [instruction]}
+        if "/users/dan@negevlabs.com/messages" in url:
+            return {"value": [thread_newest]}
+        return {"value": []}
+
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    canned = json.dumps({
+        "is_request": True, "thread_subject": "Dog tox study",
+        "counterparties": ["salim.tamboli@vimta.com"],
+        "asks": [
+            {"ask": "investigation status", "recipients": ["salim.tamboli@vimta.com", "habibur.khan@vimta.in"], "days": 2, "date": None},
+            {"ask": "summary report", "recipients": [], "days": 2, "date": None},
+        ],
+    })
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
+    replies = []
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda mid, html_body, attachments=None: replies.append((mid, html_body)))
+    return {"replies": replies}
+
+
+def test_run_intake_registers_watch_per_ask(intake_world):
+    out = fue.run_intake()
+    assert out["registered"] == 2
+    reg = fue._load_registry()
+    assert len(reg["watches"]) == 2
+    w = reg["watches"][0]
+    assert w["owner"] == "dan@negevlabs.com"
+    assert w["mailbox"] == "dan@negevlabs.com"
+    assert w["conversation_id"] == "cid-right"
+    assert w["anchor_message_id"] == "m2"
+    assert w["recipients"] == ["salim.tamboli@vimta.com", "habibur.khan@vimta.in"]
+    # Ask 2 gave no explicit recipients -> external thread participants.
+    w2 = reg["watches"][1]
+    assert set(w2["recipients"]) == {"salim.tamboli@vimta.com",
+                                     "habibur.khan@vimta.in",
+                                     "upendra.kumar@adgyllifesciences.com"}
+    # Confirmation reply went out on the instruction email and names both ids.
+    replies = intake_world["replies"]
+    assert len(replies) == 1 and replies[0][0] == "im1"
+    assert w["id"] in replies[0][1] and w2["id"] in replies[0][1]
+    # Idempotent: second scan does nothing.
+    assert fue.run_intake()["registered"] == 0
+
+
+def test_run_intake_dry_run_writes_nothing(intake_world):
+    out = fue.run_intake(dry_run=True)
+    assert out["registered"] == 2
+    assert fue._load_registry()["watches"] == []
+    assert intake_world["replies"] == []
+
+
+def test_run_intake_ignores_external_and_media(monkeypatch, fue_files):
+    ext = _intake_msg("x1", "spam@evil.com", "follow up", "follow up please")
+    media = _intake_msg("x2", "dan@negevlabs.com", "fyi",
+                        "follow up on https://youtu.be/abc123 later")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [ext, media]})
+    called = []
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: called.append(1) or '{"is_request": false}')
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda *a, **kw: pytest.fail("must not reply"))
+    out = fue.run_intake()
+    assert out["registered"] == 0
+    assert called == []  # media-link mail never reaches the parser
+
+
+def test_run_intake_cancel_command_by_watch_id(monkeypatch, fue_files):
+    reg = {"watches": [fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid-right", anchor_message_id="m2",
+        anchor_received="2026-08-05T07:23:00Z", subject="Dog tox",
+        ask="investigation status", recipients=[], interval_days=2,
+        deadline=date(2026, 8, 7), intake_conversation_id="conv-intake-1")]}
+    wid = reg["watches"][0]["id"]
+    fue._save_registry(reg)
+    cmd = _intake_msg("c1", "dan@negevlabs.com", "RE: registered",
+                      f"stop {wid} please", cid="conv-other")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [cmd]})
+    replies = []
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda mid, html_body, attachments=None: replies.append(mid))
+    out = fue.run_intake()
+    assert out["commands"] == 1
+    assert fue._load_registry()["watches"][0]["status"] == "cancelled"
+    assert replies == ["c1"]
+
+
+def test_run_intake_unresolvable_thread_replies_honestly(monkeypatch, fue_files):
+    instruction = _intake_msg("im2", "dan@negevlabs.com", "FW: Mystery",
+                              "please follow up if they do not reply")
+    def _graph_get(url, params=None):
+        if "/mailFolders/inbox/" in url:
+            return {"value": [instruction]}
+        return {"value": []}  # owner-mailbox search finds nothing
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: json.dumps({
+        "is_request": True, "thread_subject": "Mystery", "counterparties": [],
+        "asks": [{"ask": "an answer", "recipients": [], "days": None, "date": None}]}))
+    replies = []
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda mid, html_body, attachments=None: replies.append((mid, html_body)))
+    out = fue.run_intake()
+    assert out["failures"] == 1 and fue._load_registry()["watches"] == []
+    assert replies and "could not" in replies[0][1].lower()
+
+
+# Self-review additions below: real-behavior coverage the brief's tests did
+# not exercise -- the two gates never triggered by the brief's fixtures
+# (Sara's own outbound, an auto-reply), the dry-run guard on the COMMAND
+# path (the brief only dry-run-tests registration), the resume side of
+# _apply_command (never exercised at all, directly or via run_intake), and
+# the incremental-persistence contract (processed-ids written after EACH
+# handled message, not batched at the end) that a crash mid-scan depends on.
+# Also regression tests for a falsy-check bug in the brief's own Step 3 code
+# (run_intake's "days" -> interval_days, and _apply_command's resume-deadline
+# recompute both used `x or default`, which silently upgrades an explicit
+# 0 -- a legitimate same-day-chase value per Task 1's new_watch contract --
+# to FOLLOWUP_DEFAULT_BUSINESS_DAYS). Fixed to an `is None` check in both
+# spots to match new_watch and parse_instruction's existing 0-preserving
+# contract; these tests pin that fix.
+
+
+def test_run_intake_preserves_days_zero(monkeypatch, fue_files):
+    instruction = _intake_msg("d0", "dan@negevlabs.com", "FW: Same day",
+                              "please follow up today if they do not reply")
+    thread_newest = _graph_msg("m9", "cid-sameday", "RE: Same day",
+                               "person@vimta.com", "2026-08-05T07:23:00Z")
+
+    def _graph_get(url, params=None):
+        if f"/users/{fue.SARA_MAILBOX}/mailFolders/inbox/messages" in url:
+            return {"value": [instruction]}
+        if "/users/dan@negevlabs.com/messages" in url:
+            return {"value": [thread_newest]}
+        return {"value": []}
+
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    canned = json.dumps({
+        "is_request": True, "thread_subject": "Same day", "counterparties": [],
+        "asks": [{"ask": "a same-day chase", "recipients": [], "days": 0, "date": None}],
+    })
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
+    monkeypatch.setattr(xte, "send_threaded_reply", lambda *a, **kw: None)
+    out = fue.run_intake()
+    assert out["registered"] == 1
+    w = fue._load_registry()["watches"][0]
+    assert w["interval_days"] == 0
+    assert w["deadline"] == fue._today_il().isoformat()
+
+
+def test_apply_command_resume_recomputes_deadline():
+    w = fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid1", anchor_message_id="m1",
+        anchor_received="2026-08-05T04:23:00Z", subject="s", ask="a",
+        recipients=[], interval_days=3, deadline=date(2026, 8, 7),
+        intake_conversation_id="conv-intake")
+    w["status"] = "paused"
+    changed = fue._apply_command({"watches": [w]}, [w], "resume")
+    assert changed == [w["id"]]
+    assert w["status"] == "active"
+    assert w["deadline"] == fue.add_business_days(fue._today_il(), 3).isoformat()
+
+
+def test_apply_command_resume_preserves_interval_days_zero():
+    # Same falsy-check bug class Task 1 fixed in new_watch: an explicit
+    # interval_days=0 (same-day chase) must not be silently upgraded to the
+    # default when a paused watch is resumed and its deadline recomputed.
+    w = fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid1", anchor_message_id="m1",
+        anchor_received="2026-08-05T04:23:00Z", subject="s", ask="a",
+        recipients=[], interval_days=0, deadline=date(2026, 8, 7),
+        intake_conversation_id="conv-intake")
+    w["status"] = "paused"
+    fue._apply_command({"watches": [w]}, [w], "resume")
+    assert w["deadline"] == fue._today_il().isoformat()
+
+
+def test_apply_command_cancel_ignores_terminal_watch():
+    w = fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid1", anchor_message_id="m1",
+        anchor_received="2026-08-05T04:23:00Z", subject="s", ask="a",
+        recipients=[], interval_days=2, deadline=date(2026, 8, 7),
+        intake_conversation_id="conv-intake")
+    w["status"] = "answered"
+    changed = fue._apply_command({"watches": [w]}, [w], "cancel")
+    assert changed == []
+    assert w["status"] == "answered"
+
+
+def test_run_intake_skips_own_outbound(monkeypatch, fue_files):
+    # Loop guard: a message landing in Sara's inbox FROM Sara herself (a CC
+    # loop, a bounce, etc.) must never be treated as a follow-up request.
+    m = _intake_msg("s1", fue.SARA_MAILBOX, "FW: Dog tox study", "follow up please")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [m]})
+    called = []
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: called.append(1) or '{"is_request": false}')
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda *a, **kw: pytest.fail("must not reply to self"))
+    out = fue.run_intake()
+    assert out["registered"] == 0 and out["commands"] == 0 and out["failures"] == 0
+    assert called == []
+
+
+def test_run_intake_ignores_auto_reply(monkeypatch, fue_files):
+    # An autoresponder (OOO, ticketing bounce) must never be parsed as a
+    # follow-up instruction even from an internal sender with trigger words.
+    m = _intake_msg("a1", "dan@negevlabs.com", "Auto: Out of office",
+                    "follow up: I am out of office this week")
+    m["internetMessageHeaders"] = [{"name": "Auto-Submitted", "value": "auto-replied"}]
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [m]})
+    called = []
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: called.append(1) or '{"is_request": false}')
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda *a, **kw: pytest.fail("must not reply to an auto-reply"))
+    out = fue.run_intake()
+    assert out["registered"] == 0 and out["commands"] == 0 and out["failures"] == 0
+    assert called == []
+    # Marked processed so it is not re-evaluated every 15-min scan forever.
+    assert "a1" in fue._load_processed()
+
+
+def test_run_intake_dry_run_command_leaves_registry_untouched(monkeypatch, fue_files):
+    reg = {"watches": [fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid-right", anchor_message_id="m2",
+        anchor_received="2026-08-05T07:23:00Z", subject="Dog tox",
+        ask="investigation status", recipients=[], interval_days=2,
+        deadline=date(2026, 8, 7), intake_conversation_id="conv-intake-1")]}
+    wid = reg["watches"][0]["id"]
+    fue._save_registry(reg)
+    cmd = _intake_msg("c1", "dan@negevlabs.com", "RE: registered",
+                      f"stop {wid} please", cid="conv-other")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [cmd]})
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda *a, **kw: pytest.fail("dry run must not reply"))
+    out = fue.run_intake(dry_run=True)
+    assert out["commands"] == 1
+    assert fue._load_registry()["watches"][0]["status"] == "active"
+    assert fue._load_processed() == set()
+
+
+def test_run_intake_persists_incrementally_survives_mid_scan_crash(monkeypatch, fue_files):
+    """Processed-ids (and the registry mutation for a message already fully
+    handled) must be on disk BEFORE a later message in the same batch can
+    crash the scan -- otherwise a restart re-sends a reply that already went
+    out. Message 1 completes normally; message 2's reply-send raises,
+    simulating a crash/restart. A retry must not touch message 1 again."""
+    watch_a = fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid-a", anchor_message_id="ma",
+        anchor_received="2026-08-01T00:00:00Z", subject="A", ask="a",
+        recipients=[], interval_days=2, deadline=date(2026, 8, 7),
+        intake_conversation_id="conv-a")
+    watch_b = fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid-b", anchor_message_id="mb",
+        anchor_received="2026-08-01T00:00:00Z", subject="B", ask="b",
+        recipients=[], interval_days=2, deadline=date(2026, 8, 7),
+        intake_conversation_id="conv-b")
+    fue._save_registry({"watches": [watch_a, watch_b]})
+    cmd1 = _intake_msg("c1", "dan@negevlabs.com", "RE: a", f"stop {watch_a['id']}", cid="conv-a")
+    cmd2 = _intake_msg("c2", "dan@negevlabs.com", "RE: b", f"stop {watch_b['id']}", cid="conv-b")
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [cmd1, cmd2]})
+
+    replies = []
+    call_count = {"n": 0}
+
+    def _flaky_send(mid, html_body, attachments=None):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated crash mid-scan")
+        replies.append(mid)
+
+    monkeypatch.setattr(xte, "send_threaded_reply", _flaky_send)
+    with pytest.raises(RuntimeError):
+        fue.run_intake()
+
+    # Message 1 fully completed and persisted before message 2 crashed.
+    assert fue._load_processed() == {"c1"}
+    assert replies == ["c1"]
+    reg_after_crash = fue._load_registry()["watches"]
+    assert reg_after_crash[0]["status"] == "cancelled"
+    # watch_b's mutation is ALSO already on disk (registry is saved before
+    # the reply is sent in the command branch) -- not a bug: re-applying
+    # cancel to an already-cancelled watch on retry is a safe no-op.
+    assert reg_after_crash[1]["status"] == "cancelled"
+
+    # Retry with a healthy send: c1 (already handled) must not be replayed.
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda mid, html_body, attachments=None: replies.append(mid))
+    out = fue.run_intake()
+    assert out["commands"] == 1  # only c2 this scan; c1 was skipped outright
+    assert replies == ["c1", "c2"]  # c1 not resent
+    assert fue._load_processed() == {"c1", "c2"}

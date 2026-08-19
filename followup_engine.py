@@ -333,3 +333,180 @@ def resolve_thread(mailbox: str, subject_hint: str, counterparties: list):
         "subject": anchor.get("subject") or q,
         "participants": entry["participants"],
     }
+
+
+# ----------------------------------------------------------------------
+#  Intake scan
+# ----------------------------------------------------------------------
+
+
+def _esc(s: str) -> str:
+    return html.escape(s or "", quote=False)
+
+
+def _confirmation_html(watches: list) -> str:
+    rows = "".join(
+        f"<li><code>{_esc(w['id'])}</code> -- {_esc(w['ask'])} -> "
+        f"{_esc(', '.join(w['recipients']))}; reminder drafted if silent past "
+        f"<b>{_esc(w['deadline'])}</b> (max {w['max_nudges']} reminders)</li>"
+        for w in watches)
+    return (f"<p>Registered {len(watches)} follow-up watch(es) on "
+            f"<b>{_esc(watches[0]['subject'])}</b>:</p><ul>{rows}</ul>"
+            "<p>I check once a day at 17:00 and place ready-to-send drafts in your "
+            "Drafts folder; you will get a report email whenever there is anything "
+            "new or still unsent. Reply <b>stop</b> (optionally with watch ids) to "
+            "cancel, <b>resume</b> to re-arm a paused watch.</p>")
+
+
+def _failure_html(reason: str) -> str:
+    return (f"<p>I could not register that follow-up: {_esc(reason)}</p>"
+            "<p>Forward the thread again (keeping its subject line), or name the "
+            "exact subject and who should reply.</p>")
+
+
+def _apply_command(reg: dict, watches: list, cmd: str) -> list:
+    changed = []
+    for w in watches:
+        if cmd == "cancel" and w.get("status") in ("active", "paused"):
+            w["status"] = "cancelled"
+            _note(w, "cancelled by owner reply")
+            changed.append(w["id"])
+        elif cmd == "resume" and w.get("status") == "paused":
+            w["status"] = "active"
+            # is None (not falsy) check -- same contract as new_watch's
+            # interval_days=0 (Task 1): an explicit same-day-chase cadence
+            # must survive a resume, not get silently upgraded to the
+            # default by an `x or default` truthiness check on 0.
+            stored_interval = w.get("interval_days")
+            interval = (FOLLOWUP_DEFAULT_BUSINESS_DAYS if stored_interval is None
+                        else int(stored_interval))
+            w["deadline"] = add_business_days(_today_il(), interval).isoformat()
+            _note(w, "re-armed by owner reply")
+            changed.append(w["id"])
+    return changed
+
+
+def run_intake(dry_run: bool = False, limit: int = None) -> dict:
+    """Scan Sara's inbox for follow-up registrations and owner commands.
+    Idempotent via processed internetMessageIds, persisted after each
+    handled message. Dry run: parse + resolve, but write and reply nothing."""
+    started = datetime.now(timezone.utc)
+    processed = _load_processed()
+    reg = _load_registry()
+    limit = limit or FOLLOWUP_INTAKE_MAX_MESSAGES
+
+    url = f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/mailFolders/inbox/messages"
+    params = {
+        "$select": "id,subject,from,receivedDateTime,uniqueBody,internetMessageId,conversationId,internetMessageHeaders",
+        "$top": str(limit),
+        "$orderby": "receivedDateTime desc",
+    }
+    messages = (eps.graph_get(url, params=params) or {}).get("value") or []
+
+    registered, commands, failures, outcomes = 0, 0, 0, []
+    for m in messages:
+        mid = m.get("internetMessageId") or m.get("id") or ""
+        if not mid or mid in processed:
+            continue
+        sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "").strip()
+        if not sender or sender.lower() == SARA_MAILBOX.lower():
+            continue
+        if not config.is_internal_email(sender):
+            processed.add(mid)
+            _persist_processed(processed, dry_run)
+            continue
+        if xte.is_auto_reply(m):
+            processed.add(mid)
+            _persist_processed(processed, dry_run)
+            continue
+
+        body_text = eps.html_to_text((m.get("uniqueBody") or {}).get("content") or "")
+
+        # Owner commands: explicit watch ids anywhere, or the intake thread.
+        cmd = _parse_command(body_text)
+        ids_in_body = set(_WATCH_ID_RE.findall(body_text))
+        conv = m.get("conversationId") or ""
+        cmd_watches = [w for w in reg["watches"]
+                       if (w["id"] in ids_in_body)
+                       or (not ids_in_body and conv and w.get("intake_conversation_id") == conv)]
+        if cmd and cmd_watches:
+            changed = [] if dry_run else _apply_command(reg, cmd_watches, cmd)
+            if not dry_run:
+                _save_registry(reg)
+                xte.send_threaded_reply(
+                    m.get("id"),
+                    f"<p>Done: {cmd} applied to {_esc(', '.join(changed) or 'no eligible watches')}.</p>")
+            commands += 1
+            outcomes.append({"from": sender, "kind": "command", "cmd": cmd})
+            processed.add(mid)
+            _persist_processed(processed, dry_run)
+            continue
+
+        if not _TRIGGER_RE.search(body_text) or _MEDIA_RE.search(body_text):
+            continue  # not ours; leave for other handlers, do not mark
+
+        parsed = parse_instruction(m.get("subject") or "", body_text)
+        if not parsed.get("is_request"):
+            processed.add(mid)
+            _persist_processed(processed, dry_run)
+            continue
+
+        owner = config.normalize_team_email(sender)
+        thread = resolve_thread(sender, parsed.get("thread_subject") or m.get("subject") or "",
+                                parsed.get("counterparties") or [])
+        if not thread:
+            failures += 1
+            if not dry_run:
+                xte.send_threaded_reply(m.get("id"), _failure_html(
+                    "I could not find that conversation in your mailbox by its subject."))
+            outcomes.append({"from": sender, "kind": "resolve_failed"})
+            processed.add(mid)
+            _persist_processed(processed, dry_run)
+            continue
+
+        externals = sorted(p for p in thread["participants"] if not config.is_internal_email(p))
+        today = _today_il()
+        new = []
+        for ask in parsed["asks"]:
+            if len(reg["watches"]) + len(new) >= FOLLOWUP_MAX_WATCHES:
+                logger.warning("[followup] watch cap reached; skipping remaining asks")
+                break
+            days = ask.get("days")
+            # is None (not falsy) check -- an explicit days=0 ("chase the
+            # same day") must not be silently upgraded to the default by an
+            # `x or default` truthiness check; parse_instruction already
+            # preserves 0 (Task 2), this is where it would otherwise be lost.
+            interval = FOLLOWUP_DEFAULT_BUSINESS_DAYS if days is None else int(days)
+            if ask.get("date"):
+                try:
+                    deadline = date.fromisoformat(ask["date"])
+                except ValueError:
+                    deadline = add_business_days(today, interval)
+            else:
+                deadline = add_business_days(today, interval)
+            new.append(new_watch(
+                owner=owner, mailbox=sender,
+                conversation_id=thread["conversation_id"],
+                anchor_message_id=thread["anchor_id"],
+                anchor_received=thread["anchor_received"],
+                subject=thread["subject"], ask=ask["ask"].strip(),
+                recipients=[r.strip() for r in (ask.get("recipients") or []) if r] or externals,
+                interval_days=interval, deadline=deadline,
+                intake_conversation_id=conv))
+        registered += len(new)
+        outcomes.append({"from": sender, "kind": "registered",
+                         "watches": [w["id"] for w in new]})
+        if not dry_run and new:
+            reg["watches"].extend(new)
+            _save_registry(reg)
+            xte.send_threaded_reply(m.get("id"), _confirmation_html(new))
+        processed.add(mid)
+        _persist_processed(processed, dry_run)
+
+    result = {"started": started.isoformat(), "dry_run": dry_run,
+              "scanned": len(messages), "registered": registered,
+              "commands": commands, "failures": failures, "outcomes": outcomes,
+              "finished": datetime.now(timezone.utc).isoformat()}
+    logger.info(f"[followup] intake: {registered} registered, {commands} commands, "
+                f"{failures} failures of {len(messages)} scanned (dry={dry_run})")
+    return result
