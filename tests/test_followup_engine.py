@@ -191,3 +191,31 @@ def test_parse_instruction_all_blank_asks_degrades(monkeypatch):
     canned = json.dumps({"is_request": True, "asks": [{"ask": ""}, {"ask": "   "}]})
     monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
     assert fue.parse_instruction("s", "b") == {"is_request": False}
+
+
+# Review-round fixes below: regressions for two Important findings against
+# the brief's verbatim regexes (gerund false-negative on _TRIGGER_RE, domain
+# substring false-positive on _MEDIA_RE).
+
+
+def test_trigger_re_covers_inflected_forms():
+    # The original follow[\s-]?up alternative required "follow" immediately
+    # adjacent to "up", so "following up" -- one of the most common real
+    # phrasings of this exact request -- never gated in, and was not
+    # rescued by the remind(er)?/chase alternatives either.
+    for s in ["follow up", "follow-up", "followup",
+              "following up", "followed up", "follows up"]:
+        assert fue._TRIGGER_RE.search(s), s
+    assert not fue._TRIGGER_RE.search("here are the meeting notes")
+
+
+def test_media_re_requires_left_boundary():
+    # The original pattern had no left boundary before the domain, so
+    # "x.com/" matched INSIDE unrelated domains like "vertex.com/".
+    for s in ["https://x.com/foo/status/123", "https://twitter.com/foo",
+              "x.com/foo", "https://www.x.com/a",
+              "watch https://youtu.be/abc123"]:
+        assert fue._MEDIA_RE.search(s), s
+    for s in ["https://vertex.com/tools", "https://convertex.com/pricing",
+              "https://mytwitter.com/fake"]:
+        assert not fue._MEDIA_RE.search(s), s

@@ -172,9 +172,9 @@ def _note(watch: dict, text: str):
 #  Intake: gates, commands, instruction parsing
 # ----------------------------------------------------------------------
 
-_TRIGGER_RE = re.compile(r"\b(follow[\s-]?up|remind(?:er)?|chase)\b", re.I)
+_TRIGGER_RE = re.compile(r"\b(follow(?:s|ed|ing)?[\s-]?up|remind(?:er)?|chase)\b", re.I)
 # Media links belong to x_transcribe_email; a follow-up request never needs one.
-_MEDIA_RE = re.compile(r"(?:x\.com|twitter\.com|youtube\.com|youtu\.be)/", re.I)
+_MEDIA_RE = re.compile(r"(?<!\w)(?:x\.com|twitter\.com|youtube\.com|youtu\.be)/", re.I)
 _WATCH_ID_RE = re.compile(r"\bfw_[0-9a-f]{8}\b")
 _CANCEL_RE = re.compile(r"\b(stop|cancel|done)\b", re.I)
 _RESUME_RE = re.compile(r"\b(resume|continue|keep|re-?arm)\b", re.I)
