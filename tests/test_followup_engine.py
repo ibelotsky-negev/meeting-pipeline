@@ -219,3 +219,139 @@ def test_media_re_requires_left_boundary():
     for s in ["https://vertex.com/tools", "https://convertex.com/pricing",
               "https://mytwitter.com/fake"]:
         assert not fue._MEDIA_RE.search(s), s
+
+
+def _graph_msg(mid, cid, subject, sender, received, to=None, cc=None):
+    return {
+        "id": mid, "conversationId": cid, "subject": subject,
+        "from": {"emailAddress": {"address": sender}},
+        "receivedDateTime": received,
+        "toRecipients": [{"emailAddress": {"address": a}} for a in (to or [])],
+        "ccRecipients": [{"emailAddress": {"address": a}} for a in (cc or [])],
+    }
+
+
+def test_normalize_subject_strips_prefixes():
+    assert fue._normalize_subject("FW: RE: Fwd: Dog tox study") == "Dog tox study"
+    assert fue._normalize_subject("  Re:Re: x  ") == "x"
+
+
+def test_resolve_thread_picks_counterparty_conversation(monkeypatch):
+    wrong = _graph_msg("m9", "cid-wrong", "Dog tox study invoice",
+                       "billing@other.com", "2026-08-04T10:00:00Z")
+    older = _graph_msg("m1", "cid-right", "Dog tox study",
+                       "upendra.kumar@adgyllifesciences.com", "2026-08-01T10:00:00Z",
+                       to=["salim.tamboli@vimta.com"], cc=["dan@negevlabs.com"])
+    newest = _graph_msg("m2", "cid-right", "RE: Dog tox study",
+                        "dan@negevlabs.com", "2026-08-05T07:23:00Z",
+                        to=["salim.tamboli@vimta.com"], cc=["habibur.khan@vimta.in"])
+    monkeypatch.setattr(eps, "graph_get",
+                        lambda url, params=None: {"value": [wrong, older, newest]})
+    out = fue.resolve_thread("dan@negevlabs.com", "FW: Dog tox study",
+                             ["salim.tamboli@vimta.com"])
+    assert out["conversation_id"] == "cid-right"
+    assert out["anchor_id"] == "m2"
+    assert out["anchor_received"] == "2026-08-05T07:23:00Z"
+    assert "habibur.khan@vimta.in" in out["participants"]
+
+
+def test_resolve_thread_none_on_no_results(monkeypatch):
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    assert fue.resolve_thread("dan@negevlabs.com", "Nothing", []) is None
+    assert fue.resolve_thread("dan@negevlabs.com", "", []) is None
+
+
+# Self-review additions below: the brief's own tests would still pass even
+# if the scoring ignored counterparty overlap entirely (its "wrong"
+# candidate is also older than "right"), or if the anchor were picked
+# positionally instead of by actual receivedDateTime. These pin the two
+# cases where getting either one wrong means drafting a chase into the
+# wrong conversation, plus the explicit refusal branch and the null-safety
+# contract on Graph payloads.
+
+
+def test_resolve_thread_counterparty_match_outranks_recency(monkeypatch):
+    # A conversation with NO counterparty overlap but a MORE RECENT message
+    # must still lose to an older conversation that actually involves the
+    # named counterparty -- recency alone must never override identity.
+    wrong_recent = _graph_msg("m9", "cid-wrong", "Dog tox study",
+                              "billing@other.com", "2026-08-09T10:00:00Z")
+    right_older = _graph_msg("m1", "cid-right", "Dog tox study",
+                             "upendra.kumar@adgyllifesciences.com",
+                             "2026-08-01T10:00:00Z",
+                             to=["salim.tamboli@vimta.com"])
+    monkeypatch.setattr(eps, "graph_get",
+                        lambda url, params=None: {"value": [wrong_recent, right_older]})
+    out = fue.resolve_thread("dan@negevlabs.com", "Dog tox study",
+                             ["salim.tamboli@vimta.com"])
+    assert out["conversation_id"] == "cid-right"
+    assert out["anchor_id"] == "m1"
+
+
+def test_resolve_thread_anchor_is_true_newest_regardless_of_list_order(monkeypatch):
+    # Graph's $search result order is not guaranteed chronological. The true
+    # newest message sits in the MIDDLE of the returned list -- neither the
+    # first nor the last element -- so a positional shortcut (first/last
+    # appended) would pick the wrong anchor and still "look" plausible.
+    newest = _graph_msg("m3", "cid-right", "RE: Dog tox study",
+                        "dan@negevlabs.com", "2026-08-05T07:23:00Z",
+                        to=["salim.tamboli@vimta.com"])
+    middle = _graph_msg("m2", "cid-right", "RE: Dog tox study",
+                        "salim.tamboli@vimta.com", "2026-08-03T09:00:00Z")
+    oldest = _graph_msg("m1", "cid-right", "Dog tox study",
+                        "upendra.kumar@adgyllifesciences.com", "2026-08-01T10:00:00Z",
+                        to=["salim.tamboli@vimta.com"])
+    monkeypatch.setattr(eps, "graph_get",
+                        lambda url, params=None: {"value": [middle, newest, oldest]})
+    out = fue.resolve_thread("dan@negevlabs.com", "Dog tox study",
+                             ["salim.tamboli@vimta.com"])
+    assert out["anchor_id"] == "m3"
+    assert out["anchor_received"] == "2026-08-05T07:23:00Z"
+
+
+def test_resolve_thread_refuses_when_counterparty_never_matches(monkeypatch):
+    # Messages are found and grouped into real conversations, but NONE of
+    # them include the named counterparty -- resolve_thread must refuse
+    # (return None) rather than silently hand back its best-scoring wrong
+    # guess, per the spec's "unresolvable thread -> honest failure, never
+    # silence".
+    a = _graph_msg("m1", "cid-a", "Dog tox study", "someone@else.com",
+                   "2026-08-01T10:00:00Z")
+    b = _graph_msg("m2", "cid-b", "RE: Dog tox study", "another@else.com",
+                   "2026-08-05T07:23:00Z")
+    monkeypatch.setattr(eps, "graph_get",
+                        lambda url, params=None: {"value": [a, b]})
+    out = fue.resolve_thread("dan@negevlabs.com", "Dog tox study",
+                             ["salim.tamboli@vimta.com"])
+    assert out is None
+
+
+def test_resolve_thread_searches_normalized_subject(monkeypatch):
+    # The query sent to Graph must be the NORMALIZED subject (FW:/RE:
+    # stripped), not the raw hint -- otherwise "resolution is by normalized
+    # subject search" is decorative rather than real.
+    captured = {}
+
+    def _fake_graph_get(url, params=None):
+        captured["url"] = url
+        captured["params"] = params
+        return {"value": []}
+
+    monkeypatch.setattr(eps, "graph_get", _fake_graph_get)
+    fue.resolve_thread("dan@negevlabs.com", "FW: RE: Dog tox study", ["x@vimta.com"])
+    assert "dan@negevlabs.com" in captured["url"]
+    assert captured["params"]["$search"] == '"subject:Dog tox study"'
+
+
+def test_participants_handles_graph_nulls():
+    # Graph payloads routinely carry explicit nulls (not missing keys) for
+    # from/to/cc and their emailAddress sub-objects -- every hop must
+    # degrade to empty rather than raising.
+    msg = {
+        "from": None,
+        "toRecipients": None,
+        "ccRecipients": [{"emailAddress": None}, None,
+                          {"emailAddress": {"address": "Salim@Vimta.com"}}],
+    }
+    assert fue._participants(msg) == {"salim@vimta.com"}
+    assert fue._participants({}) == set()

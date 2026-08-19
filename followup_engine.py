@@ -248,3 +248,79 @@ def parse_instruction(subject: str, body_text: str) -> dict:
     out["thread_subject"] = (out.get("thread_subject") or "").strip()
     out["counterparties"] = [c for c in (out.get("counterparties") or []) if c]
     return out
+
+
+# ----------------------------------------------------------------------
+#  Thread resolution -- the forward Sara received is a NEW conversation;
+#  the real thread lives in the SENDER's mailbox and is found by subject.
+# ----------------------------------------------------------------------
+
+_SUBJECT_PREFIX_RE = re.compile(r"^\s*(re|fw|fwd)\s*:\s*", re.I)
+
+
+def _normalize_subject(s: str) -> str:
+    s = (s or "").strip()
+    while True:
+        stripped = _SUBJECT_PREFIX_RE.sub("", s, count=1)
+        if stripped == s:
+            return s.strip()
+        s = stripped
+
+
+def _participants(msg: dict) -> set:
+    out = set()
+    frm = ((msg.get("from") or {}).get("emailAddress") or {}).get("address")
+    if frm:
+        out.add(frm.strip().lower())
+    for key in ("toRecipients", "ccRecipients"):
+        for r in (msg.get(key) or []):
+            addr = ((r or {}).get("emailAddress") or {}).get("address")
+            if addr:
+                out.add(addr.strip().lower())
+    return out
+
+
+def resolve_thread(mailbox: str, subject_hint: str, counterparties: list):
+    q = _normalize_subject(subject_hint)
+    if not q:
+        return None
+    url = f"{eps.MS_GRAPH_BASE}/users/{mailbox}/messages"
+    params = {
+        "$search": f'"subject:{q}"',
+        "$top": "25",
+        "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,conversationId",
+    }
+    resp = eps.graph_get(url, params=params) or {}
+    msgs = resp.get("value") or []
+    if not msgs:
+        return None
+
+    wanted = {c.strip().lower() for c in (counterparties or []) if c and "@" in c}
+    convs = {}
+    for m in msgs:
+        cid = m.get("conversationId") or ""
+        if not cid:
+            continue
+        entry = convs.setdefault(cid, {"messages": [], "participants": set()})
+        entry["messages"].append(m)
+        entry["participants"] |= _participants(m)
+
+    def _score(item):
+        cid, entry = item
+        overlap = len(wanted & entry["participants"]) if wanted else 0
+        newest = max(m.get("receivedDateTime") or "" for m in entry["messages"])
+        return (overlap, newest)
+
+    cid, entry = max(convs.items(), key=_score)
+    if wanted and not (wanted & entry["participants"]):
+        # Counterparties were named but no candidate conversation contains
+        # them -- guessing here would watch the wrong thread. Refuse instead.
+        return None
+    anchor = max(entry["messages"], key=lambda m: m.get("receivedDateTime") or "")
+    return {
+        "conversation_id": cid,
+        "anchor_id": anchor.get("id"),
+        "anchor_received": anchor.get("receivedDateTime"),
+        "subject": anchor.get("subject") or q,
+        "participants": entry["participants"],
+    }
