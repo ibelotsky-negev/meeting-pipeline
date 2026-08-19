@@ -849,3 +849,82 @@ def test_parse_command_cancel_wins_across_lines():
     # first -- a naive per-line short-circuit would return "resume" here
     # since line 1 leads with "keep", never reaching line 2's "cancel".
     assert fue._parse_command("keep going\ncancel it") == "cancel"
+
+
+# Fix report (review round 2) -- Finding D below.
+
+
+def _dog_tox_retry_world(monkeypatch):
+    """Shared setup for the Finding D tests: one instruction, one ask, a
+    thread that resolves cleanly. Caller still has to set send_threaded_reply
+    for scan 1 (always _boom) and can override it again for scan 2."""
+    instruction = _intake_msg(
+        "im6", "dan@negevlabs.com", "FW: Dog tox study",
+        "Sara: if Vimta does not reply within 2 days, follow up on the "
+        "investigation status.")
+    thread_newest = _graph_msg("m2", "cid-right", "RE: Dog tox study",
+                               "upendra.kumar@adgyllifesciences.com",
+                               "2026-08-05T07:23:00Z",
+                               to=["salim.tamboli@vimta.com"])
+
+    def _graph_get(url, params=None):
+        if f"/users/{fue.SARA_MAILBOX}/mailFolders/inbox/messages" in url:
+            return {"value": [instruction]}
+        if "/users/dan@negevlabs.com/messages" in url:
+            return {"value": [thread_newest]}
+        return {"value": []}
+
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    canned = json.dumps({
+        "is_request": True, "thread_subject": "Dog tox study",
+        "counterparties": ["salim.tamboli@vimta.com"],
+        "asks": [{"ask": "investigation status",
+                  "recipients": ["salim.tamboli@vimta.com"], "days": 2, "date": None}],
+    })
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
+
+
+def test_run_intake_retry_reconfirms_existing_watches_after_reply_failure(monkeypatch, fue_files):
+    # FINDING D: Finding A's dedup fix must not turn a transient reply-send
+    # failure into PERMANENT silence -- the owner still needs the watch ids
+    # to ever cancel them. Scan 2 must re-send the confirmation naming the
+    # SAME ids that already exist, not silently swallow it.
+    _dog_tox_retry_world(monkeypatch)
+    monkeypatch.setattr(xte, "send_threaded_reply", _boom)
+
+    with pytest.raises(RuntimeError):
+        fue.run_intake()
+
+    original_id = fue._load_registry()["watches"][0]["id"]
+    assert "im6" not in fue._load_processed()
+
+    replies = []
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda mid, html_body, attachments=None: replies.append((mid, html_body)))
+    out = fue.run_intake()
+
+    assert out["registered"] == 0  # nothing NEW -- the ask already existed
+    watches = fue._load_registry()["watches"]
+    assert len(watches) == 1 and watches[0]["id"] == original_id  # one per ask, unchanged
+    assert len(replies) == 1 and replies[0][0] == "im6"
+    assert original_id in replies[0][1]  # the SAME id -- not silence
+
+
+def test_run_intake_retry_dry_run_reconfirmation_sends_and_writes_nothing(monkeypatch, fue_files):
+    # A dry run on the reconfirmation retry must still send and write
+    # nothing -- same dry-run contract as every other path in this function.
+    _dog_tox_retry_world(monkeypatch)
+    monkeypatch.setattr(xte, "send_threaded_reply", _boom)
+
+    with pytest.raises(RuntimeError):
+        fue.run_intake()
+
+    watches_before = fue._load_registry()["watches"]
+    assert len(watches_before) == 1
+
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda *a, **kw: pytest.fail("dry run must not reply"))
+    out = fue.run_intake(dry_run=True)
+    assert out["registered"] == 0
+    assert fue._load_registry()["watches"] == watches_before  # unchanged
+    assert fue._load_processed() == set()  # dry run persists nothing

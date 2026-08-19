@@ -521,14 +521,19 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
         externals = sorted(p for p in thread["participants"] if not config.is_internal_email(p))
         today = _today_il()
         new = []
+        matched_existing = []
         for ask in parsed["asks"]:
             ask_text = ask["ask"].strip()
-            if _find_existing_watch(reg, new, conv, ask_text):
+            existing = _find_existing_watch(reg, new, conv, ask_text)
+            if existing:
                 # Already registered -- e.g. a retry after send_threaded_reply
                 # raised on a prior scan (the registry save happens before the
                 # reply is sent, so mid never got marked processed and this
                 # instruction is being re-parsed from scratch). Skipping keeps
-                # the registry idempotent without adding a new watch field.
+                # the registry idempotent without adding a new watch field;
+                # collected so the confirmation that failed to send earlier
+                # can still go out below, instead of being lost for good.
+                matched_existing.append(existing)
                 continue
             if len(reg["watches"]) + len(new) >= FOLLOWUP_MAX_WATCHES:
                 logger.warning("[followup] watch cap reached; skipping remaining asks")
@@ -556,12 +561,22 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
                 interval_days=interval, deadline=deadline,
                 intake_conversation_id=conv))
         registered += len(new)
-        outcomes.append({"from": sender, "kind": "registered",
-                         "watches": [w["id"] for w in new]})
-        if not dry_run and new:
-            reg["watches"].extend(new)
-            _save_registry(reg)
-            xte.send_threaded_reply(m.get("id"), _confirmation_html(new))
+        if new:
+            outcomes.append({"from": sender, "kind": "registered",
+                             "watches": [w["id"] for w in new]})
+            if not dry_run:
+                reg["watches"].extend(new)
+                _save_registry(reg)
+                xte.send_threaded_reply(m.get("id"), _confirmation_html(new))
+        elif matched_existing:
+            # Every ask already had a watch -- the confirmation for them
+            # never went out (that is exactly why mid was never marked
+            # processed). Re-sending it now completes the interrupted
+            # operation; it is not a duplicate since nothing new is created.
+            outcomes.append({"from": sender, "kind": "reconfirmed",
+                             "watches": [w["id"] for w in matched_existing]})
+            if not dry_run:
+                xte.send_threaded_reply(m.get("id"), _confirmation_html(matched_existing))
         processed.add(mid)
         _persist_processed(processed, dry_run)
 
