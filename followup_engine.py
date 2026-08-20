@@ -499,6 +499,58 @@ def _failure_html(reason: str) -> str:
             "exact subject and who should reply.</p>")
 
 
+def _owns_watch(watch: dict, sender: str) -> bool:
+    """Does this sender own this watch? Scopes a targetless command to the
+    sender's OWN watches -- Sara's inbox is shared (x-transcribe-email,
+    sara_corrections) and several addresses are internal, so a 'stop' from
+    one teammate must never surface, let alone act on, another's watch.
+    Matches the canonical owner, the raw mailbox the forward came from, and
+    an alias address resolved through config.normalize_team_email."""
+    s = (sender or "").strip().lower()
+    if not s:
+        return False
+    known = {(watch.get("owner") or "").strip().lower(),
+             (watch.get("mailbox") or "").strip().lower()}
+    known.discard("")
+    if s in known:
+        return True
+    norm = (config.normalize_team_email(sender) or "").strip().lower()
+    return bool(norm) and norm in known
+
+
+def _which_watch_html(cmd: str, watches: list) -> str:
+    word = "stop" if cmd == "cancel" else "resume"
+    rows = "".join(
+        f"<li><code>{_esc(w['id'])}</code> -- {_esc(w['ask'])} "
+        f"({_esc(w.get('status') or '')})</li>" for w in watches)
+    return (f"<p>I could not tell which watch you meant by <b>{_esc(word)}</b>: this "
+            f"reply is not on a registration thread and names no watch id.</p>"
+            f"<p>Your open watches:</p><ul>{rows}</ul>"
+            f"<p>Reply <b>{_esc(word)}</b> with the id, e.g. "
+            f"<code>{_esc(word)} {_esc(watches[0]['id'])}</code>.</p>")
+
+
+def _reply_which_watch(reg: dict, msg: dict, sender: str, cmd: str, dry_run: bool) -> list:
+    """FINDING 5 (final review): the daily report's footer invites "Reply
+    stop or resume", but a report is a NEW conversation (Sara mails the
+    owner directly, so it matches no intake_conversation_id) and uniqueBody
+    strips the quoted fw_ ids -- so a bare "stop" had no target at all:
+    no command, no reply, no error, and Sara kept drafting reminders to a
+    CRO after the owner believed they had stopped it.
+
+    Asks which watch instead, listing only the sender's OWN non-terminal
+    watches. Returns the ids it asked about; an empty list means this
+    sender owns nothing open, in which case the caller leaves the mail
+    alone for the other handlers that share this inbox."""
+    owned = [w for w in (reg.get("watches") or [])
+             if w.get("status") not in _TERMINAL_STATUSES and _owns_watch(w, sender)]
+    if not owned:
+        return []
+    if not dry_run:
+        xte.send_threaded_reply(msg.get("id"), _which_watch_html(cmd, owned))
+    return [w["id"] for w in owned]
+
+
 def _cap_failure_html(dropped: list) -> str:
     """Honest failure, never silence (this module's own rule): name EVERY
     ask the watch cap dropped, and say how to free a slot."""
@@ -617,11 +669,41 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
             _persist_processed(processed, dry_run)
             continue
 
-        if not _TRIGGER_RE.search(body_text) or _MEDIA_RE.search(body_text):
+        # A command word with no fw_ id AND no watch on this conversation:
+        # the finding-5 case (an owner replying to a daily REPORT email).
+        # Only acted on once we know the message is NOT a registration
+        # request, so a genuine "Keep on top of this -- follow up with
+        # Vimta..." still registers normally rather than being answered
+        # with "which watch did you mean?".
+        targetless_cmd = bool(cmd) and not ids_in_body and not cmd_watches
+        has_media = bool(_MEDIA_RE.search(body_text))
+
+        if not _TRIGGER_RE.search(body_text) or has_media:
+            # A media link makes the message x_transcribe_email's, never
+            # ours -- do not answer it even if it leads with a command word.
+            if targetless_cmd and not has_media:
+                asked = _reply_which_watch(reg, m, sender, cmd, dry_run)
+                if asked:
+                    failures += 1
+                    outcomes.append({"from": sender, "kind": "ambiguous_command",
+                                     "cmd": cmd, "watches": asked})
+                    processed.add(mid)
+                    _persist_processed(processed, dry_run)
+                    continue
             continue  # not ours; leave for other handlers, do not mark
 
         parsed = parse_instruction(m.get("subject") or "", body_text)
         if not parsed.get("is_request"):
+            # Same finding-5 case reached the other way: "stop the follow-up
+            # on the dog tox study" trips the trigger regex, so the parser
+            # runs and correctly reports NOT_A_REQUEST. This used to mark
+            # the mail processed and reply nothing at all.
+            if targetless_cmd:
+                asked = _reply_which_watch(reg, m, sender, cmd, dry_run)
+                if asked:
+                    failures += 1
+                    outcomes.append({"from": sender, "kind": "ambiguous_command",
+                                     "cmd": cmd, "watches": asked})
             processed.add(mid)
             _persist_processed(processed, dry_run)
             continue
