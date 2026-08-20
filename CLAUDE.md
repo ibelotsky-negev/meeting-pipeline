@@ -524,10 +524,15 @@ share it.
   escalation report and those subjects name the OWNER's ids, so without
   it a CC'd teammate's "Done, thanks!" cancelled someone else's watch --
   silently (the confirmation replies to the CC) and invisibly (a
-  cancelled watch drops out of the owner's reports). A subject id naming
-  a watch the sender does not own is IGNORED IN SILENCE, never answered.
-  A typed BODY id is unchanged and may still act cross-owner: typing one
-  is deliberate. Targets: named `fw_` ids, else all watches from
+  cancelled watch drops out of the owner's reports). A subject id that
+  resolves to nothing the sender owns -- someone else's watch, or none at
+  all once a registry restore or a pruned report thread leaves an id
+  behind -- is IGNORED IN SILENCE and NOT marked processed. The "I do not
+  recognize watch id(s)" reply belongs to an id the sender TYPED (honest
+  feedback on a likely typo); on an id Sara generated into a subject it
+  answers mail that may be `sara_corrections`' or `x_transcribe_email`'s
+  and writes state on another handler's message. A typed BODY id is
+  unchanged and may still act cross-owner: typing one is deliberate. Targets: named `fw_` ids, else all watches from
   that intake conversation. A command with NEITHER is NOT a request: no
   reply, no state write, nothing marked processed. (Through the previous
   fix wave it got a "which watch did you mean?" reply, which over-fired --
@@ -578,6 +583,7 @@ share it.
 | Daily digest owner names blank / 403 | Missing HubSpot crm.objects.owners.read scope | Grant + reconnect HubSpot (granted 2026-06-14) |
 | FYI Triage classifies but never moves | Dual gate not fully open | Set BOTH `?live=1` AND env `FYI_LIVE=1`; absent either it stays DRY by design |
 | FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
+| A "stop"/"resume"/"Done, thanks!" reply to a follow-up report does nothing at all -- no cancel, no reply | BY DESIGN when the replier does not OWN the watches the report subject names (e.g. `FOLLOWUP_ALERT_CC` CC'd on an escalation report), or when the subject's ids no longer exist. Subject-carried ids are ownership-scoped and fail silent; only the owner can command from a report thread | Have the WATCH OWNER reply, or type the `fw_` id in the BODY -- a typed id is deliberate, acts cross-owner, and an unknown one gets an honest "I do not recognize watch id(s)" reply. `/followup/status` lists every watch and its owner |
 | `/followup/intake` returns 409, or the log says "another follow-up run is in progress; skipping" | BY DESIGN -- one `_followup_lock` gates both follow-up routes and both jobs, because intake and the daily check share `followups.json` and independent locks lost each other's writes | Wait and retry; the 15-min intake job retries by itself and marks nothing processed when it skips |
 | `/followup/status` returns `registry_unreadable`, or a run aborts with `RegistryUnreadable` | `followups.json` could not be parsed. It has been PRESERVED as `followups.corrupt-<ts>-<rand>.json` on `/data` and nothing overwrote it | Inspect/repair the preserved file and move it back to `followups.json`. Doing nothing is also safe: the next load starts from an empty registry, but every watch is then gone |
 | Meeting never got a Phase-1 email (no webhook log line for its transcript id) | Poll's fallback window used to gate on meeting START time only ([fireflies_client.py](fireflies_client.py) `get_recent_transcripts`); a meeting longer than the window (default 15 min) had its start timestamp scroll out of the cutoff before the transcript was ready, and if the webhook also missed it the meeting was silently never processed | Fixed @2.27.0 -- window now gates on end time (start + duration). If a meeting still slips through, replay it manually via `/process/<transcript_id>` |

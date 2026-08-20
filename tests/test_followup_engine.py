@@ -834,6 +834,26 @@ def test_run_intake_typed_body_id_still_acts_across_owners(monkeypatch, fue_file
     assert len(replies) == 1
 
 
+def test_run_intake_unknown_subject_id_is_ignored_without_a_reply(monkeypatch, fue_files):
+    # DEFECT 3 (same code path): a SUBJECT id matching no watch -- after a
+    # registry restore, or on a report thread whose watches were pruned --
+    # earned an "I do not recognize watch id(s)" reply and marked the
+    # message processed. On mail that may belong to sara_corrections or
+    # x_transcribe_email that is both noise and a state write on another
+    # handler's message. The honest-failure reply belongs to ids the
+    # sender TYPED; an id we generated into a subject line ourselves is
+    # ignored in silence.
+    w = _watch_in_registry()
+    fue._save_registry({"watches": [w]})
+    subject = "RE: " + fue._report_subject(1, 0, date(2026, 8, 7), ["fw_deadbeef"])
+    replies = _report_reply_world(monkeypatch, "stop", subject=subject)
+    out = fue.run_intake()
+    assert replies == [] and out["commands"] == 0 and out["failures"] == 0
+    assert out["outcomes"] == []
+    assert fue._load_registry()["watches"][0]["status"] == "active"
+    assert fue._load_processed() == set()
+
+
 def test_owns_watch_matches_owner_mailbox_and_alias():
     # RESTORED with _owns_watch itself (DEFECT 2). Deleting this unit test
     # and test_run_intake_bare_stop_lists_only_the_senders_own_watches left

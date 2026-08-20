@@ -82,8 +82,10 @@ established the message is not a registration -- so a genuine
 registration replied into a report thread still registers instead of
 being swallowed as a command; and it acts only on watches the SENDER
 OWNS, since escalation report subjects reach `FOLLOWUP_ALERT_CC` too. A
-subject id naming someone else's watch is ignored in silence. A typed
-body id still acts cross-owner: typing one is deliberate.
+subject id resolving to nothing the sender owns -- someone else's watch,
+or no watch at all -- is ignored in silence and nothing is marked; the
+"I do not recognize watch id(s)" reply is for an id the sender TYPED. A
+typed body id still acts cross-owner: typing one is deliberate.
 Targets: named ids, else all watches registered from that intake
 conversation. Confirmed by reply. A command with NEITHER -- no id in body
 or subject, no matching intake conversation -- is NOT a request: no reply,

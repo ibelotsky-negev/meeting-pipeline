@@ -576,23 +576,26 @@ def _handle_subject_command(reg: dict, msg: dict, sender: str, cmd: str,
     through a typed id stays allowed and documented; it must not ride
     along in a subject the sender never chose.
 
-    Returns the outcome to record, or None when the subject names no id at
-    all -- in which case the caller leaves the message exactly as it found
-    it, since this inbox is shared."""
+    Returns the outcome to record, or None when the subject resolves to
+    nothing this sender owns -- in which case the caller leaves the
+    message exactly as it found it, since this inbox is shared."""
     ids = set(_WATCH_ID_RE.findall(msg.get("subject") or ""))
     if not ids:
         return None
-    known = [w for w in (reg.get("watches") or []) if w["id"] in ids]
-    watches = [w for w in known if _owns_watch(w, sender)]
-    if known and not watches:
-        # The subject named a real watch, just not this sender's. Ignore
-        # it in silence -- the shared-mailbox-safe default. A reply here
-        # would be unsolicited mail to someone who only ever got CC'd, and
-        # it would leak another owner's watch to them; and the watch's
-        # real owner is not on this thread to be told anything anyway.
-        return None
+    watches = [w for w in (reg.get("watches") or [])
+               if w["id"] in ids and _owns_watch(w, sender)]
     if not watches:
-        return {"from": sender, "kind": "unknown_watch_id"}
+        # The subject named nothing of this sender's: either someone
+        # else's watch (an escalation report reaches FOLLOWUP_ALERT_CC
+        # too), or no watch at all -- an id outlives the watch it names
+        # after a registry restore, or once a report thread's watches are
+        # pruned. Silence in BOTH cases. The "I do not recognize watch
+        # id(s)" reply is for an id the sender TYPED, where it is honest
+        # feedback on a likely typo; firing it on an id WE generated into
+        # a subject answers mail that may be sara_corrections' or
+        # x_transcribe_email's, and marking it processed writes state on
+        # another handler's message.
+        return None
     changed = [] if dry_run else _apply_command(reg, watches, cmd)
     if not dry_run:
         _save_registry(reg)
@@ -780,10 +783,7 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
             if cmd and not ids_in_body and not has_media:
                 res = _handle_subject_command(reg, m, sender, cmd, dry_run)
                 if res is not None:
-                    if res["kind"] == "command":
-                        commands += 1
-                    else:
-                        failures += 1
+                    commands += 1
                     outcomes.append(res)
                     processed.add(mid)
                     _persist_processed(processed, dry_run)
@@ -799,10 +799,7 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
             if cmd and not ids_in_body:
                 res = _handle_subject_command(reg, m, sender, cmd, dry_run)
                 if res is not None:
-                    if res["kind"] == "command":
-                        commands += 1
-                    else:
-                        failures += 1
+                    commands += 1
                     outcomes.append(res)
                     processed.add(mid)
                     _persist_processed(processed, dry_run)
