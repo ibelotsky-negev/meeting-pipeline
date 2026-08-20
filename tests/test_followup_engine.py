@@ -1234,7 +1234,16 @@ def test_process_deadlines_report_only_without_live(monkeypatch, fue_files):
     # weakening what is asserted: still an exact match, still proves the
     # report-only body carries Claude's real content.
     assert events[0]["type"] == "would_draft" and events[0]["body"] == "<p>Reminder body</p>"
-    assert reg["watches"][0]["nudges_sent"] == 1
+    # CONTROLLER RULING (dry-run budget fix): updated from the brief's
+    # literal expectation (which asserted nudges_sent == 1). Report-only
+    # must NOT consume the nudge budget -- nudges_sent stays 0 -- but the
+    # deadline STILL advances by the watch's interval, so the watch
+    # re-surfaces on the same cadence a live run would rather than being
+    # reported once and then going stale forever. Asserting BOTH halves
+    # positively so either regressing (the budget creeping again, or the
+    # deadline going stale) fails this test.
+    assert reg["watches"][0]["nudges_sent"] == 0
+    assert reg["watches"][0]["deadline"] == "2026-08-11"  # Fri + 2bd (default interval) -> Tue
 
 
 def test_process_deadlines_before_deadline_noop(monkeypatch, fue_files):
@@ -1306,10 +1315,12 @@ def test_process_deadlines_unparseable_deadline_reset_respects_interval_days_zer
 
 
 def test_process_deadlines_dry_run_true_forces_report_only_even_when_live(monkeypatch, fue_files):
-    # Isolates the "not dry_run" half of `if _live() and not dry_run:` --
-    # the brief's own creates_draft_when_live test never passes dry_run=True,
-    # so a mutation dropping that half (leaving only `if _live():`) would
-    # pass every OTHER test in this file undetected.
+    # Isolates dry_run's priority over the live gate -- an explicit
+    # dry_run=True call must win even when FOLLOWUP_LIVE=1 (controller
+    # ruling, mode 3: "whether or not _live()"). The brief's own
+    # creates_draft_when_live test never passes dry_run=True, so a mutation
+    # that let LIVE override an explicit dry_run=True would pass every
+    # OTHER test in this file undetected.
     monkeypatch.setenv("FOLLOWUP_LIVE", "1")
     reg = {"watches": [_watch_in_registry(deadline="2026-08-07")]}
     monkeypatch.setattr(eps, "graph_post",
@@ -1317,12 +1328,14 @@ def test_process_deadlines_dry_run_true_forces_report_only_even_when_live(monkey
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=True)
     assert events[0]["type"] == "would_draft"
-    # In-memory bookkeeping still advances -- process_deadlines has no
-    # _save_registry call at all (same pattern as check_replies/Task 5);
-    # gating PERSISTENCE on dry_run is the future orchestrator's job, not
-    # this function's. Pinned here so that split of responsibility is
-    # documented and any accidental change is visible.
-    assert reg["watches"][0]["nudges_sent"] == 1
+    # CONTROLLER RULING (dry-run budget fix): dry_run=True must be safe to
+    # invoke at any time and mutate NOTHING -- not nudges_sent, not
+    # deadline, not a note. This function previously advanced nudges_sent
+    # unconditionally even under an explicit dry_run=True, which meant a
+    # mere PREVIEW call silently consumed the real nudge budget.
+    assert reg["watches"][0]["nudges_sent"] == 0
+    assert reg["watches"][0]["deadline"] == "2026-08-07"
+    assert reg["watches"][0]["notes"] == []
 
 
 def test_process_deadlines_exhaustion_leaves_nudges_and_deadline_unchanged(monkeypatch, fue_files):
@@ -1337,12 +1350,18 @@ def test_process_deadlines_exhaustion_leaves_nudges_and_deadline_unchanged(monke
 def test_process_deadlines_one_below_max_nudges_still_drafts(monkeypatch, fue_files):
     # The exhaustion boundary's OTHER side: nudges_sent == max_nudges - 1
     # must still draft (escalation level == max_nudges), not exhaust early.
+    # Report-only mode (FOLLOWUP_LIVE unset), so per the controller ruling
+    # nudges_sent stays at its CURRENT value (2) rather than the brief-
+    # literal 3 -- the reported escalation level is still correctly 3
+    # (computed from the current count), it is just not persisted until a
+    # real draft exists.
     monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
     reg = {"watches": [_watch_in_registry(deadline="2026-08-07", nudges_sent=2)]}
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
     assert events[0]["type"] == "would_draft" and events[0]["escalation"] == 3
-    assert reg["watches"][0]["nudges_sent"] == 3
+    assert reg["watches"][0]["nudges_sent"] == 2  # unchanged -- report-only never consumes budget
+    assert reg["watches"][0]["deadline"] == "2026-08-11"  # still advances -- Fri + 2bd -> Tue
     assert reg["watches"][0]["status"] == "active"  # not exhausted yet
 
 
@@ -1367,6 +1386,7 @@ def test_process_deadlines_unparseable_deadline_resets_and_skips(monkeypatch, fu
 
 
 def test_process_deadlines_compose_failure_skips_that_watch_only(monkeypatch, fue_files):
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)  # report-only; explicit for clarity
     broken = _watch_in_registry(deadline="2026-08-07")
     ok = _watch_in_registry(deadline="2026-08-07")
     reg = {"watches": [broken, ok]}
@@ -1382,7 +1402,12 @@ def test_process_deadlines_compose_failure_skips_that_watch_only(monkeypatch, fu
     events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
     assert reg["watches"][0]["nudges_sent"] == 0  # broken watch untouched, retried next run
     assert reg["watches"][0]["deadline"] == "2026-08-07"  # unchanged
-    assert reg["watches"][1]["nudges_sent"] == 1  # ok watch still processed
+    # CONTROLLER RULING (dry-run budget fix): report-only, so the "ok" watch
+    # still gets reported (would_draft) but its nudge budget is NOT
+    # consumed -- only the deadline advances, same as any other report-only
+    # watch, regardless of whether a SIBLING watch's compose call failed.
+    assert reg["watches"][1]["nudges_sent"] == 0
+    assert reg["watches"][1]["deadline"] == "2026-08-11"  # Fri + 2bd -> Tue
     assert len(events) == 1 and events[0]["watch_id"] == ok["id"]
 
 
@@ -1403,15 +1428,79 @@ def test_process_deadlines_draft_creation_failure_leaves_nudges_and_deadline_unc
 
 
 def test_process_deadlines_second_reminder_escalates_to_2(monkeypatch, fue_files):
+    # CONTROLLER RULING (dry-run budget fix): escalation only climbs across
+    # runs when a REAL draft was created each time -- report-only no longer
+    # advances nudges_sent at all (see test_process_deadlines_report_only_
+    # without_live and the companion test right below this one), so this
+    # scenario is now LIVE-only. Two distinct draft ids so each run's draft
+    # is independently distinguishable.
+    monkeypatch.setenv("FOLLOWUP_LIVE", "1")
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=2)]}
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    _capture_writes(monkeypatch, draft_id="d1")
+    first = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert first[0]["type"] == "draft" and first[0]["escalation"] == 1
+    assert reg["watches"][0]["nudges_sent"] == 1
+    assert reg["watches"][0]["deadline"] == "2026-08-11"  # Fri + 2bd -> Tue
+    _capture_writes(monkeypatch, draft_id="d2")
+    second = fue.process_deadlines(reg, date(2026, 8, 11), dry_run=False)
+    assert second[0]["type"] == "draft" and second[0]["escalation"] == 2
+    assert reg["watches"][0]["nudges_sent"] == 2
+
+
+def test_process_deadlines_report_only_does_not_escalate_across_runs(monkeypatch, fue_files):
+    # The direct counterpart to the LIVE test above: repeated report-only
+    # runs stay at escalation level 1 forever (nudges_sent never leaves 0),
+    # which is the ACCEPTED, INTENDED consequence of the controller ruling
+    # ("the reported escalation stays 1 and the tone never climbs"), not a
+    # separate bug.
     monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
     reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=2)]}
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     first = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
-    assert first[0]["escalation"] == 1
-    assert reg["watches"][0]["deadline"] == "2026-08-11"  # Fri + 2bd -> Tue
+    assert first[0]["type"] == "would_draft" and first[0]["escalation"] == 1
     second = fue.process_deadlines(reg, date(2026, 8, 11), dry_run=False)
-    assert second[0]["escalation"] == 2
-    assert reg["watches"][0]["nudges_sent"] == 2
+    assert second[0]["type"] == "would_draft" and second[0]["escalation"] == 1  # still 1, not 2
+    assert reg["watches"][0]["nudges_sent"] == 0
+
+
+def test_process_deadlines_live_mode_advances_nudges_and_deadline(monkeypatch, fue_files):
+    # Required test 1/3 (controller ruling): LIVE mode is unchanged --
+    # draft created, nudges_sent incremented, deadline advanced. Overlaps
+    # deliberately with the brief's own test_process_deadlines_creates_
+    # draft_when_live, giving a clean, explicitly-named three-mode set
+    # alongside the report-only and dry-run tests above.
+    monkeypatch.setenv("FOLLOWUP_LIVE", "1")
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=2)]}
+    _capture_writes(monkeypatch)
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert events[0]["type"] == "draft"
+    assert reg["watches"][0]["nudges_sent"] == 1
+    assert reg["watches"][0]["deadline"] == "2026-08-11"  # Fri + 2bd -> Tue
+
+
+def test_process_deadlines_report_only_never_exhausts_the_nudge_budget(monkeypatch, fue_files):
+    # THE motivating defect, directly reproduced and guarded against:
+    # repeated report-only runs, well past max_nudges (default 3), must
+    # NEVER flip the watch to "exhausted" or emit an "exhausted" event --
+    # because zero real drafts were ever created in anyone's mailbox. Runs
+    # the SAME watch through 10 consecutive report-only cycles (more than
+    # 3x max_nudges), each one landing exactly on the deadline the PREVIOUS
+    # cycle reported, simulating 10 real daily-cron days.
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=1)]}
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    today = date(2026, 8, 7)
+    for _ in range(10):
+        events = fue.process_deadlines(reg, today, dry_run=False)
+        assert all(e["type"] == "would_draft" for e in events)
+        w = reg["watches"][0]
+        assert w["status"] == "active"
+        today = date.fromisoformat(w["deadline"])  # advance to the next reported deadline
+    assert reg["watches"][0]["nudges_sent"] == 0
+    assert reg["watches"][0]["status"] == "active"
+    assert not any("max reminders" in n["text"] for n in reg["watches"][0]["notes"])
 
 
 def test_create_draft_uses_latest_message_id_over_anchor(monkeypatch, fue_files):

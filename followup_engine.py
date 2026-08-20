@@ -771,7 +771,27 @@ def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
             logger.warning(f"[followup] compose failed for {w['id']}: {e}")
             continue  # try again next run; deadline unchanged
         escalation = w.get("nudges_sent", 0) + 1
-        if _live() and not dry_run:
+        # is None check -- see comment above; same anti-pattern, same fix.
+        # Computed once, shared by the LIVE and REPORT-ONLY branches below
+        # -- DRY RUN never uses it (it mutates nothing), but the
+        # computation itself is pure (no I/O, no mutation) so precomputing
+        # it here is harmless and avoids a third copy of the interval logic.
+        stored_interval = w.get("interval_days")
+        interval = (FOLLOWUP_DEFAULT_BUSINESS_DAYS if stored_interval is None
+                    else int(stored_interval))
+        next_deadline = add_business_days(today, interval).isoformat()
+
+        if dry_run:
+            # CONTROLLER RULING (dry-run budget fix): dry_run=True must be
+            # safe to invoke at any time, whether or not FOLLOWUP_LIVE is
+            # set -- report what WOULD happen and mutate NOTHING (no
+            # nudges_sent, no deadline, no note).
+            events.append({"type": "would_draft", "owner": w["owner"], "watch_id": w["id"],
+                           "ask": w["ask"], "recipients": w["recipients"],
+                           "body": body_html, "escalation": escalation})
+            continue
+
+        if _live():
             try:
                 d = _create_draft(w, body_html)
             except Exception as e:
@@ -783,17 +803,27 @@ def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
                            "ask": w["ask"], "recipients": w["recipients"],
                            "body": body_html, "web_link": d["web_link"],
                            "escalation": escalation})
+            w["nudges_sent"] = escalation
+            w["deadline"] = next_deadline
         else:
+            # CONTROLLER RULING (dry-run budget fix): REPORT-ONLY is the
+            # ship state (FOLLOWUP_LIVE unset). Advance the deadline so the
+            # watch re-surfaces on the same cadence a live run would, but
+            # leave nudges_sent UNTOUCHED -- a run that drafted nothing in
+            # anyone's mailbox must never consume the nudge budget, or
+            # every watch silently exhausts itself within max_nudges
+            # report-only days with zero real reminders ever sent (the
+            # defect: report-only used to advance nudges_sent
+            # unconditionally, so setting FOLLOWUP_LIVE=1 later found every
+            # pilot watch already dead). The exhaustion check above
+            # therefore never fires from repeated report-only runs alone --
+            # no separate guard needed, since nudges_sent structurally
+            # cannot reach max_nudges this way.
             _note(w, f"reminder {escalation} would be drafted (report-only)")
             events.append({"type": "would_draft", "owner": w["owner"], "watch_id": w["id"],
                            "ask": w["ask"], "recipients": w["recipients"],
                            "body": body_html, "escalation": escalation})
-        w["nudges_sent"] = escalation
-        # is None check -- see comment above; same anti-pattern, same fix.
-        stored_interval = w.get("interval_days")
-        interval = (FOLLOWUP_DEFAULT_BUSINESS_DAYS if stored_interval is None
-                    else int(stored_interval))
-        w["deadline"] = add_business_days(today, interval).isoformat()
+            w["deadline"] = next_deadline
     return events
 
 
