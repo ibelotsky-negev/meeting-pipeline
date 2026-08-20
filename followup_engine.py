@@ -500,7 +500,7 @@ def _confirmation_html(watches: list) -> str:
             "<p>I check once a day at 17:00 and place ready-to-send drafts in your "
             "Drafts folder; you will get a report email whenever there is anything "
             "new or still unsent. Reply <b>stop</b> (optionally with watch ids) to "
-            "cancel, <b>resume</b> to re-arm a paused watch.</p>")
+            "cancel, <b>resume</b> to re-arm a paused or cancelled watch.</p>")
 
 
 # A watch in one of these statuses does not count toward the open-watch cap
