@@ -38,7 +38,14 @@ PARSE_MODEL = os.environ.get("FOLLOWUP_PARSE_MODEL", "claude-sonnet-4-6")
 VERDICT_MODEL = os.environ.get("FOLLOWUP_VERDICT_MODEL", "claude-haiku-4-5-20251001")
 DRAFT_MODEL = os.environ.get("FOLLOWUP_DRAFT_MODEL", "claude-sonnet-4-6")
 ALERT_CC = os.environ.get("FOLLOWUP_ALERT_CC", "bk@negevlabs.com")
-TZ_NAME = "Asia/Jerusalem"
+# IANA zone name (NOT a fixed UTC offset) so daylight saving is handled
+# automatically -- US Central is CST/CDT depending on the date. app.py's
+# start_scheduler() reads this SAME env var independently for the
+# followup_daily cron's timezone= (it must not import this module at
+# module scope -- see that function's own comment), so the two defaults
+# can drift apart if only one is ever changed;
+# test_followup_daily_job_timezone_matches_tz_name pins them together.
+TZ_NAME = os.environ.get("FOLLOWUP_TZ", "America/Chicago")
 
 
 def _live() -> bool:
@@ -47,7 +54,11 @@ def _live() -> bool:
     return os.environ.get("FOLLOWUP_LIVE", "") == "1"
 
 
-def _today_il() -> date:
+def _today_local() -> date:
+    # "local" = TZ_NAME (FOLLOWUP_TZ, default America/Chicago) -- the
+    # calendar the daily cron's own clock and the deadline math must
+    # agree on. Renamed from _today_il: that suffix meant Israel and
+    # became actively misleading once the default moved to US Central.
     from zoneinfo import ZoneInfo
     return datetime.now(ZoneInfo(TZ_NAME)).date()
 
@@ -651,7 +662,7 @@ def _apply_command(reg: dict, watches: list, cmd: str) -> list:
             stored_interval = w.get("interval_days")
             interval = (FOLLOWUP_DEFAULT_BUSINESS_DAYS if stored_interval is None
                         else int(stored_interval))
-            w["deadline"] = add_business_days(_today_il(), interval).isoformat()
+            w["deadline"] = add_business_days(_today_local(), interval).isoformat()
             _note(w, "re-armed by owner reply")
             changed.append(w["id"])
     return changed
@@ -825,7 +836,7 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
             continue
 
         externals = sorted(p for p in thread["participants"] if not config.is_internal_email(p))
-        today = _today_il()
+        today = _today_local()
         new = []
         matched_existing = []
         capped = []
@@ -1447,7 +1458,7 @@ def run_daily(dry_run: bool = False) -> dict:
     started = datetime.now(timezone.utc)
     reg = _load_registry()
     events = check_replies(reg)
-    today = _today_il()
+    today = _today_local()
     events += process_deadlines(reg, today, dry_run)
     unsent = [] if dry_run else sweep_unsent(reg)
 

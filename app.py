@@ -4566,8 +4566,13 @@ def start_scheduler():
         replace_existing=True,
     )
     # Follow-Up Engine: intake scan every 15min (registrations + commands);
-    # daily thread check 17:00 Asia/Jerusalem -- drafts land in time for an
-    # early-evening send that tops a CRO's next-morning inbox in India.
+    # daily thread check 17:00 America/Chicago (FOLLOWUP_TZ, default
+    # America/Chicago). Deliberately does NOT import followup_engine here to
+    # share its TZ_NAME -- that module is lazily imported inside handlers
+    # only, and this function runs at boot -- so both places read
+    # FOLLOWUP_TZ independently and must keep agreeing, or the deadline date
+    # the daily run computes and the calendar day the cron fires on drift
+    # apart by one day. See test_followup_daily_job_timezone_matches_tz_name.
     _scheduler.add_job(
         followup_intake_run,
         trigger="interval",
@@ -4580,7 +4585,7 @@ def start_scheduler():
         trigger="cron",
         hour=int(os.environ.get("FOLLOWUP_HOUR", "17")),
         minute=0,
-        timezone="Asia/Jerusalem",
+        timezone=os.environ.get("FOLLOWUP_TZ", "America/Chicago"),
         id="followup_daily",
         replace_existing=True,
         misfire_grace_time=3600,

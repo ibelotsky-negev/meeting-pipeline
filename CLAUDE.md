@@ -168,7 +168,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Read/Learn Digest:** Friday 06:00 Asia/Jerusalem, drains Ken's Outlook "read/learn" folder, resolves each saved link, Opus cluster+curate against a Ken's-needs profile, emails one HTML digest + creates Asana keeper tasks (`learn_digest.py`). See the Read/Learn Digest Module section.
 - **FYI Triage:** daily 06:00 Asia/Jerusalem, scans the two high-volume auto-filed folders "4: notification" + "8: marketing", classifies each message IMPORTANT vs NOISE with Sonnet (reading the body, not just the from-address), and MOVES the important ones to "2: FYI". Dual-gated (`?live=1` AND env `FYI_LIVE=1`) -- ships DRY, auto-promotes to live once Ken sets `FYI_LIVE` (`fyi_triage.py`). See the FYI Triage Module section + ROLLOUT.md.
 - **X-transcribe-email:** any internal teammate emails Sara (`sara@palomar-labs.com`) an x.com/twitter.com or youtube.com/youtu.be link to a single post/video (a podcast episode link is detected too and reported unsupported; a container URL -- channel, profile, playlist, show -- is not a request at all); a 15-min inbox scan transcribes each video (YouTube captions first, falling back to yt-dlp + Grok STT; X always via yt-dlp + Grok STT), summarizes with Claude, and REPLIES in-thread (Graph `createReply`) with a structured summary in the body + the full transcript as a `.md` attachment per link. A question asked alongside the link, or a link-free follow-up reply in an already-transcribed conversation, is answered from the cached transcript (`x_transcribe_email.py`). See the x-transcribe-email Module section.
-- **Follow-Up Engine (pilot):** a 15-min scan of Sara's inbox registers one watch per ask from a forwarded thread ("chase X if no reply in N days"); a daily 17:00 Asia/Jerusalem check then places a ready-to-send reminder DRAFT in the thread owner's Outlook Drafts -- it NEVER sends to a counterparty -- and stays report-only until `FOLLOWUP_LIVE=1` (`followup_engine.py`). See the followup-engine Module section.
+- **Follow-Up Engine (pilot):** a 15-min scan of Sara's inbox registers one watch per ask from a forwarded thread ("chase X if no reply in N days"); a daily 17:00 America/Chicago (`FOLLOWUP_TZ`) check then places a ready-to-send reminder DRAFT in the thread owner's Outlook Drafts -- it NEVER sends to a counterparty -- and stays report-only until `FOLLOWUP_LIVE=1` (`followup_engine.py`). See the followup-engine Module section.
 
 ## email-pipeline-sync Module
 
@@ -544,7 +544,7 @@ share it.
   `FOLLOWUP_MAX_WATCHES` counts only NON-TERMINAL watches (nothing prunes
   finished ones, so counting them ratcheted the cap shut), and any ask the
   cap drops is named in a failure reply -- honest failure, never silence.
-- Daily check (17:00 Asia/Jerusalem): per active watch, new thread messages
+- Daily check (17:00 America/Chicago, `FOLLOWUP_TZ`): per active watch, new thread messages
   since last check; external non-auto-reply messages get a per-ask Haiku
   verdict -- ANSWERED closes, a human non-answer PAUSES (owner re-arms);
   internal/own messages ignored (pilot limitation: an owner's manual chase
@@ -613,8 +613,10 @@ Fireflies polling: `POLL_INTERVAL_MINUTES` (default 5 in code, **set to 60 on Ra
 Read/Learn: optional `LEARN_LOOKBACK_DAYS` (trailing window for normal/cron runs, default 14; read/unread agnostic), `LEARN_CONCURRENCY`, `LEARN_CURRENCY_CHECK`, `LEARN_YT_ATTEMPTS` (YouTube caption attempts on a TRANSIENT error, default 3) / `LEARN_YT_RETRY_WAIT` (backoff seconds, default 2), resolver keys `XAI_API_KEY` / `SPOKEN_API_KEY` / `JINA_API_KEY` (read at call time; absent = degrade, never fabricate).
 
 followup-engine: `FOLLOWUP_LIVE` (set `1` to arm draft creation; UNSET at ship
-= report-only), `FOLLOWUP_HOUR` (daily check hour Asia/Jerusalem, default 17),
-`FOLLOWUP_INTAKE_MINUTES` (15), `FOLLOWUP_DEFAULT_BUSINESS_DAYS` (2),
+= report-only), `FOLLOWUP_HOUR` (daily check hour, default 17), `FOLLOWUP_TZ`
+(daily check timezone, IANA name so DST is handled automatically, default
+`America/Chicago`), `FOLLOWUP_INTAKE_MINUTES` (15),
+`FOLLOWUP_DEFAULT_BUSINESS_DAYS` (2),
 `FOLLOWUP_MAX_NUDGES` (3), `FOLLOWUP_MAX_WATCHES` (100),
 `FOLLOWUP_INTAKE_MAX_MESSAGES` (25), `FOLLOWUP_PARSE_MODEL` /
 `FOLLOWUP_DRAFT_MODEL` (sonnet) / `FOLLOWUP_VERDICT_MODEL` (haiku),

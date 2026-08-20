@@ -608,7 +608,7 @@ def test_run_daily_report_subject_names_the_watches_it_covers(monkeypatch, fue_f
     w1 = _watch_in_registry(deadline="2026-08-07", ask="investigation status")
     w2 = _watch_in_registry(deadline="2026-08-07", ask="summary report")
     fue._save_registry({"watches": [w1, w2]})
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     sent = _sendmail_capture(monkeypatch)
@@ -646,7 +646,7 @@ def test_run_intake_resume_reply_to_a_report_re_arms_the_watch_the_subject_names
     fue._save_registry({"watches": [w]})
     subject = "RE: " + fue._report_subject(0, 1, date(2026, 8, 7), [w["id"]])
     replies = _report_reply_world(monkeypatch, "resume", subject=subject)
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
     out = fue.run_intake()
     assert out["commands"] == 1
     saved = fue._load_registry()["watches"][0]
@@ -674,7 +674,7 @@ def test_run_intake_done_thanks_reply_then_resume_round_trip(monkeypatch, fue_fi
     # A later reply on a FRESH report conversation naming the same watch
     # resumes it. Distinct message id (mid="rep2") so intake does not treat
     # this as a repeat of the already-processed cancel reply.
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 10))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 10))
     resume_subject = "RE: " + fue._report_subject(0, 1, date(2026, 8, 10), [w["id"]])
     replies2 = _report_reply_world(monkeypatch, "resume", subject=resume_subject,
                                    cid="conv-report-10", mid="rep2")
@@ -1164,7 +1164,7 @@ def test_run_intake_preserves_days_zero(monkeypatch, fue_files):
     assert out["registered"] == 1
     w = fue._load_registry()["watches"][0]
     assert w["interval_days"] == 0
-    assert w["deadline"] == fue._today_il().isoformat()
+    assert w["deadline"] == fue._today_local().isoformat()
 
 
 def test_apply_command_resume_recomputes_deadline():
@@ -1178,7 +1178,7 @@ def test_apply_command_resume_recomputes_deadline():
     changed = fue._apply_command({"watches": [w]}, [w], "resume")
     assert changed == [w["id"]]
     assert w["status"] == "active"
-    assert w["deadline"] == fue.add_business_days(fue._today_il(), 3).isoformat()
+    assert w["deadline"] == fue.add_business_days(fue._today_local(), 3).isoformat()
 
 
 def test_apply_command_resume_preserves_interval_days_zero():
@@ -1193,7 +1193,7 @@ def test_apply_command_resume_preserves_interval_days_zero():
         intake_conversation_id="conv-intake")
     w["status"] = "paused"
     fue._apply_command({"watches": [w]}, [w], "resume")
-    assert w["deadline"] == fue._today_il().isoformat()
+    assert w["deadline"] == fue._today_local().isoformat()
 
 
 def test_apply_command_cancel_ignores_terminal_watch():
@@ -1221,7 +1221,7 @@ def test_apply_command_resume_reactivates_cancelled_watch():
         recipients=[], interval_days=3, deadline=date(2026, 8, 7),
         intake_conversation_id="conv-intake")
     w["status"] = "cancelled"
-    today = fue._today_il()
+    today = fue._today_local()
     changed = fue._apply_command({"watches": [w]}, [w], "resume")
     assert changed == [w["id"]]
     assert w["status"] == "active"
@@ -1246,7 +1246,7 @@ def test_apply_command_resume_from_cancelled_preserves_interval_days_zero():
     w["status"] = "cancelled"
     fue._apply_command({"watches": [w]}, [w], "resume")
     assert w["status"] == "active"
-    assert w["deadline"] == fue._today_il().isoformat()
+    assert w["deadline"] == fue._today_local().isoformat()
 
 
 def test_apply_command_resume_does_not_revive_answered_or_exhausted():
@@ -2858,7 +2858,7 @@ def test_run_daily_reports_would_draft_per_owner(monkeypatch, fue_files):
                            deadline="2026-08-07"),
     ]}
     fue._save_registry(reg)
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     sent = _sendmail_capture(monkeypatch)
@@ -2890,7 +2890,7 @@ def test_run_daily_reports_would_draft_per_owner(monkeypatch, fue_files):
 
 def test_run_daily_quiet_day_sends_nothing(monkeypatch, fue_files):
     fue._save_registry({"watches": [_watch_in_registry(deadline="2026-12-31")]})
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
     sent = _sendmail_capture(monkeypatch)
     out = fue.run_daily()
@@ -2901,7 +2901,7 @@ def test_run_daily_quiet_day_sends_nothing(monkeypatch, fue_files):
 def test_run_daily_escalation_ccs_alert(monkeypatch, fue_files):
     fue._save_registry({"watches": [
         _watch_in_registry(deadline="2026-08-07", nudges_sent=3)]})
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
     sent = _sendmail_capture(monkeypatch)
     fue.run_daily()
@@ -2913,7 +2913,7 @@ def test_run_daily_escalation_ccs_alert(monkeypatch, fue_files):
 def test_run_daily_dry_run_persists_nothing(monkeypatch, fue_files):
     monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
     fue._save_registry({"watches": [_watch_in_registry(deadline="2026-08-07")]})
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     sent = _sendmail_capture(monkeypatch)
@@ -2963,7 +2963,7 @@ def test_run_daily_dry_run_does_not_touch_status_file(monkeypatch, fue_files):
     # byte-identical.
     fue._write_status({"reports": 999, "marker": "prior-real-run"})
     fue._save_registry({"watches": [_watch_in_registry(deadline="2026-08-07")]})
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     _sendmail_capture(monkeypatch)
@@ -2997,7 +2997,7 @@ def test_run_daily_per_owner_report_excludes_other_owners_content(monkeypatch, f
     ka_unsent["drafts"] = [{"message_id": "d-ka-old", "web_link": "https://outlook.example/d-ka",
                             "created": "2026-08-01T00:00:00Z", "sent": False}]
     fue._save_registry({"watches": [dan_event, ka_event, dan_unsent, ka_unsent]})
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
 
     def _graph_get_router(url, params=None):
         if url.endswith("/messages"):
@@ -3030,7 +3030,7 @@ def test_run_daily_sends_report_for_unsent_only_no_new_events(monkeypatch, fue_f
     w["drafts"] = [{"message_id": "d-old", "web_link": "https://outlook.example/d-old",
                      "created": "2026-08-01T00:00:00Z", "sent": False}]
     fue._save_registry({"watches": [w]})
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
 
     def _graph_get_router(url, params=None):
         if url.endswith("/messages"):
@@ -3053,7 +3053,7 @@ def test_run_daily_alert_cc_not_duplicated_when_owner_is_alert_cc(monkeypatch, f
     fue._save_registry({"watches": [
         _watch_in_registry(owner=fue.ALERT_CC, mailbox=fue.ALERT_CC,
                            deadline="2026-08-07", nudges_sent=3)]})
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
     sent = _sendmail_capture(monkeypatch)
     fue.run_daily()
@@ -3069,7 +3069,7 @@ def test_run_daily_send_failure_for_one_owner_does_not_block_others(monkeypatch,
                            deadline="2026-08-07"),
     ]}
     fue._save_registry(reg)
-    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(fue, "_today_local", lambda: date(2026, 8, 7))
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     sent = []
@@ -3519,3 +3519,127 @@ def test_followup_run_route_async_thread_start_failure_releases_lock(fue_files, 
     assert "thread start boom" in payload["error"]
     assert app_module._followup_lock.acquire(timeout=5)
     app_module._followup_lock.release()
+
+
+# ----------------------------------------------------------------------
+#  FOLLOWUP_TZ: the daily watch moved to 17:00 US Central (was Asia/
+#  Jerusalem). TZ_NAME here and the followup_daily cron's timezone= in
+#  app.py's start_scheduler() are two INDEPENDENT reads of the same env
+#  var -- app.py must not import this module at module scope (see that
+#  function's own comment), so nothing but a test stops the two literal
+#  fallback defaults from drifting apart.
+# ----------------------------------------------------------------------
+
+def test_tz_name_default_and_env_override():
+    import importlib
+    import os
+    original = os.environ.pop("FOLLOWUP_TZ", None)
+    try:
+        importlib.reload(fue)
+        assert fue.TZ_NAME == "America/Chicago"
+
+        os.environ["FOLLOWUP_TZ"] = "Europe/London"
+        importlib.reload(fue)
+        assert fue.TZ_NAME == "Europe/London"
+    finally:
+        if original is None:
+            os.environ.pop("FOLLOWUP_TZ", None)
+        else:
+            os.environ["FOLLOWUP_TZ"] = original
+        importlib.reload(fue)
+
+
+def test_followup_daily_job_timezone_matches_tz_name():
+    """Drift guard. Checked twice: once under the ambient default (catches
+    a diverged literal fallback), once under an explicit override neither
+    side's default happens to equal (catches one side quietly ignoring
+    FOLLOWUP_TZ while the other keeps honoring it)."""
+    import app as app_module
+    import importlib
+    import os
+
+    def _job_tz():
+        app_module.start_scheduler()
+        try:
+            job = app_module._scheduler.get_job("followup_daily")
+            assert job is not None, "followup_daily job was not registered"
+            return str(job.trigger.timezone)
+        finally:
+            app_module._scheduler.shutdown(wait=False)
+
+    assert fue.TZ_NAME == "America/Chicago"
+    assert _job_tz() == fue.TZ_NAME
+
+    original = os.environ.get("FOLLOWUP_TZ")
+    os.environ["FOLLOWUP_TZ"] = "Europe/London"
+    try:
+        importlib.reload(fue)
+        assert fue.TZ_NAME == "Europe/London"
+        assert _job_tz() == fue.TZ_NAME
+    finally:
+        if original is None:
+            os.environ.pop("FOLLOWUP_TZ", None)
+        else:
+            os.environ["FOLLOWUP_TZ"] = original
+        importlib.reload(fue)
+
+
+def test_run_intake_registers_deadline_on_the_central_calendar_date_not_israels(
+        monkeypatch, fue_files):
+    """The exact off-by-one FOLLOWUP_TZ exists to prevent. At
+    2026-08-19T22:00:00Z the Central calendar reads 2026-08-19 17:00 (the
+    new cron hour, precisely) while Israel's has already rolled to
+    2026-08-20 01:00 -- so a 2-business-day chase registered at this
+    instant must anchor to Aug 19 (deadline Fri Aug 21), never to Aug 20
+    (deadline Mon Aug 24 -- the wrong answer a still-Israel-anchored clock
+    would compute, and exactly the bug this task exists to prevent)."""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    fixed_utc = _dt.datetime(2026, 8, 19, 22, 0, 0, tzinfo=_dt.timezone.utc)
+
+    class _FixedDatetime(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_utc.replace(tzinfo=None)
+            return fixed_utc.astimezone(tz)
+
+    # Sanity: confirm the constructed instant really straddles the two
+    # calendars, or nothing below would prove anything.
+    assert fixed_utc.astimezone(ZoneInfo("America/Chicago")).date() == date(2026, 8, 19)
+    assert fixed_utc.astimezone(ZoneInfo("Asia/Jerusalem")).date() == date(2026, 8, 20)
+    assert fue.TZ_NAME == "America/Chicago"
+
+    monkeypatch.setattr(fue, "datetime", _FixedDatetime)
+
+    instruction = _intake_msg(
+        "bd1", "dan@negevlabs.com", "FW: Dog tox study",
+        "please chase them for a status update in 2 days if they do not reply")
+    thread_newest = _graph_msg("m2", "cid-right", "RE: Dog tox study",
+                               "upendra.kumar@adgyllifesciences.com",
+                               "2026-08-05T07:23:00Z",
+                               to=["salim.tamboli@vimta.com"],
+                               cc=["dan@negevlabs.com"])
+
+    def _graph_get(url, params=None):
+        if f"/users/{fue.SARA_MAILBOX}/mailFolders/inbox/messages" in url:
+            return {"value": [instruction]}
+        if "/users/dan@negevlabs.com/messages" in url:
+            return {"value": [thread_newest]}
+        return {"value": []}
+
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    canned = json.dumps({
+        "is_request": True, "thread_subject": "Dog tox study", "counterparties": [],
+        "asks": [{"ask": "status update", "recipients": [], "days": 2, "date": None}],
+    })
+    monkeypatch.setattr(ld, "_call_claude_text", lambda p, m, max_tokens=2000, **kw: canned)
+    monkeypatch.setattr(xte, "send_threaded_reply", lambda *a, **kw: None)
+
+    out = fue.run_intake()
+    assert out["registered"] == 1
+    w = fue._load_registry()["watches"][0]
+    assert w["deadline"] == "2026-08-21"
+    assert w["deadline"] == fue.add_business_days(date(2026, 8, 19), 2).isoformat()
+    assert w["deadline"] != fue.add_business_days(date(2026, 8, 20), 2).isoformat()

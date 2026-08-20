@@ -27,7 +27,7 @@ drafts, notifies, and stops.
    silence. A message that is not a follow-up request (no trigger keyword, or
    the parser says NOT_A_REQUEST) is left for other handlers (x-transcribe,
    corrections) exactly as they leave mail for us.
-2. **Watch (daily, 17:00 Asia/Jerusalem).** For each active watch, read new
+2. **Watch (daily, 17:00 America/Chicago, `FOLLOWUP_TZ`).** For each active watch, read new
    thread messages since last check via app-only Graph. External, non-auto-reply
    messages get a per-ask Claude verdict: ANSWERED closes the watch;
    a human reply that does NOT answer pauses the watch (owner decides);
@@ -121,9 +121,10 @@ that is parked by team decision and is out of scope for this module.
 - `/followup/run` (POST/GET, `?dry_run=1&sync=1`) -- manual daily check.
 - `/followup/intake` (POST/GET, `?dry_run=1&sync=1`) -- manual intake scan.
 - `/followup/status` -- last run + active watch summaries.
-- APScheduler: cron `followup_daily` 17:00 Asia/Jerusalem
-  (`FOLLOWUP_HOUR`, default 17); interval `followup_intake` every
-  `FOLLOWUP_INTAKE_MINUTES` (default 15). ONE trigger lock
+- APScheduler: cron `followup_daily` 17:00 America/Chicago
+  (`FOLLOWUP_HOUR`, default 17; `FOLLOWUP_TZ`, default `America/Chicago`, an
+  IANA zone name so DST is handled automatically); interval `followup_intake`
+  every `FOLLOWUP_INTAKE_MINUTES` (default 15). ONE trigger lock
   (`app._followup_lock`) shared by both manual routes AND both jobs --
   intake and the daily check both rewrite `followups.json` wholesale, so
   they must never overlap. Never held while taking another lock, always
