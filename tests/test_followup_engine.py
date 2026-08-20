@@ -1665,3 +1665,44 @@ def test_sweep_unsent_isdraft_false_marks_sent_without_exception(monkeypatch, fu
     assert unsent == []
     assert w["drafts"][0]["sent"] is True
     assert any("left the Drafts folder" in n["text"] for n in w["notes"])
+
+
+# Fix report (dry-run inertness) additions -- FIX 1 and FIX 2 below close the
+# same defect class the report-only budget ruling settled: dry_run=True must
+# mutate NOTHING, full stop. Each new test is paired with an existing
+# non-dry counterpart (named in its own comment) so the guard cannot be
+# satisfied by disabling the underlying feature outright.
+
+
+def test_process_deadlines_dry_run_unparseable_deadline_leaves_watch_untouched(monkeypatch, fue_files):
+    # FIX 1: a dry run must be safe to invoke at any time against live
+    # state -- it must not repair a corrupted deadline either. Paired with
+    # test_process_deadlines_unparseable_deadline_resets_and_skips
+    # (dry_run=False), which proves the deadline DOES actually reset when
+    # not in a dry run, so this guard cannot be satisfied by disabling the
+    # reset feature outright.
+    reg = {"watches": [_watch_in_registry(deadline="not-a-date")]}
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("unparseable deadline must never reach compose"))
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=True)  # must not raise
+    assert events == []
+    assert reg["watches"][0]["deadline"] == "not-a-date"  # byte-identical, NOT reset
+    assert reg["watches"][0]["notes"] == []  # byte-identical, no note added
+
+
+def test_process_deadlines_dry_run_exhausted_watch_emits_event_without_mutating(monkeypatch, fue_files):
+    # FIX 2 (the more serious one): a dry_run=True preview against a watch
+    # already at nudges_sent >= max_nudges must still show the "exhausted"
+    # outcome (the event fires, so the preview is honest) but must NEVER
+    # flip the watch to exhausted for real as a side effect of merely
+    # asking "what would happen?". Paired with the brief's own
+    # test_process_deadlines_exhaustion (dry_run=False), which proves
+    # status DOES actually flip when not in a dry run, so this guard
+    # cannot be satisfied by disabling the exhaustion feature outright.
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", nudges_sent=3)]}
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("an exhausted watch must never be drafted for"))
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=True)
+    assert events[0]["type"] == "exhausted"  # still reported in the preview
+    assert reg["watches"][0]["status"] == "active"  # NOT flipped for real
+    assert reg["watches"][0]["notes"] == []  # unchanged

@@ -738,6 +738,13 @@ def _create_draft(watch: dict, body_html: str) -> dict:
 
 
 def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
+    # DRY-RUN INVARIANT (controller ruling): under dry_run, this function
+    # may compute and emit events freely, but must not mutate ANY field of
+    # ANY watch -- not deadline, not status, not nudges_sent, not notes,
+    # not drafts. Every site below that writes to a watch is guarded by
+    # `if not dry_run:` (or is provably unreachable when dry_run is True,
+    # e.g. everything inside the `if _live():` / `else:` split lower down,
+    # which sits after the unconditional `if dry_run: ... continue`).
     events = []
     for w in reg.get("watches") or []:
         if w.get("status") != "active":
@@ -745,22 +752,35 @@ def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
         try:
             deadline = date.fromisoformat(w.get("deadline") or "")
         except ValueError:
-            _note(w, f"unparseable deadline {w.get('deadline')!r}; resetting")
-            # is None (not falsy) check -- an explicit interval_days=0 must
-            # survive a deadline reset too; `x or default` would silently
-            # upgrade a same-day-chase watch to the 2-day default. Same fix
-            # as new_watch (Task 1) and _apply_command's resume (Task 4) --
-            # standing rule, do not reintroduce.
-            stored_interval = w.get("interval_days")
-            interval = (FOLLOWUP_DEFAULT_BUSINESS_DAYS if stored_interval is None
-                        else int(stored_interval))
-            w["deadline"] = add_business_days(today, interval).isoformat()
+            # DRY-RUN INVARIANT: a dry run must be safe to invoke at any
+            # time against live state, so a corrupted deadline is reported/
+            # skipped WITHOUT being repaired when dry_run is True. Non-dry
+            # behavior (actually reset it) is unchanged.
+            if not dry_run:
+                _note(w, f"unparseable deadline {w.get('deadline')!r}; resetting")
+                # is None (not falsy) check -- an explicit interval_days=0
+                # must survive a deadline reset too; `x or default` would
+                # silently upgrade a same-day-chase watch to the 2-day
+                # default. Same fix as new_watch (Task 1) and
+                # _apply_command's resume (Task 4) -- standing rule, do
+                # not reintroduce.
+                stored_interval = w.get("interval_days")
+                interval = (FOLLOWUP_DEFAULT_BUSINESS_DAYS if stored_interval is None
+                            else int(stored_interval))
+                w["deadline"] = add_business_days(today, interval).isoformat()
             continue
         if today < deadline:
             continue
         if w.get("nudges_sent", 0) >= w.get("max_nudges", FOLLOWUP_MAX_NUDGES):
-            w["status"] = "exhausted"
-            _note(w, "max reminders reached; escalated to owner")
+            # DRY-RUN INVARIANT: the preview must show that this watch
+            # WOULD exhaust (the event still fires), but must not actually
+            # flip status or write a note -- a dry_run=True call against a
+            # watch already at nudges_sent >= max_nudges from real LIVE
+            # runs must never permanently exhaust it as a side effect of
+            # asking "what would happen?".
+            if not dry_run:
+                w["status"] = "exhausted"
+                _note(w, "max reminders reached; escalated to owner")
             events.append({"type": "exhausted", "owner": w["owner"], "watch_id": w["id"],
                            "ask": w["ask"], "recipients": w["recipients"],
                            "escalation": w.get("nudges_sent", 0)})
