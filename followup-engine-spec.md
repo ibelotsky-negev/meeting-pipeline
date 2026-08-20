@@ -38,12 +38,16 @@ drafts, notifies, and stops.
    `createReplyAll`s the latest thread message IN THE OWNER'S MAILBOX, patches
    body (+ explicit recipients when the instruction named them, keeping
    inherited CC so the prime CRO stays in the loop), and LEAVES IT AS A DRAFT.
-   `nudges_sent` increments; the next deadline advances by the watch's
-   interval (business days, Mon-Fri). At `max_nudges` the watch is marked
-   exhausted and escalated instead of drafted. Exhaustion tests
+   `nudges_sent` INCREMENTS (it counts real drafts; it never absorbs the
+   ladder rung, or a watch armed LIVE after report-only cycles would
+   report reminders nobody wrote); the next deadline advances by the
+   watch's interval (business days, Mon-Fri). At `max_nudges` the watch is
+   marked exhausted and escalated instead of drafted. Exhaustion tests
    `max(nudges_sent, report_only_nudges)`, so a REPORT-ONLY watch climbs
    the same ladder and terminates the same way without ever spending the
-   real nudge budget. Counterparty-controlled text (subject, message
+   real nudge budget -- and a watch armed LIVE mid-ladder still gets up to
+   `max_nudges` REAL reminders (one ladder rung can repeat while the
+   counters converge). Counterparty-controlled text (subject, message
    bodies) is fenced as untrusted data in every prompt; an empty compose is
    a failure (retry next run), never a blank draft; and a verdict must be
    an EXACT `ANSWERED` to close a watch.

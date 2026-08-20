@@ -1068,7 +1068,17 @@ def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
                            "ask": w["ask"], "recipients": w["recipients"],
                            "body": body_html, "web_link": d["web_link"],
                            "escalation": escalation})
-            w["nudges_sent"] = escalation
+            # FINDING 2 (final polish): INCREMENT, never store the rung.
+            # `escalation` is max(nudges_sent, report_only_nudges) + 1, so
+            # assigning it made a watch that had climbed in report-only
+            # jump straight to that rung on its FIRST real draft.
+            # nudges_sent means "real reminders drafted" -- the exhaustion
+            # line and /followup/status both read it as that -- and it is
+            # exactly one draft older than it was a line ago. The ladder
+            # and the exhaustion rule are untouched: the event still
+            # carries the rung, and exhaustion still tests
+            # max(nudges_sent, report_only_nudges) per the human ruling.
+            w["nudges_sent"] = _watch_int(w, "nudges_sent") + 1
             w["deadline"] = next_deadline
         else:
             # CONTROLLER RULING (dry-run budget fix), AS AMENDED BY THE

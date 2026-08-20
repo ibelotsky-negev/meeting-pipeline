@@ -1973,6 +1973,80 @@ def test_process_deadlines_report_only_terminates_without_spending_the_real_budg
     assert any("max reminders" in n["text"] for n in w["notes"])
 
 
+def test_process_deadlines_live_draft_increments_nudges_sent_not_the_ladder_rung(monkeypatch, fue_files):
+    # FINDING 2 (final polish): the live branch STORED the ladder rung
+    # (`w["nudges_sent"] = escalation`, escalation being
+    # max(nudges_sent, report_only_nudges) + 1), so a watch that spent a
+    # cycle in report-only and was then armed LIVE jumped straight to 2 on
+    # its FIRST real draft. nudges_sent means "real reminders drafted" --
+    # the exhaustion line and /followup/status both read it -- so it may
+    # only ever increment. Nothing else moves: the reported escalation is
+    # still the ladder rung.
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=2)]}
+
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    first = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert first[0]["type"] == "would_draft" and first[0]["escalation"] == 1
+    assert reg["watches"][0]["report_only_nudges"] == 1
+    assert reg["watches"][0]["nudges_sent"] == 0        # nothing drafted yet
+
+    monkeypatch.setenv("FOLLOWUP_LIVE", "1")
+    _capture_writes(monkeypatch)
+    second = fue.process_deadlines(reg, date(2026, 8, 11), dry_run=False)
+    assert second[0]["type"] == "draft"
+    assert second[0]["escalation"] == 2                 # ladder rung, unchanged
+    assert reg["watches"][0]["nudges_sent"] == 1        # exactly ONE real draft exists
+    assert reg["watches"][0]["report_only_nudges"] == 1  # untouched by the live branch
+    # The note still names the RUNG (tone escalates with the ladder, not
+    # with the count of real drafts).
+    assert any("reminder 2 drafted" in n["text"] for n in reg["watches"][0]["notes"])
+
+
+def test_process_deadlines_mixed_report_only_then_live_still_exhausts_at_max_nudges(monkeypatch, fue_files):
+    # The other half of finding 2: ONLY the stored count changed. The
+    # ladder formula and the exhaustion rule are untouched -- exhaustion
+    # still tests max(nudges_sent, report_only_nudges) per the human
+    # ruling -- and the two PURE paths are byte-identical to before
+    # (all-live: draft 1,2,3 then exhausted; never-live: would_draft 1,2,3
+    # then exhausted, both already pinned by their own tests above).
+    #
+    # The MIXED path does move by one cycle, and that is the honest
+    # consequence of counting real drafts: with nudges_sent at 1 after the
+    # first real draft and report_only_nudges at 1, max() is 1, so rung 2
+    # comes round once more. max_nudges=3 therefore now means AT MOST 3
+    # real reminders, where before a report-only cycle silently ate one of
+    # them (the watch exhausted after 2 real drafts while nudges_sent
+    # claimed 3). Termination is still guaranteed and still bounded by
+    # max_nudges: every live cycle increments nudges_sent by exactly 1,
+    # and every report-only cycle raises report_only_nudges strictly.
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=1)]}
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    today, seen, events = date(2026, 8, 7), [], []
+    for cycle in range(10):
+        if cycle == 1:                       # armed LIVE after one report-only cycle
+            monkeypatch.setenv("FOLLOWUP_LIVE", "1")
+            _capture_writes(monkeypatch)
+        events = fue.process_deadlines(reg, today, dry_run=False)
+        seen += [(e["type"], e.get("escalation")) for e in events]
+        w = reg["watches"][0]
+        if w["status"] != "active":
+            break
+        today = date.fromisoformat(w["deadline"])
+    w = reg["watches"][0]
+    assert seen == [("would_draft", 1), ("draft", 2), ("draft", 2), ("draft", 3),
+                    ("exhausted", 3)]
+    assert w["status"] == "exhausted"                   # still terminates at the cap
+    assert w["nudges_sent"] == 3                        # 3 REAL drafts == 3 reminders
+    assert w["report_only_nudges"] == 1
+    # The exhaustion line is now true either way: 3 real drafts, so no
+    # "actually drafted" caveat is needed here.
+    assert "3 reminders went unanswered" in fue.build_report(w["owner"], events, [])
+    fue._save_registry(reg)
+    assert fue.status_summary()["watches"][0]["nudges_sent"] == 3   # counts drafts, not rungs
+
+
 def test_escalation_step_none_safe_and_max_of_both_counters():
     # is None (not falsy) guard: a legitimate stored 0 survives, an absent
     # key (older registry) reads 0, an explicit null reads 0.
