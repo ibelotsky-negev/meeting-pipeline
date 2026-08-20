@@ -778,6 +778,61 @@ def test_run_intake_targetless_command_that_is_really_a_registration_still_regis
     assert "Registered 2 follow-up watch" in body
 
 
+def test_run_intake_registration_replied_into_a_report_thread_still_registers(monkeypatch, fue_files):
+    # DEFECT 1 (ordering): the SUBJECT-id resolution ran ABOVE the trigger
+    # and is_request gates, so a genuine NEW registration sent as a REPLY
+    # inside a report thread was misread as a command -- registered=0,
+    # commands=1, "Done: resume applied to no eligible watches", and the
+    # message marked processed, losing the ask permanently. The existing
+    # targetless-command guard misses this: its subject is a plain "FW:"
+    # one carrying no ids. Subject ids may only resolve once
+    # parse_instruction has reported this is NOT a registration.
+    w = _watch_in_registry(ask="prior ask", intake_conversation_id="conv-other")
+    fue._save_registry({"watches": [w]})
+    subject = "RE: " + fue._report_subject(1, 0, date(2026, 8, 7), [w["id"]])
+    instruction = _intake_msg(
+        "rep1", "dan@negevlabs.com", subject,
+        "Keep on top of this: please follow up with Vimta if they do not "
+        "reply within 2 days.", cid="conv-report-9")
+    thread_newest = _graph_msg("m2", "cid-right", "RE: Dog tox study",
+                               "upendra.kumar@adgyllifesciences.com",
+                               "2026-08-05T07:23:00Z",
+                               to=["salim.tamboli@vimta.com"],
+                               cc=["dan@negevlabs.com"])
+
+    def _graph_get(url, params=None):
+        if f"/users/{fue.SARA_MAILBOX}/mailFolders/inbox/messages" in url:
+            return {"value": [instruction]}
+        if "/users/dan@negevlabs.com/messages" in url:
+            return {"value": [thread_newest]}
+        return {"value": []}
+
+    monkeypatch.setattr(eps, "graph_get", _graph_get)
+    canned = json.dumps({
+        "is_request": True, "thread_subject": "Dog tox study",
+        "counterparties": ["salim.tamboli@vimta.com"],
+        "asks": [{"ask": "investigation status", "recipients": [], "days": 2,
+                  "date": None}],
+    })
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda p, m, max_tokens=2000, **kw: canned)
+    replies = []
+    monkeypatch.setattr(xte, "send_threaded_reply",
+                        lambda mid, html_body, attachments=None: replies.append((mid, html_body)))
+    out = fue.run_intake()
+    assert out["registered"] == 1 and out["commands"] == 0 and out["failures"] == 0
+    watches = fue._load_registry()["watches"]
+    assert len(watches) == 2
+    # The watch whose id rode in the report subject is untouched.
+    assert watches[0]["id"] == w["id"] and watches[0]["status"] == "active"
+    fresh = watches[1]
+    assert fresh["id"] != w["id"] and fresh["ask"] == "investigation status"
+    body = replies[0][1]
+    assert len(replies) == 1
+    assert "Registered 1 follow-up watch" in body and fresh["id"] in body
+    assert "Done:" not in body
+
+
 def test_run_intake_stop_phrasing_with_a_trigger_word_and_no_id_is_left_alone(monkeypatch, fue_files):
     # REPLACES test_run_intake_stop_phrasing_with_a_trigger_word_still_asks_
     # which_watch. "stop the follow-up ..." trips the trigger regex, so the

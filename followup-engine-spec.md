@@ -76,7 +76,11 @@ from the SUBJECT, which is where the daily report carries the ids it
 covers (a report is a new conversation and `uniqueBody` strips the quoted
 body, so the subject is the one part a reply keeps). A subject id supplies
 the TARGET only: the leading-word rule still reads the body alone, since
-the subject's ids ride on every reply while a typed id is deliberate.
+the subject's ids ride on every reply while a typed id is deliberate. It
+is also resolved LAST -- only once the trigger gate and the parser have
+established the message is not a registration -- so a genuine
+registration replied into a report thread still registers instead of
+being swallowed as a command.
 Targets: named ids, else all watches registered from that intake
 conversation. Confirmed by reply. A command with NEITHER -- no id in body
 or subject, no matching intake conversation -- is NOT a request: no reply,

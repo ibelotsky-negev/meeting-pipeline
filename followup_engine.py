@@ -532,6 +532,38 @@ def _failure_html(reason: str) -> str:
             "exact subject and who should reply.</p>")
 
 
+def _handle_subject_command(reg: dict, msg: dict, sender: str, cmd: str,
+                            dry_run: bool):
+    """Act on the watch ids the daily report carries in its SUBJECT.
+
+    Called ONLY once the message has been established as not a
+    registration -- see its two call sites in run_intake. Resolving these
+    ids any earlier (as the first cut of the subject-id fix did) reads a
+    genuine registration replied into a report thread -- "Keep on top of
+    this: please follow up with Vimta..." -- as a command, answers it
+    "Done: resume applied to no eligible watches", and marks it processed,
+    losing the ask for good. Ids the sender TYPED in the BODY are
+    different and stay resolved up front: typing one is a deliberate act,
+    while the subject's list rides on every reply to a report.
+
+    Returns the outcome to record, or None when the subject names no id at
+    all -- in which case the caller leaves the message exactly as it found
+    it, since this inbox is shared."""
+    ids = set(_WATCH_ID_RE.findall(msg.get("subject") or ""))
+    if not ids:
+        return None
+    watches = [w for w in (reg.get("watches") or []) if w["id"] in ids]
+    if not watches:
+        return {"from": sender, "kind": "unknown_watch_id"}
+    changed = [] if dry_run else _apply_command(reg, watches, cmd)
+    if not dry_run:
+        _save_registry(reg)
+        xte.send_threaded_reply(
+            msg.get("id"),
+            f"<p>Done: {cmd} applied to {_esc(', '.join(changed) or 'no eligible watches')}.</p>")
+    return {"from": sender, "kind": "command", "cmd": cmd}
+
+
 def _cap_failure_html(dropped: list) -> str:
     """Honest failure, never silence (this module's own rule): name EVERY
     ask the watch cap dropped, and say how to free a slot.
@@ -646,26 +678,18 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
 
         body_text = eps.html_to_text((m.get("uniqueBody") or {}).get("content") or "")
 
-        # Owner commands: explicit watch ids, or the intake thread.
+        # Owner commands: watch ids the sender TYPED in the body, or the
+        # intake thread. Ids carried in the report SUBJECT are a separate,
+        # LATER resolution -- see _handle_subject_command and its two call
+        # sites below. Body ids also REPLACE the subject's rather than
+        # uniting with them: a union would let "stop fw_a" cancel every
+        # watch the report happened to mention.
         cmd = _parse_command(body_text)
-        ids_named = set(_WATCH_ID_RE.findall(body_text))
-        if not ids_named:
-            # FINDING 1 (final polish): the daily report's footer invites
-            # "Reply stop or resume", and a report is a NEW conversation
-            # matching no intake_conversation_id, whose quoted body
-            # uniqueBody strips -- so the ids ride in the report SUBJECT
-            # (see _report_subject), which a reply keeps. Read as a TARGET
-            # only: _parse_command still sees the BODY alone, so a subject
-            # id never relaxes the leading-word rule. An id the sender
-            # TYPED is deliberate; the subject list rides on every reply.
-            ids_named = set(_WATCH_ID_RE.findall(m.get("subject") or ""))
+        ids_in_body = set(_WATCH_ID_RE.findall(body_text))
         conv = m.get("conversationId") or ""
-        # Body ids REPLACE the subject's rather than uniting with them --
-        # a union would let "stop fw_a" cancel every watch the report
-        # happened to mention.
         cmd_watches = [w for w in reg["watches"]
-                       if (w["id"] in ids_named)
-                       or (not ids_named and conv and w.get("intake_conversation_id") == conv)]
+                       if (w["id"] in ids_in_body)
+                       or (not ids_in_body and conv and w.get("intake_conversation_id") == conv)]
         if cmd and cmd_watches:
             changed = [] if dry_run else _apply_command(reg, cmd_watches, cmd)
             if not dry_run:
@@ -679,7 +703,7 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
             _persist_processed(processed, dry_run)
             continue
 
-        if cmd and ids_named and not cmd_watches:
+        if cmd and ids_in_body and not cmd_watches:
             # A command word plus an explicit fw_ id that matches no known
             # watch -- almost certainly a typo. "Honest failure, never
             # silence" per the module's own rule; same reply-then-mark
@@ -687,7 +711,7 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
             failures += 1
             if not dry_run:
                 xte.send_threaded_reply(m.get("id"), _failure_html(
-                    f"I do not recognize watch id(s) {', '.join(sorted(ids_named))}."))
+                    f"I do not recognize watch id(s) {', '.join(sorted(ids_in_body))}."))
             outcomes.append({"from": sender, "kind": "unknown_watch_id"})
             processed.add(mid)
             _persist_processed(processed, dry_run)
@@ -703,21 +727,51 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
         # root cause it worked around is fixed upstream instead: the report
         # subject now carries the fw_ ids, so a real report reply resolves
         # explicitly and never needs a guess.
-        if not _TRIGGER_RE.search(body_text) or _MEDIA_RE.search(body_text):
+        has_media = bool(_MEDIA_RE.search(body_text))
+        if not _TRIGGER_RE.search(body_text) or has_media:
             # Not ours: no trigger keyword, or a media link that makes the
             # message x_transcribe_email's. No reply, no state write, not
             # even marked processed -- exactly as those handlers leave mail
             # for us.
+            #
+            # EXCEPT for a bare command reply to a REPORT ("stop",
+            # "resume", "Done, thanks!"): it carries no trigger keyword,
+            # and for that same reason it can never be a registration, so
+            # this is the first of the two points where the report
+            # SUBJECT's ids may safely be read as a target.
+            if cmd and not ids_in_body and not has_media:
+                res = _handle_subject_command(reg, m, sender, cmd, dry_run)
+                if res is not None:
+                    if res["kind"] == "command":
+                        commands += 1
+                    else:
+                        failures += 1
+                    outcomes.append(res)
+                    processed.add(mid)
+                    _persist_processed(processed, dry_run)
             continue
 
         parsed = parse_instruction(m.get("subject") or "", body_text)
         if not parsed.get("is_request"):
             # e.g. "stop the follow-up on the dog tox study" -- the trigger
             # regex fires, the parser runs and correctly reports
-            # NOT_A_REQUEST. Nothing to act on (an explicit id would have
-            # been resolved by the command path above), so consume it: the
-            # Claude call already happened, and re-running it every 15
-            # minutes would buy nothing.
+            # NOT_A_REQUEST. Only HERE is the message finally established
+            # as not a registration, which is the second and last point a
+            # SUBJECT id may be read as a target.
+            if cmd and not ids_in_body:
+                res = _handle_subject_command(reg, m, sender, cmd, dry_run)
+                if res is not None:
+                    if res["kind"] == "command":
+                        commands += 1
+                    else:
+                        failures += 1
+                    outcomes.append(res)
+                    processed.add(mid)
+                    _persist_processed(processed, dry_run)
+                    continue
+            # Nothing to act on, so consume it: the Claude call already
+            # happened, and re-running it every 15 minutes would buy
+            # nothing.
             processed.add(mid)
             _persist_processed(processed, dry_run)
             continue

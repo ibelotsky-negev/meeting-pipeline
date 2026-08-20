@@ -512,7 +512,13 @@ share it.
   a reply keeps. Body ids REPLACE the subject's (a union would let
   "stop fw_a" cancel every watch the report mentioned), and a subject id
   is a TARGET only -- it never relaxes the leading-word rule, which still
-  reads the body alone. Targets: named `fw_` ids, else all watches from
+  reads the body alone. A body id resolves up front; a SUBJECT id is
+  resolved LAST, by `_handle_subject_command`, only once the trigger gate
+  and the parser have established the message is NOT a registration --
+  otherwise a real registration replied INTO a report thread ("Keep on
+  top of this: follow up with Vimta...") is read as a command, answered
+  "Done: resume applied to no eligible watches", and marked processed,
+  losing the ask. Targets: named `fw_` ids, else all watches from
   that intake conversation. A command with NEITHER is NOT a request: no
   reply, no state write, nothing marked processed. (Through the previous
   fix wave it got a "which watch did you mean?" reply, which over-fired --
