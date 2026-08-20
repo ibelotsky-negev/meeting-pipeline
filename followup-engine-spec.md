@@ -47,7 +47,9 @@ drafts, notifies, and stops.
    bodies) is fenced as untrusted data in every prompt; an empty compose is
    a failure (retry next run), never a blank draft; and a verdict must be
    an EXACT `ANSWERED` to close a watch.
-4. **Report (same run, one email per owner).** Sent from Sara to the owner:
+4. **Report (same run, one email per owner).** Sent from Sara to the owner,
+   subject carrying the `fw_` ids it covers (first 3, then `+N more`) so a
+   "stop"/"resume" reply resolves explicitly:
    every new draft (full text inline + Graph `webLink` to open it in Outlook),
    replies detected, escalations (CC `FOLLOWUP_ALERT_CC`), and every STILL
    UNSENT draft from earlier runs -- repeated daily until sent or cancelled
@@ -64,12 +66,18 @@ A reply to Sara cancels a watch on `stop|cancel|done`, or re-arms a paused
 watch on `resume|continue|keep`. The command word must LEAD the reply or one
 of its lines (an optional short greeting is skipped) unless the body names an
 explicit `fw_xxxxxxxx` id, in which case the word may appear anywhere.
+Ids are read from the body, and -- only when the body names none --
+from the SUBJECT, which is where the daily report carries the ids it
+covers (a report is a new conversation and `uniqueBody` strips the quoted
+body, so the subject is the one part a reply keeps). A subject id supplies
+the TARGET only: the leading-word rule still reads the body alone, since
+the subject's ids ride on every reply while a typed id is deliberate.
 Targets: named ids, else all watches registered from that intake
-conversation. Confirmed by reply. A command with NEITHER a known id nor a
-matching intake conversation -- the shape of an owner replying to a REPORT
-email, since a report is a new conversation and `uniqueBody` strips the
-quoted ids -- gets a "which watch did you mean?" reply listing the
-SENDER'S OWN non-terminal watches, never a stranger's, and never a guess.
+conversation. Confirmed by reply. A command with NEITHER -- no id in body
+or subject, no matching intake conversation -- is NOT a request: no reply,
+no state write, nothing marked. Sara's inbox is shared, and a correction
+mailed to Sara ("Keep the framing... Stop calling it X") parses as a
+command word; guessing at a target answered every one of those.
 
 ## Live gate
 
@@ -139,8 +147,10 @@ that is parked by team decision and is out of scope for this module.
 - Idempotency: processed-ids persisted after EACH handled message; registry
   persisted atomically after each mutation batch; dry runs write nothing.
 - Honest failure, never silence: an unresolvable thread, an unknown watch
-  id, a targetless command, and an ask dropped by `FOLLOWUP_MAX_WATCHES`
-  (which counts only NON-TERMINAL watches) each earn a reply.
+  id, and an ask dropped by `FOLLOWUP_MAX_WATCHES` (which counts only
+  NON-TERMINAL watches) each earn a reply. A command with no resolvable
+  target is the exception and stays silent -- it is indistinguishable from
+  ordinary mail another handler on this shared inbox owns.
 - GxP-adjacent: communications with CROs on GLP/GMP studies -- conservative
   wording, owner always the sender of record, full audit trail in registry.
 

@@ -564,12 +564,13 @@ def test_run_intake_dry_run_writes_nothing(intake_world):
     assert intake_world["replies"] == []
 
 
-def _report_reply_world(monkeypatch, body, sender="dan@negevlabs.com", cid="conv-report-9"):
+def _report_reply_world(monkeypatch, body, sender="dan@negevlabs.com", cid="conv-report-9",
+                        subject="RE: [follow-up] 1 draft(s) ready"):
     """Sara's inbox holds ONE reply that arrived on a conversation the intake
     has never seen -- exactly the shape of an owner replying to a daily
     REPORT email (a report is a new conversation, and uniqueBody strips the
-    quoted fw_ ids)."""
-    msg = _intake_msg("rep1", sender, "RE: [follow-up] 1 draft(s) ready", body, cid=cid)
+    quoted body, which is why the fw_ ids now ride in the SUBJECT)."""
+    msg = _intake_msg("rep1", sender, subject, body, cid=cid)
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [msg]})
     replies = []
     monkeypatch.setattr(xte, "send_threaded_reply",
@@ -577,102 +578,182 @@ def _report_reply_world(monkeypatch, body, sender="dan@negevlabs.com", cid="conv
     return replies
 
 
-def test_run_intake_bare_stop_on_a_report_thread_asks_which_watch(monkeypatch, fue_files):
-    # FINDING 5 (final review): the report footer invites "Reply stop or
-    # resume", but a report is a NEW conversation matching no
-    # intake_conversation_id, and uniqueBody strips the quoted fw_ ids --
-    # so a bare "stop" produced no command, no reply and no error, and Sara
-    # kept drafting reminders to a CRO after the owner believed they had
-    # stopped it.
-    w1 = _watch_in_registry(ask="investigation status")
-    w2 = _watch_in_registry(ask="summary report", status="paused")
+def test_report_subject_carries_the_watch_ids_and_caps_them():
+    # FINDING 1 (final polish), root cause: a "stop" reply to a report had
+    # no target because the ids only ever existed in the report BODY, which
+    # uniqueBody strips on reply. They now ride in the SUBJECT, which a
+    # reply keeps. Capped at 3 -- a subject is a one-line UI and a pilot
+    # report covers one or two watches in practice -- and the overflow is
+    # COUNTED in the subject, never silently dropped.
+    ids = [f"fw_{i:08x}" for i in range(6)]
+    one = fue._report_subject(1, 0, date(2026, 8, 7), ids[:1])
+    assert "1 draft(s) ready, 0 still unsent -- 2026-08-07" in one
+    assert one.endswith(f"[{ids[0]}]")
+    many = fue._report_subject(4, 2, date(2026, 8, 7), ids)
+    assert many.count("fw_") == fue._REPORT_SUBJECT_MAX_IDS == 3
+    assert all(i in many for i in ids[:3])
+    assert "+3 more" in many
+    assert len(many) < 120                      # still readable in a mail list
+    # No ids (nothing to name) -> the plain subject, no empty brackets.
+    assert fue._report_subject(0, 1, date(2026, 8, 7), []).endswith("2026-08-07")
+
+
+def test_run_daily_report_subject_names_the_watches_it_covers(monkeypatch, fue_files):
+    # End of the same wire: what run_daily actually puts on the wire has to
+    # carry the ids, or the intake side has nothing to resolve.
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    w1 = _watch_in_registry(deadline="2026-08-07", ask="investigation status")
+    w2 = _watch_in_registry(deadline="2026-08-07", ask="summary report")
     fue._save_registry({"watches": [w1, w2]})
-    replies = _report_reply_world(monkeypatch, "stop")
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    sent = _sendmail_capture(monkeypatch)
+    fue.run_daily()
+    subject = sent[0]["message"]["subject"]
+    assert w1["id"] in subject and w2["id"] in subject
+
+
+def test_run_intake_stop_reply_to_a_report_cancels_the_watch_the_subject_names(monkeypatch, fue_files):
+    # FINDING 1 (final polish): with the ids in the subject, an owner's
+    # "stop" reply to a report resolves through the ORDINARY explicit-id
+    # path -- no guessing branch, no ambiguity, and only the watch the
+    # report was about.
+    w1 = _watch_in_registry(ask="investigation status")
+    w2 = _watch_in_registry(ask="summary report")
+    fue._save_registry({"watches": [w1, w2]})
+    subject = "RE: " + fue._report_subject(1, 0, date(2026, 8, 7), [w1["id"]])
+    replies = _report_reply_world(monkeypatch, "stop", subject=subject)
     monkeypatch.setattr(ld, "_call_claude_text",
                         lambda *a, **kw: pytest.fail("no Claude call for a bare command"))
     out = fue.run_intake()
-    assert len(replies) == 1 and replies[0][0] == "rep1"     # NOT silence
-    body = replies[0][1]
-    assert w1["id"] in body and w2["id"] in body
-    assert "investigation status" in body and "summary report" in body
-    assert [o["kind"] for o in out["outcomes"]] == ["ambiguous_command"]
-    assert out["outcomes"][0]["cmd"] == "cancel"
-    # Nothing was cancelled on a guess.
+    assert out["commands"] == 1 and out["failures"] == 0
     saved = {w["id"]: w["status"] for w in fue._load_registry()["watches"]}
-    assert saved == {w1["id"]: "active", w2["id"]: "paused"}
-    # Marked processed -- no repeat reply every 15 minutes.
-    assert fue.run_intake()["failures"] == 0 and len(replies) == 1
+    assert saved == {w1["id"]: "cancelled", w2["id"]: "active"}
+    assert len(replies) == 1 and w1["id"] in replies[0][1]
+    # Marked processed -- no repeat action or reply every 15 minutes.
+    assert fue.run_intake()["commands"] == 0 and len(replies) == 1
 
 
-def test_run_intake_bare_stop_lists_only_the_senders_own_watches(monkeypatch, fue_files):
-    # Shared-mailbox citizenship: scope the lookup to watches the SENDER
-    # owns, so a teammate's targetless "stop" never surfaces (or acts on)
-    # someone else's watch.
-    mine = _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
-                             ask="my ask")
-    theirs = _watch_in_registry(owner="ka@negevlabs.com", mailbox="ka@negevlabs.com",
-                               ask="their ask")
-    fue._save_registry({"watches": [mine, theirs]})
-    replies = _report_reply_world(monkeypatch, "stop")
-    fue.run_intake()
-    body = replies[0][1]
-    assert mine["id"] in body and "my ask" in body
-    assert theirs["id"] not in body and "their ask" not in body
+def test_run_intake_resume_reply_to_a_report_re_arms_the_watch_the_subject_names(monkeypatch, fue_files):
+    # Same wire, the other command: the report footer invites "resume" for
+    # a paused watch, and a paused watch is exactly what a report row is
+    # most often about.
+    w = _watch_in_registry(status="paused", deadline="2026-08-01")
+    fue._save_registry({"watches": [w]})
+    subject = "RE: " + fue._report_subject(0, 1, date(2026, 8, 7), [w["id"]])
+    replies = _report_reply_world(monkeypatch, "resume", subject=subject)
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    out = fue.run_intake()
+    assert out["commands"] == 1
+    saved = fue._load_registry()["watches"][0]
+    assert saved["status"] == "active" and saved["deadline"] == "2026-08-11"
+    assert len(replies) == 1
 
 
-def test_run_intake_bare_stop_ignores_terminal_watches(monkeypatch, fue_files):
-    # An owner whose only watches are finished gets no reply at all, and the
-    # mail is NOT marked processed -- it is somebody else's message (the
-    # corrections handler shares this inbox), so we leave it alone exactly
-    # as the trigger gate does.
-    fue._save_registry({"watches": [_watch_in_registry(status="answered"),
-                                    _watch_in_registry(status="cancelled"),
-                                    _watch_in_registry(status="exhausted")]})
-    replies = _report_reply_world(monkeypatch, "stop")
+def test_run_intake_leaves_a_corrections_style_reply_completely_alone(monkeypatch, fue_files):
+    # FINDING 1 (final polish), the reason the guessing branch had to go.
+    # REPLACES test_run_intake_bare_stop_on_a_report_thread_asks_which_watch
+    # and test_run_intake_bare_stop_lists_only_the_senders_own_watches,
+    # which pinned the over-firing behavior: ANY command word from a sender
+    # who owned an open watch earned a "which watch did you mean?" reply.
+    # Sara's inbox is SHARED with sara_corrections, whose entire workflow is
+    # a teammate replying to a pulse/biweekly report with line-leading
+    # imperatives exactly like this -- so every correction got an
+    # unsolicited reply, breaking the leave-a-non-request-alone rule.
+    w = _watch_in_registry(status="active")
+    fue._save_registry({"watches": [w]})
+    correction = ("Hi Sara,<br>Keep the Ariadne framing on the raise.<br>"
+                  "Stop calling it a lead investor gap.")
+    replies = _report_reply_world(monkeypatch, correction,
+                                  subject="RE: Sara -- weekly pulse 2026-W34")
+    monkeypatch.setattr(ld, "_call_claude_text",
+                        lambda *a, **kw: pytest.fail("no Claude call for a non-request"))
+    out = fue.run_intake()
+    # The trap is still live at the parser -- the fix is that carrying no
+    # fw_ id anywhere now makes the message inert, not that the words
+    # stopped looking like a command.
+    assert fue._parse_command("Hi Sara,\nKeep the Ariadne framing on the raise.\n"
+                              "Stop calling it a lead investor gap.") == "cancel"
+    assert replies == [] and out["failures"] == 0 and out["outcomes"] == []
+    assert fue._load_registry()["watches"][0]["status"] == "active"   # no state write
+    # Not consumed either: it belongs to another handler on this inbox.
+    assert fue._load_processed() == set()
+
+
+def test_run_intake_bare_stop_with_no_id_anywhere_is_left_alone(monkeypatch, fue_files):
+    # REPLACES test_run_intake_bare_stop_ignores_terminal_watches. The old
+    # rule replied whenever the sender owned an open watch and stayed
+    # silent otherwise; the rule now is uniform -- no resolvable target,
+    # no reply, whatever the sender owns.
+    fue._save_registry({"watches": [_watch_in_registry()]})
+    replies = _report_reply_world(monkeypatch, "stop", subject="RE: quick question")
     out = fue.run_intake()
     assert replies == [] and out["failures"] == 0 and out["outcomes"] == []
+    assert fue._load_registry()["watches"][0]["status"] == "active"
     assert fue._load_processed() == set()
+
+
+def test_run_intake_command_body_id_wins_over_the_subject_ids(monkeypatch, fue_files):
+    # The subject's id list rides on EVERY reply to a report; an id the
+    # owner TYPED is a deliberate choice. Body ids therefore replace the
+    # subject's rather than uniting with them -- a union would make
+    # "stop fw_a" cancel every watch the report happened to mention.
+    w1 = _watch_in_registry(ask="investigation status")
+    w2 = _watch_in_registry(ask="summary report")
+    fue._save_registry({"watches": [w1, w2]})
+    subject = "RE: " + fue._report_subject(2, 0, date(2026, 8, 7), [w1["id"], w2["id"]])
+    _report_reply_world(monkeypatch, f"stop {w2['id']} please", subject=subject)
+    fue.run_intake()
+    saved = {w["id"]: w["status"] for w in fue._load_registry()["watches"]}
+    assert saved == {w1["id"]: "active", w2["id"]: "cancelled"}
+
+
+def test_run_intake_subject_id_does_not_relax_the_leading_word_rule(monkeypatch, fue_files):
+    # A subject id supplies the TARGET only -- never permission to match a
+    # command word mid-sentence. That relaxation stays tied to an id the
+    # SENDER typed, since the subject's ids ride on every single reply.
+    w = _watch_in_registry()
+    fue._save_registry({"watches": [w]})
+    subject = "RE: " + fue._report_subject(1, 0, date(2026, 8, 7), [w["id"]])
+    replies = _report_reply_world(
+        monkeypatch, "Thanks -- once the vendor audit is done, loop in Legal.",
+        subject=subject)
+    out = fue.run_intake()
+    assert replies == [] and out["outcomes"] == []
+    assert fue._load_registry()["watches"][0]["status"] == "active"
 
 
 def test_run_intake_targetless_command_that_is_really_a_registration_still_registers(intake_world, monkeypatch):
     # Regression guard for the gate ordering: a genuine registration whose
     # first word happens to be a command word ("Keep chasing them ...")
-    # must still be REGISTERED, not answered with "which watch did you
-    # mean?". The finding-5 branch only fires once we know the message is
-    # not a registration request.
+    # must still be REGISTERED, not swallowed by the command path.
     fue._save_registry({"watches": [_watch_in_registry(intake_conversation_id="conv-other")]})
     monkeypatch.setattr(eps, "graph_get", _intake_world_graph_get(
         "Keep on top of this: please follow up with Vimta if they do not "
         "reply within 2 days."))
     out = fue.run_intake()
-    assert out["registered"] == 2
-    assert "which watch" not in intake_world["replies"][0][1].lower()
+    assert out["registered"] == 2 and out["failures"] == 0
+    body = intake_world["replies"][0][1]
+    assert "which watch" not in body.lower()
+    assert "Registered 2 follow-up watch" in body
 
 
-def test_run_intake_stop_phrasing_with_a_trigger_word_still_asks_which_watch(monkeypatch, fue_files):
-    # The other route into the same case: "stop the follow-up ..." trips the
-    # trigger regex, so the parser runs and correctly says NOT_A_REQUEST.
-    # Before, that path silently marked the mail processed and replied
-    # nothing.
+def test_run_intake_stop_phrasing_with_a_trigger_word_and_no_id_is_left_alone(monkeypatch, fue_files):
+    # REPLACES test_run_intake_stop_phrasing_with_a_trigger_word_still_asks_
+    # which_watch. "stop the follow-up ..." trips the trigger regex, so the
+    # parser runs and correctly says NOT_A_REQUEST. With no id anywhere
+    # there is nothing to act on: reply nothing rather than guess.
     w = _watch_in_registry()
     fue._save_registry({"watches": [w]})
-    replies = _report_reply_world(monkeypatch, "stop the follow-up on the dog tox study")
+    replies = _report_reply_world(monkeypatch, "stop the follow-up on the dog tox study",
+                                  subject="RE: dog tox")
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: '{"is_request": false}')
     out = fue.run_intake()
-    assert len(replies) == 1 and w["id"] in replies[0][1]
-    assert [o["kind"] for o in out["outcomes"]] == ["ambiguous_command"]
-
-
-def test_owns_watch_matches_owner_mailbox_and_alias():
-    w = _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@negevlabs.com")
-    assert fue._owns_watch(w, "dan@negevlabs.com")
-    assert fue._owns_watch(w, "DAN@negevlabs.com")
-    assert fue._owns_watch(w, "dan@palomar-labs.com")     # alias -> canonical
-    assert not fue._owns_watch(w, "ka@negevlabs.com")
-    assert not fue._owns_watch(w, "")
-    # A forward sent from an alias address stores the RAW sender as mailbox.
-    aliased = _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@palomar-labs.com")
-    assert fue._owns_watch(aliased, "dan@palomar-labs.com")
+    assert replies == [] and out["failures"] == 0 and out["outcomes"] == []
+    assert fue._load_registry()["watches"][0]["status"] == "active"
+    # The parser already ran on it, so this one IS consumed -- unchanged.
+    assert fue._load_processed() == {"rep1"}
 
 
 def _cap_filler(n, status="answered"):

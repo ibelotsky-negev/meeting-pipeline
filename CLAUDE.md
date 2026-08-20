@@ -502,15 +502,22 @@ share it.
   cancels, resume/continue/keep re-arms a paused watch -- the command word
   must LEAD the reply or one of its lines (an optional short greeting is
   skipped) UNLESS the body names an explicit `fw_` id, where the match is
-  anywhere in the body as before. Targets: named `fw_` ids, else all
-  watches from that intake conversation. A command with NEITHER (the owner
-  replying to a REPORT email -- a report is a new conversation matching no
-  intake conversation, and `uniqueBody` strips the quoted `fw_` ids) gets a
-  "which watch did you mean?" reply listing the SENDER'S OWN non-terminal
-  watches; a sender who owns none gets no reply and the mail is left
-  unmarked for the other handlers sharing Sara's inbox. That branch fires
-  only once the message is known NOT to be a registration request, so
-  "Keep on top of this -- follow up with Vimta..." still registers.
+  anywhere in the body as before. Ids come from the body, and only if the
+  body names none, from the SUBJECT -- the daily report carries the ids it
+  covers in its subject (`_report_subject`, first 3 then `+N more`),
+  because a report is a new conversation matching no intake conversation
+  and `uniqueBody` strips the quoted body, so the subject is the one part
+  a reply keeps. Body ids REPLACE the subject's (a union would let
+  "stop fw_a" cancel every watch the report mentioned), and a subject id
+  is a TARGET only -- it never relaxes the leading-word rule, which still
+  reads the body alone. Targets: named `fw_` ids, else all watches from
+  that intake conversation. A command with NEITHER is NOT a request: no
+  reply, no state write, nothing marked processed. (Through the previous
+  fix wave it got a "which watch did you mean?" reply, which over-fired --
+  Sara's inbox is shared with `sara_corrections`, whose whole workflow is
+  a teammate replying with line-leading imperatives that parse as
+  commands.) A genuine registration whose first word is a command word
+  ("Keep on top of this -- follow up with Vimta...") still registers.
   `FOLLOWUP_MAX_WATCHES` counts only NON-TERMINAL watches (nothing prunes
   finished ones, so counting them ratcheted the cap shut), and any ask the
   cap drops is named in a failure reply -- honest failure, never silence.
