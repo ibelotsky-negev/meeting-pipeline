@@ -1214,7 +1214,14 @@ def sweep_unsent(reg: dict) -> list:
                                    f"{d['message_id']} status ({e}); reporting as still unsent")
                     still_draft = True  # ambiguous failure -- never one-way-flip sent
             if still_draft:
+                # FINDING 7 (final review): carry the watch's STATUS so the
+                # report can say why a draft is stale. A three-task seam --
+                # Task 5 introduced "answered", Task 6 special-cased only
+                # "cancelled", Task 7 rendered the row with no status at
+                # all -- so the owner was nudged daily to send a chase for
+                # something the counterparty had already answered.
                 unsent.append({"owner": w["owner"], "watch_id": w["id"], "ask": w["ask"],
+                               "status": w.get("status") or "",
                                "web_link": d.get("web_link") or "", "created": d.get("created") or ""})
             else:
                 d["sent"] = True
@@ -1301,8 +1308,22 @@ def build_report(owner: str, events: list, unsent: list) -> str:
         for u in unsent:
             link = (f' -- <a href="{_esc(u["web_link"])}">open draft</a>'
                     if u.get("web_link") else "")
+            status = (u.get("status") or "").strip()
+            # DELIBERATE (finding 7): an ANSWERED watch's draft is STILL
+            # listed, not dropped. Under LIVE it is a real message sitting
+            # in the owner's Drafts folder and nothing else surfaces it, so
+            # hiding it makes an accidental send later MORE likely, not
+            # less. Labelling turns a daily nag into a one-off cleanup item.
+            # ("cancelled" is the one status never reported at all --
+            # sweep_unsent skips those watches entirely, per spec line 47.)
+            if status == "answered":
+                note = " -- <b>watch answered; this draft is stale, delete it</b>"
+            elif status and status != "active":
+                note = f" -- watch {_esc(status)}"
+            else:
+                note = ""
             parts.append(f"<li><b>{_esc(u['ask'])}</b> (drafted {_esc(u['created'][:10])}, "
-                         f"<code>{_esc(u['watch_id'])}</code>){link}</li>")
+                         f"<code>{_esc(u['watch_id'])}</code>){note}{link}</li>")
         parts.append("</ul>")
     parts.append("<p>Reply <b>stop</b> or <b>resume</b> with a watch id to control "
                  "a watch. -- Sara Follow-Up Engine</p>")

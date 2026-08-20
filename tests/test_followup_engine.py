@@ -2250,6 +2250,60 @@ def test_sweep_unsent_still_reports_paused_watch_draft(monkeypatch, fue_files):
     assert [u["web_link"] for u in unsent] == ["Lp1"]
 
 
+def test_sweep_unsent_carries_the_watch_status(monkeypatch, fue_files):
+    # FINDING 7 (final review): the unsent entry had no status field at all,
+    # so the report could not tell the owner that a draft was stale.
+    watches = []
+    for i, status in enumerate(("active", "paused", "answered", "exhausted")):
+        w = _watch_in_registry(status=status, ask=f"ask {status}")
+        w["drafts"] = [{"message_id": f"d{i}", "web_link": f"L{i}", "created": "c", "sent": False}]
+        watches.append(w)
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"isDraft": True})
+    unsent = fue.sweep_unsent({"watches": watches})
+    assert {u["ask"]: u["status"] for u in unsent} == {
+        "ask active": "active", "ask paused": "paused",
+        "ask answered": "answered", "ask exhausted": "exhausted"}
+
+
+def test_build_report_labels_a_stale_answered_draft(monkeypatch, fue_files):
+    # End to end through the two functions the seam ran between: an
+    # answered watch's leftover draft is STILL listed (it is a real message
+    # in the owner's Drafts folder and nothing else surfaces it) but is
+    # visibly labelled stale, so the owner deletes it rather than sending a
+    # chase for something already answered.
+    w = _watch_in_registry(status="answered", ask="investigation status")
+    w["drafts"] = [{"message_id": "d9", "web_link": "L9", "created": "2026-08-01T00:00:00Z",
+                    "sent": False}]
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"isDraft": True})
+    unsent = fue.sweep_unsent({"watches": [w]})
+    out = fue.build_report("dan@negevlabs.com", [], unsent)
+    assert "Still unsent" in out and w["id"] in out
+    assert "watch answered; this draft is stale" in out
+
+
+def test_build_report_unsent_row_stays_quiet_for_an_active_watch():
+    unsent = [{"owner": "dan@negevlabs.com", "watch_id": "fw_act00001", "ask": "live ask",
+               "status": "active", "web_link": "", "created": "2026-08-01T00:00:00Z"}]
+    out = fue.build_report("dan@negevlabs.com", [], unsent)
+    assert "fw_act00001" in out
+    assert "stale" not in out and "watch active" not in out
+
+
+def test_build_report_unsent_row_labels_a_paused_watch():
+    unsent = [{"owner": "dan@negevlabs.com", "watch_id": "fw_pau00001", "ask": "paused ask",
+               "status": "paused", "web_link": "", "created": "2026-08-01T00:00:00Z"}]
+    out = fue.build_report("dan@negevlabs.com", [], unsent)
+    assert "watch paused" in out and "stale" not in out
+
+
+def test_build_report_unsent_row_without_a_status_key_still_renders():
+    # Back-compat: an entry produced before the status field existed.
+    unsent = [{"owner": "dan@negevlabs.com", "watch_id": "fw_old00001", "ask": "old ask",
+               "web_link": "", "created": "2026-08-01T00:00:00Z"}]
+    out = fue.build_report("dan@negevlabs.com", [], unsent)
+    assert "fw_old00001" in out and "old ask" in out
+
+
 def test_sweep_unsent_skips_already_sent_draft_without_graph_call(monkeypatch, fue_files):
     w = _watch_in_registry()
     w["drafts"] = [{"message_id": "ds1", "web_link": "Ls1", "created": "c", "sent": True}]
