@@ -730,7 +730,17 @@ def _verdict(watch: dict, msgs: list) -> str:
     except Exception as e:
         logger.warning(f"[followup] verdict failed for {watch['id']}: {e}")
         return "NOT_ANSWERED"  # degrade to pause, never to a silent close
-    return "ANSWERED" if (raw or "").strip().upper().startswith("ANSWERED") else "NOT_ANSWERED"
+    # FINDING 4 (final review): NOT a prefix match. "ANSWERED, but only
+    # partially" and "ANSWERED for point 1 only" both START with ANSWERED
+    # and both mean the chase must CONTINUE -- and "answered" is terminal
+    # with no re-arm path, so a prefix match silently killed a live CRO
+    # chase. Test NOT_ANSWERED first, then require exact equality (bar a
+    # trailing full stop): anything hedged, empty, or unparseable degrades
+    # to NOT_ANSWERED -- pause, owner decides -- never to a silent close.
+    resolved = (raw or "").strip().upper().rstrip(".!")
+    if "NOT_ANSWERED" in resolved:
+        return "NOT_ANSWERED"
+    return "ANSWERED" if resolved == "ANSWERED" else "NOT_ANSWERED"
 
 
 def check_replies(reg: dict) -> list:

@@ -1205,6 +1205,35 @@ def test_verdict_default_on_unparseable_response_is_not_answered(monkeypatch):
     assert fue._verdict(w, msgs) == "NOT_ANSWERED"
 
 
+def test_verdict_prefixed_answered_does_not_close_the_watch(monkeypatch):
+    # Final review finding 4: the old `.startswith("ANSWERED")` resolved a
+    # HEDGED response as a clean ANSWERED. Both strings below fit inside
+    # max_tokens=10 and were reproduced empirically by the reviewer.
+    # "answered" is terminal with no re-arm path, so this killed a live CRO
+    # chase exactly when it most needed to continue.
+    w = _watch_in_registry()
+    msgs = [_thread_reply("r12", "salim.tamboli@vimta.com", "partial update")]
+    for hedged in ("ANSWERED, but only partially", "ANSWERED for point 1 only"):
+        monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: hedged)
+        assert fue._verdict(w, msgs) == "NOT_ANSWERED", hedged
+
+
+def test_verdict_bare_words_resolve_exactly(monkeypatch):
+    # The other side of the same fix: an unhedged one-word verdict, in
+    # either case and with or without a trailing period, still resolves --
+    # the fix must not make ANSWERED unreachable.
+    w = _watch_in_registry()
+    msgs = [_thread_reply("r13", "salim.tamboli@vimta.com", "update")]
+    cases = (("ANSWERED", "ANSWERED"), ("  answered\n", "ANSWERED"),
+             ("ANSWERED.", "ANSWERED"), ("NOT_ANSWERED", "NOT_ANSWERED"),
+             ("not_answered", "NOT_ANSWERED"),
+             ("NOT_ANSWERED, they only promised", "NOT_ANSWERED"),
+             ("", "NOT_ANSWERED"))
+    for raw, expected in cases:
+        monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: raw)
+        assert fue._verdict(w, msgs) == expected, raw
+
+
 def test_check_replies_skips_paused_watch(monkeypatch, fue_files):
     reg = {"watches": [_watch_in_registry(status="paused")]}
     monkeypatch.setattr(eps, "graph_get",
