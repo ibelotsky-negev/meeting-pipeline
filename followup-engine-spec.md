@@ -40,13 +40,23 @@ drafts, notifies, and stops.
    inherited CC so the prime CRO stays in the loop), and LEAVES IT AS A DRAFT.
    `nudges_sent` increments; the next deadline advances by the watch's
    interval (business days, Mon-Fri). At `max_nudges` the watch is marked
-   exhausted and escalated instead of drafted.
+   exhausted and escalated instead of drafted. Exhaustion tests
+   `max(nudges_sent, report_only_nudges)`, so a REPORT-ONLY watch climbs
+   the same ladder and terminates the same way without ever spending the
+   real nudge budget. Counterparty-controlled text (subject, message
+   bodies) is fenced as untrusted data in every prompt; an empty compose is
+   a failure (retry next run), never a blank draft; and a verdict must be
+   an EXACT `ANSWERED` to close a watch.
 4. **Report (same run, one email per owner).** Sent from Sara to the owner:
    every new draft (full text inline + Graph `webLink` to open it in Outlook),
    replies detected, escalations (CC `FOLLOWUP_ALERT_CC`), and every STILL
    UNSENT draft from earlier runs -- repeated daily until sent or cancelled
    (unsent = the draft message still exists with `isDraft`; 404/false = sent
-   or deleted, stop listing). Nothing happened and nothing unsent -> no email.
+   or deleted, stop listing). Each unsent row carries its watch's STATUS: an
+   `answered` watch's leftover draft is still listed (it is a real message in
+   the owner's Drafts folder and nothing else surfaces it) but is labelled
+   stale so the owner deletes it rather than chasing an answered question.
+   Nothing happened and nothing unsent -> no email.
 
 ## Commands (deterministic, no LLM)
 
@@ -55,7 +65,11 @@ watch on `resume|continue|keep`. The command word must LEAD the reply or one
 of its lines (an optional short greeting is skipped) unless the body names an
 explicit `fw_xxxxxxxx` id, in which case the word may appear anywhere.
 Targets: named ids, else all watches registered from that intake
-conversation. Confirmed by reply.
+conversation. Confirmed by reply. A command with NEITHER a known id nor a
+matching intake conversation -- the shape of an owner replying to a REPORT
+email, since a report is a new conversation and `uniqueBody` strips the
+quoted ids -- gets a "which watch did you mean?" reply listing the
+SENDER'S OWN non-terminal watches, never a stranger's, and never a guess.
 
 ## Live gate
 
@@ -71,7 +85,12 @@ that is parked by team decision and is out of scope for this module.
   recipients[], interval_days, deadline (ISO date), max_nudges, nudges_sent,
   status (`active|paused|answered|exhausted|cancelled`), last_checked,
   latest_message_id, drafts[{message_id, web_link, created, sent}],
-  intake_conversation_id, notes[{ts, text}], created, updated.
+  intake_conversation_id, notes[{ts, text}], created, updated,
+  report_only_nudges (report-only escalation cycles, kept separate from
+  nudges_sent so the real budget is never spent without a real draft).
+  Saved ATOMICALLY (temp sibling + os.replace). A registry that exists but
+  cannot be parsed is preserved as `followups.corrupt-<ts>-<rand>.json` and
+  raises, never silently degraded to an empty document.
 - `followup_processed.json` -- intake dedup (internetMessageId, last 1000).
 - `followup_status.json` -- last run summary for `/followup/status`.
 
@@ -82,8 +101,13 @@ that is parked by team decision and is out of scope for this module.
 - `/followup/status` -- last run + active watch summaries.
 - APScheduler: cron `followup_daily` 17:00 Asia/Jerusalem
   (`FOLLOWUP_HOUR`, default 17); interval `followup_intake` every
-  `FOLLOWUP_INTAKE_MINUTES` (default 15). Trigger locks shared with the
-  manual routes (x-transcribe pattern). Single-worker topology unchanged.
+  `FOLLOWUP_INTAKE_MINUTES` (default 15). ONE trigger lock
+  (`app._followup_lock`) shared by both manual routes AND both jobs --
+  intake and the daily check both rewrite `followups.json` wholesale, so
+  they must never overlap. Never held while taking another lock, always
+  acquired non-blocking: no deadlock, contention just skips (safe -- a
+  skipped intake marks nothing processed and retries). Single-worker
+  topology unchanged.
 - CLI: `python followup_engine.py --intake|--check [--dry-run]`.
 
 ## Reuse (no duplication)
@@ -113,7 +137,10 @@ that is parked by team decision and is out of scope for this module.
 - Loop safety: Sara's own outbound skipped; external senders never trigger
   intake; auto-replies never trigger anything; per-run message caps.
 - Idempotency: processed-ids persisted after EACH handled message; registry
-  persisted after each mutation batch; dry runs write nothing.
+  persisted atomically after each mutation batch; dry runs write nothing.
+- Honest failure, never silence: an unresolvable thread, an unknown watch
+  id, a targetless command, and an ask dropped by `FOLLOWUP_MAX_WATCHES`
+  (which counts only NON-TERMINAL watches) each earn a reply.
 - GxP-adjacent: communications with CROs on GLP/GMP studies -- conservative
   wording, owner always the sender of record, full audit trail in registry.
 

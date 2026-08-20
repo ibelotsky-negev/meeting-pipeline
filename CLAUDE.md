@@ -469,11 +469,24 @@ sent/deleted -- any other Graph error keeps it listed; a cancelled watch's
 draft is never re-reported). The machine NEVER sends to a counterparty --
 there is no auto-send code path (parked by team decision). `FOLLOWUP_LIVE`
 unset ships REPORT-ONLY (no drafts created, report shows would-draft text;
-deadlines still advance on schedule but `nudges_sent` does not, so
-report-only alone can never exhaust a watch); `dry_run=1` mutates no state
-at all, live or not. Full spec: `followup-engine-spec.md`. Imported lazily
+deadlines advance on schedule and the escalation ladder climbs via a
+SEPARATE `report_only_nudges` counter, so a report-only watch escalates and
+finally exhausts like a live one -- while `nudges_sent`, the REAL budget,
+still never moves without a real draft behind it; exhaustion tests
+`max(nudges_sent, report_only_nudges)`); `dry_run=1` mutates no state at
+all, live or not. Full spec: `followup-engine-spec.md`. Imported lazily
 by app.py. Reuses eps Graph helpers, xte `is_auto_reply` +
 `send_threaded_reply`, ld `_call_claude_text`, config identity helpers.
+
+**ONE lock for the whole subsystem.** `app.py` `_followup_lock` gates BOTH
+manual routes and BOTH scheduled jobs. Intake and the daily check each do
+`_load_registry` -> mutate -> `_save_registry` on the same `followups.json`
+and last writer wins on the whole document, so independent locks lost
+writes wholesale. It is never held while acquiring another lock and every
+acquire is non-blocking, so no deadlock is possible; contention skips
+(cron) or 409s (route), which is safe because a skipped intake marks
+nothing processed and retries. The CLI is a separate process and does NOT
+share it.
 
 - Intake (15-min scan of Sara's inbox): internal sender forwards a thread with
   an instruction ("if Vimta does not reply within 2 days, draft a reminder for
@@ -490,7 +503,17 @@ by app.py. Reuses eps Graph helpers, xte `is_auto_reply` +
   must LEAD the reply or one of its lines (an optional short greeting is
   skipped) UNLESS the body names an explicit `fw_` id, where the match is
   anywhere in the body as before. Targets: named `fw_` ids, else all
-  watches from that intake conversation.
+  watches from that intake conversation. A command with NEITHER (the owner
+  replying to a REPORT email -- a report is a new conversation matching no
+  intake conversation, and `uniqueBody` strips the quoted `fw_` ids) gets a
+  "which watch did you mean?" reply listing the SENDER'S OWN non-terminal
+  watches; a sender who owns none gets no reply and the mail is left
+  unmarked for the other handlers sharing Sara's inbox. That branch fires
+  only once the message is known NOT to be a registration request, so
+  "Keep on top of this -- follow up with Vimta..." still registers.
+  `FOLLOWUP_MAX_WATCHES` counts only NON-TERMINAL watches (nothing prunes
+  finished ones, so counting them ratcheted the cap shut), and any ask the
+  cap drops is named in a failure reply -- honest failure, never silence.
 - Daily check (17:00 Asia/Jerusalem): per active watch, new thread messages
   since last check; external non-auto-reply messages get a per-ask Haiku
   verdict -- ANSWERED closes, a human non-answer PAUSES (owner re-arms);
@@ -498,9 +521,21 @@ by app.py. Reuses eps Graph helpers, xte `is_auto_reply` +
   does not reset the clock). Active past deadline -> Sonnet drafts an
   escalating status-request-only reminder (nudge N of max 3), deadline
   advances by the watch's business-day interval (Mon-Fri); at max ->
-  `exhausted` + escalation. Quiet day (no events, nothing unsent) -> no email.
+  `exhausted` + escalation. An EMPTY compose is treated as a compose
+  failure (retry next run), never as a blank draft. Counterparty-controlled
+  text (subject, message bodies) is fenced between `<<<UNTRUSTED_DATA>>>`
+  markers in every prompt with a do-not-obey rule, and `_as_data` strips any
+  marker the quoted text tries to emit. `_verdict` requires an EXACT
+  `ANSWERED` (a hedged "ANSWERED, but only partially" pauses instead of
+  closing -- `answered` is terminal with no re-arm path). Quiet day (no
+  events, nothing unsent) -> no email.
 - State on /data: `followups.json` (registry), `followup_processed.json`
   (intake dedup, persisted after EACH handled message), `followup_status.json`.
+  The registry save is ATOMIC (sibling temp file + `os.replace`). A registry
+  that exists but cannot be parsed is moved aside to
+  `followups.corrupt-<ts>-<rand>.json` and raises `RegistryUnreadable` --
+  never degraded to an empty document the next save would make permanent.
+  A missing file is still a normal first run.
 - Endpoints: `/followup/run`, `/followup/intake` (both `?dry_run=&sync=`),
   `/followup/status`. CLI: `python followup_engine.py --intake|--check [--dry-run]`.
 
@@ -519,6 +554,8 @@ by app.py. Reuses eps Graph helpers, xte `is_auto_reply` +
 | Daily digest owner names blank / 403 | Missing HubSpot crm.objects.owners.read scope | Grant + reconnect HubSpot (granted 2026-06-14) |
 | FYI Triage classifies but never moves | Dual gate not fully open | Set BOTH `?live=1` AND env `FYI_LIVE=1`; absent either it stays DRY by design |
 | FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
+| `/followup/intake` returns 409, or the log says "another follow-up run is in progress; skipping" | BY DESIGN -- one `_followup_lock` gates both follow-up routes and both jobs, because intake and the daily check share `followups.json` and independent locks lost each other's writes | Wait and retry; the 15-min intake job retries by itself and marks nothing processed when it skips |
+| `/followup/status` returns `registry_unreadable`, or a run aborts with `RegistryUnreadable` | `followups.json` could not be parsed. It has been PRESERVED as `followups.corrupt-<ts>-<rand>.json` on `/data` and nothing overwrote it | Inspect/repair the preserved file and move it back to `followups.json`. Doing nothing is also safe: the next load starts from an empty registry, but every watch is then gone |
 | Meeting never got a Phase-1 email (no webhook log line for its transcript id) | Poll's fallback window used to gate on meeting START time only ([fireflies_client.py](fireflies_client.py) `get_recent_transcripts`); a meeting longer than the window (default 15 min) had its start timestamp scroll out of the cutoff before the transcript was ready, and if the webhook also missed it the meeting was silently never processed | Fixed @2.27.0 -- window now gates on end time (start + duration). If a meeting still slips through, replay it manually via `/process/<transcript_id>` |
 | X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
 | Every YouTube link fails: log shows `youtube transcript failed <vid>: no element found: line 1, column 0`, then yt-dlp `HTTP Error 403` | `youtube-transcript-api` 0.6.2 broke against YouTube's current response format (empty body -> XML parse error), so the captions path returned nothing and everything fell through to yt-dlp | Fixed @2.28.1 -- pin raised to `1.2.4` and `_fetch_youtube_transcript` rewritten for the 1.x API. **The API changed incompatibly at 1.0**: static `get_transcript` -> instance `fetch`, dict chunks -> snippet objects with `.text`. A bare version bump without the call-site change fails SILENTLY (AttributeError swallowed -> None). The resolver now handles both generations |
