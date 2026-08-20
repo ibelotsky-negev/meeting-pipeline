@@ -3119,6 +3119,129 @@ def fyi_status():
 _xte_trigger_lock = _threading.Lock()
 
 
+# ======================================================================
+#  FOLLOW-UP ENGINE (pilot) -- silent-thread reminder drafts
+#  Spec: followup-engine-spec.md. Module imported lazily; report-only
+#  until FOLLOWUP_LIVE=1. The engine NEVER sends to a counterparty.
+# ======================================================================
+
+# ONE lock for the WHOLE follow-up subsystem -- intake (every 15 min) and
+# the daily check (17:00) both do _load_registry -> mutate -> _save_registry
+# on the same followups.json, and last writer wins on the WHOLE document.
+# With the two independent trigger locks this section used to hold, an
+# intake save landing inside a daily run's window silently discarded the
+# new watch AFTER its owner had been told its id -- and in the other order
+# the daily run's entire update was lost, drafts[] included, so under LIVE a
+# draft sitting in an owner's mailbox was never recorded, sweep_unsent could
+# never surface it, and the un-consumed budget drafted it again next run.
+#
+# ACQUISITION ORDER: there is nothing to order. This is the only lock in
+# the subsystem, it is never held while acquiring another, and every
+# acquire is non-blocking -- so no nesting, no waiting, and no deadlock is
+# structurally possible. Contention SKIPS (cron) or 409s (route), which is
+# safe: a skipped intake marks nothing processed and retries in 15 minutes,
+# and a skipped daily check re-runs on its next tick with the deadline
+# arithmetic unchanged. test_followup_subsystem_exposes_exactly_one_lock
+# guards against an accidental re-split.
+_followup_lock = _threading.Lock()
+
+
+def followup_daily_run():
+    if not _followup_lock.acquire(blocking=False):
+        logger.info("[followup] another follow-up run is in progress; skipping daily run")
+        return
+    try:
+        import followup_engine
+        followup_engine.run_daily()
+    except Exception as e:
+        logger.error(f"[followup] daily run failed: {e}", exc_info=True)
+    finally:
+        _followup_lock.release()
+
+
+def followup_intake_run():
+    if not _followup_lock.acquire(blocking=False):
+        logger.info("[followup] another follow-up run is in progress; skipping intake")
+        return
+    try:
+        import followup_engine
+        followup_engine.run_intake()
+    except Exception as e:
+        logger.error(f"[followup] intake run failed: {e}", exc_info=True)
+    finally:
+        _followup_lock.release()
+
+
+def _followup_route(lock, fn_name, dry_run, sync):
+    def _invoke():
+        import followup_engine
+        return getattr(followup_engine, fn_name)(dry_run=dry_run)
+
+    # Acquire in the REQUEST thread, before sync/async branch and before any
+    # thread is spawned -- matches transcribe_email_run's _xte_trigger_lock
+    # pattern. Async previously acquired inside _bg(), so a busy lock (e.g.
+    # the paired cron job already running) still returned 200 "started" while
+    # the background thread quietly did nothing. Now both paths 409 alike.
+    # The lock passed in is always _followup_lock -- see its comment above
+    # for why intake and the daily check must not run concurrently.
+    if not lock.acquire(blocking=False):
+        logger.info(f"[followup] {fn_name} already in progress; refusing trigger")
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            return jsonify(_invoke())
+        except Exception as e:
+            logger.error(f"[followup] {fn_name} failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e)}), 500
+        finally:
+            lock.release()
+
+    def _bg():
+        try:
+            _invoke()
+        except Exception as e:
+            logger.error(f"[followup] {fn_name} failed: {e}", exc_info=True)
+        finally:
+            lock.release()
+
+    t = _threading.Thread(target=_bg, daemon=True)
+    try:
+        t.start()
+    except Exception as e:
+        lock.release()  # never orphan the trigger lock if the thread won't start
+        logger.error(f"[followup] {fn_name}: failed to start background thread: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": f"could not start run: {e}"}), 500
+    return jsonify({"status": "started", "dry_run": dry_run})
+
+
+@app.route("/followup/run", methods=["GET", "POST"])
+def followup_run_route():
+    dry_run = request.args.get("dry_run", "").lower() in ("1", "true")
+    sync = request.args.get("sync", "").lower() in ("1", "true")
+    return _followup_route(_followup_lock, "run_daily", dry_run, sync)
+
+
+@app.route("/followup/intake", methods=["GET", "POST"])
+def followup_intake_route():
+    dry_run = request.args.get("dry_run", "").lower() in ("1", "true")
+    sync = request.args.get("sync", "").lower() in ("1", "true")
+    return _followup_route(_followup_lock, "run_intake", dry_run, sync)
+
+
+@app.route("/followup/status")
+def followup_status_route():
+    import followup_engine
+    try:
+        return jsonify(followup_engine.status_summary())
+    except followup_engine.RegistryUnreadable as e:
+        # The registry was unusable; the engine has preserved it aside and
+        # refused to invent state. Report that rather than 500ing blank --
+        # this endpoint is how the failure gets diagnosed.
+        logger.error(f"[followup] status: {e}")
+        return jsonify({"status": "registry_unreadable", "error": str(e)}), 500
+
+
 @app.route("/transcribe-email/run", methods=["GET", "POST"])
 def transcribe_email_run():
     """Manually scan Sara's inbox for internal mail carrying x.com links and
@@ -3301,7 +3424,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.29.1-process-bookkeeping", "deployed": "2026-08-20"})
+    return jsonify({"version": "2.30.0-followup-pilot", "deployed": "2026-08-20"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3369,7 +3492,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.29.1-process-bookkeeping", "steps": {}}
+    results = {"version": "2.30.0-followup-pilot", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4441,6 +4564,31 @@ def start_scheduler():
         minutes=int(os.environ.get("XTE_INTERVAL_MINUTES", "15")),
         id="x_transcribe_email",
         replace_existing=True,
+    )
+    # Follow-Up Engine: intake scan every 15min (registrations + commands);
+    # daily thread check 17:00 America/Chicago (FOLLOWUP_TZ, default
+    # America/Chicago). Deliberately does NOT import followup_engine here to
+    # share its TZ_NAME -- that module is lazily imported inside handlers
+    # only, and this function runs at boot -- so both places read
+    # FOLLOWUP_TZ independently and must keep agreeing, or the deadline date
+    # the daily run computes and the calendar day the cron fires on drift
+    # apart by one day. See test_followup_daily_job_timezone_matches_tz_name.
+    _scheduler.add_job(
+        followup_intake_run,
+        trigger="interval",
+        minutes=int(os.environ.get("FOLLOWUP_INTAKE_MINUTES", "15")),
+        id="followup_intake",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        followup_daily_run,
+        trigger="cron",
+        hour=int(os.environ.get("FOLLOWUP_HOUR", "17")),
+        minute=0,
+        timezone=os.environ.get("FOLLOWUP_TZ", "America/Chicago"),
+        id="followup_daily",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
     # Renewal job: every 45min, renews if expiry < 30min away (Graph max is 59min for this resource)
     _scheduler.add_job(

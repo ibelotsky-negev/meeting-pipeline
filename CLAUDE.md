@@ -148,6 +148,9 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/fyi/status` | Last FYI Triage run outcome (scanned/important/moved + per-message decisions) + heartbeat + `fyi_live_env` |
 | `/transcribe-email/run` | Email-to-transcript: scan Sara's inbox for team mail with x.com/YouTube links, reply with transcript+summary (`?dry_run=&sync=&limit=`) |
 | `/transcribe-email/status` | Last x-transcribe-email scan outcome (scanned/replied + per-message links) |
+| `/followup/run` | Manual Follow-Up Engine daily check (`?dry_run=&sync=`) |
+| `/followup/intake` | Manual Follow-Up Engine inbox intake scan (`?dry_run=&sync=`) |
+| `/followup/status` | Follow-Up Engine last run + per-watch summaries (all statuses) |
 
 ## Architecture Notes
 
@@ -165,6 +168,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Read/Learn Digest:** Friday 06:00 Asia/Jerusalem, drains Ken's Outlook "read/learn" folder, resolves each saved link, Opus cluster+curate against a Ken's-needs profile, emails one HTML digest + creates Asana keeper tasks (`learn_digest.py`). See the Read/Learn Digest Module section.
 - **FYI Triage:** daily 06:00 Asia/Jerusalem, scans the two high-volume auto-filed folders "4: notification" + "8: marketing", classifies each message IMPORTANT vs NOISE with Sonnet (reading the body, not just the from-address), and MOVES the important ones to "2: FYI". Dual-gated (`?live=1` AND env `FYI_LIVE=1`) -- ships DRY, auto-promotes to live once Ken sets `FYI_LIVE` (`fyi_triage.py`). See the FYI Triage Module section + ROLLOUT.md.
 - **X-transcribe-email:** any internal teammate emails Sara (`sara@palomar-labs.com`) an x.com/twitter.com or youtube.com/youtu.be link to a single post/video (a podcast episode link is detected too and reported unsupported; a container URL -- channel, profile, playlist, show -- is not a request at all); a 15-min inbox scan transcribes each video (YouTube captions first, falling back to yt-dlp + Grok STT; X always via yt-dlp + Grok STT), summarizes with Claude, and REPLIES in-thread (Graph `createReply`) with a structured summary in the body + the full transcript as a `.md` attachment per link. A question asked alongside the link, or a link-free follow-up reply in an already-transcribed conversation, is answered from the cached transcript (`x_transcribe_email.py`). See the x-transcribe-email Module section.
+- **Follow-Up Engine (pilot):** a 15-min scan of Sara's inbox registers one watch per ask from a forwarded thread ("chase X if no reply in N days"); a daily 17:00 America/Chicago (`FOLLOWUP_TZ`) check then places a ready-to-send reminder DRAFT in the thread owner's Outlook Drafts -- it NEVER sends to a counterparty -- and stays report-only until `FOLLOWUP_LIVE=1` (`followup_engine.py`). See the followup-engine Module section.
 
 ## email-pipeline-sync Module
 
@@ -452,6 +456,119 @@ machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, 
   sharing `_xte_trigger_lock` with the manual route so a scheduled scan never overlaps
   `/transcribe-email/run`. CLI: `python x_transcribe_email.py [--dry-run] [--limit N]`.
 
+## followup-engine Module (pilot)
+
+Standalone module (`followup_engine.py`) -- watches registered email threads
+for a counterparty reply; on silence past a per-ask deadline, places a
+ready-to-send reminder draft in the thread OWNER's Outlook Drafts (app-only
+`createReplyAll` + PATCH; explicit recipients when the instruction named
+them, inherited CC preserved) and sends the owner ONE report email per run:
+new drafts (full text + Graph webLink), replies detected, escalations
+(CC `FOLLOWUP_ALERT_CC`), and every STILL UNSENT draft repeated daily until
+sent or cancelled (unsent = still `isDraft`; only a confirmed 404/410 means
+sent/deleted -- any other Graph error keeps it listed; a cancelled watch's
+draft is never re-reported). The machine NEVER sends to a counterparty --
+there is no auto-send code path (parked by team decision). `FOLLOWUP_LIVE`
+unset ships REPORT-ONLY (no drafts created, report shows would-draft text;
+deadlines advance on schedule and the escalation ladder climbs via a
+SEPARATE `report_only_nudges` counter, so a report-only watch escalates and
+finally exhausts like a live one -- while `nudges_sent`, the REAL budget,
+still never moves without a real draft behind it; exhaustion tests
+`max(nudges_sent, report_only_nudges)`); `dry_run=1` mutates no state at
+all, live or not. Full spec: `followup-engine-spec.md`. Imported lazily
+by app.py. Reuses eps Graph helpers, xte `is_auto_reply` +
+`send_threaded_reply`, ld `_call_claude_text`, config identity helpers.
+
+**ONE lock for the whole subsystem.** `app.py` `_followup_lock` gates BOTH
+manual routes and BOTH scheduled jobs. Intake and the daily check each do
+`_load_registry` -> mutate -> `_save_registry` on the same `followups.json`
+and last writer wins on the whole document, so independent locks lost
+writes wholesale. It is never held while acquiring another lock and every
+acquire is non-blocking, so no deadlock is possible; contention skips
+(cron) or 409s (route), which is safe because a skipped intake marks
+nothing processed and retries. The CLI is a separate process and does NOT
+share it.
+
+- Intake (15-min scan of Sara's inbox): internal sender forwards a thread with
+  an instruction ("if Vimta does not reply within 2 days, draft a reminder for
+  me to send"). Deterministic gate (trigger keyword, no media links -- those
+  belong to x-transcribe) -> Claude parse (one WATCH PER ASK) -> thread
+  resolved in the SENDER's mailbox by normalized-subject `$search` +
+  counterparty overlap (the forward itself is a NEW conversation) ->
+  confirmation reply with watch ids; unresolvable -> honest failure reply.
+  Re-parsing the same ask (e.g. a retry after the confirmation reply itself
+  failed to send) matches the existing watch on that intake conversation
+  instead of duplicating it, and re-sends the confirmation instead of
+  re-registering. Owner commands, deterministic, no LLM: stop/cancel/done
+  cancels, resume/continue/keep re-arms a paused OR CANCELLED watch (never
+  answered/exhausted -- genuinely finished, nothing revives those) -- the
+  command word
+  must LEAD the reply or one of its lines (an optional short greeting is
+  skipped) UNLESS the body names an explicit `fw_` id, where the match is
+  anywhere in the body as before. Ids come from the body, and only if the
+  body names none, from the SUBJECT -- the daily report carries the ids it
+  covers in its subject (`_report_subject`, first 3 then `+N more`),
+  because a report is a new conversation matching no intake conversation
+  and `uniqueBody` strips the quoted body, so the subject is the one part
+  a reply keeps. Body ids REPLACE the subject's (a union would let
+  "stop fw_a" cancel every watch the report mentioned), and a subject id
+  is a TARGET only -- it never relaxes the leading-word rule, which still
+  reads the body alone. A body id resolves up front; a SUBJECT id is
+  resolved LAST, by `_handle_subject_command`, only once the trigger gate
+  and the parser have established the message is NOT a registration --
+  otherwise a real registration replied INTO a report thread ("Keep on
+  top of this: follow up with Vimta...") is read as a command, answered
+  "Done: resume applied to no eligible watches", and marked processed,
+  losing the ask. A SUBJECT id is also OWNERSHIP-SCOPED (`_owns_watch`:
+  canonical owner, raw forwarding mailbox, or alias via
+  `config.normalize_team_email`): `FOLLOWUP_ALERT_CC` is CC'd on every
+  escalation report and those subjects name the OWNER's ids, so without
+  it a CC'd teammate's "Done, thanks!" cancelled someone else's watch --
+  silently (the confirmation replies to the CC) and invisibly (a
+  cancelled watch drops out of the owner's reports). A subject id that
+  resolves to nothing the sender owns -- someone else's watch, or none at
+  all once a registry restore or a pruned report thread leaves an id
+  behind -- is IGNORED IN SILENCE and NOT marked processed. The "I do not
+  recognize watch id(s)" reply belongs to an id the sender TYPED (honest
+  feedback on a likely typo); on an id Sara generated into a subject it
+  answers mail that may be `sara_corrections`' or `x_transcribe_email`'s
+  and writes state on another handler's message. A typed BODY id is
+  unchanged and may still act cross-owner: typing one is deliberate. Targets: named `fw_` ids, else all watches from
+  that intake conversation. A command with NEITHER is NOT a request: no
+  reply, no state write, nothing marked processed. (Through the previous
+  fix wave it got a "which watch did you mean?" reply, which over-fired --
+  Sara's inbox is shared with `sara_corrections`, whose whole workflow is
+  a teammate replying with line-leading imperatives that parse as
+  commands.) A genuine registration whose first word is a command word
+  ("Keep on top of this -- follow up with Vimta...") still registers.
+  `FOLLOWUP_MAX_WATCHES` counts only NON-TERMINAL watches (nothing prunes
+  finished ones, so counting them ratcheted the cap shut), and any ask the
+  cap drops is named in a failure reply -- honest failure, never silence.
+- Daily check (17:00 America/Chicago, `FOLLOWUP_TZ`): per active watch, new thread messages
+  since last check; external non-auto-reply messages get a per-ask Haiku
+  verdict -- ANSWERED closes, a human non-answer PAUSES (owner re-arms);
+  internal/own messages ignored (pilot limitation: an owner's manual chase
+  does not reset the clock). Active past deadline -> Sonnet drafts an
+  escalating status-request-only reminder (nudge N of max 3), deadline
+  advances by the watch's business-day interval (Mon-Fri); at max ->
+  `exhausted` + escalation. An EMPTY compose is treated as a compose
+  failure (retry next run), never as a blank draft. Counterparty-controlled
+  text (subject, message bodies) is fenced between `<<<UNTRUSTED_DATA>>>`
+  markers in every prompt with a do-not-obey rule, and `_as_data` strips any
+  marker the quoted text tries to emit. `_verdict` requires an EXACT
+  `ANSWERED` (a hedged "ANSWERED, but only partially" pauses instead of
+  closing -- `answered` is terminal with no re-arm path). Quiet day (no
+  events, nothing unsent) -> no email.
+- State on /data: `followups.json` (registry), `followup_processed.json`
+  (intake dedup, persisted after EACH handled message), `followup_status.json`.
+  The registry save is ATOMIC (sibling temp file + `os.replace`). A registry
+  that exists but cannot be parsed is moved aside to
+  `followups.corrupt-<ts>-<rand>.json` and raises `RegistryUnreadable` --
+  never degraded to an empty document the next save would make permanent.
+  A missing file is still a normal first run.
+- Endpoints: `/followup/run`, `/followup/intake` (both `?dry_run=&sync=`),
+  `/followup/status`. CLI: `python followup_engine.py --intake|--check [--dry-run]`.
+
 ## Common Failure Modes
 
 | Symptom | Cause | Fix |
@@ -467,6 +584,9 @@ machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, 
 | Daily digest owner names blank / 403 | Missing HubSpot crm.objects.owners.read scope | Grant + reconnect HubSpot (granted 2026-06-14) |
 | FYI Triage classifies but never moves | Dual gate not fully open | Set BOTH `?live=1` AND env `FYI_LIVE=1`; absent either it stays DRY by design |
 | FYI Triage run aborts "could not resolve folder" | A source/dest folder was renamed | Folders are matched by display name -- restore "2: FYI" / "4: notification" / "8: marketing" or update the names in `fyi_triage.py` |
+| A "stop"/"resume"/"Done, thanks!" reply to a follow-up report does nothing at all -- no cancel, no reply | BY DESIGN when the replier does not OWN the watches the report subject names (e.g. `FOLLOWUP_ALERT_CC` CC'd on an escalation report), or when the subject's ids no longer exist. Subject-carried ids are ownership-scoped and fail silent; only the owner can command from a report thread | Have the WATCH OWNER reply, or type the `fw_` id in the BODY -- a typed id is deliberate, acts cross-owner, and an unknown one gets an honest "I do not recognize watch id(s)" reply. `/followup/status` lists every watch and its owner |
+| `/followup/intake` returns 409, or the log says "another follow-up run is in progress; skipping" | BY DESIGN -- one `_followup_lock` gates both follow-up routes and both jobs, because intake and the daily check share `followups.json` and independent locks lost each other's writes | Wait and retry; the 15-min intake job retries by itself and marks nothing processed when it skips |
+| `/followup/status` returns `registry_unreadable`, or a run aborts with `RegistryUnreadable` | `followups.json` could not be parsed. It has been PRESERVED as `followups.corrupt-<ts>-<rand>.json` on `/data` and nothing overwrote it | Inspect/repair the preserved file and move it back to `followups.json`. Doing nothing is also safe: the next load starts from an empty registry, but every watch is then gone |
 | Team stops getting ANY meeting update after Zoom/Fireflies calls; logs show `Polling error: ... too_many_requests` on every poll and `Webhook thread: transcript not found after 3 attempts` | Fireflies enforces a hard **~50 requests/day** quota (resets 00:00 UTC, shared workspace-wide with anything else on the same key, including the Fireflies MCP). At `POLL_INTERVAL_MINUTES=5` the poller alone wanted 288 calls/day, so the quota died daily by ~04:13 UTC -- before the Israeli workday. After that BOTH ingestion paths failed at once: the poll raised every run, and the webhook's 3 retries (15/30/45s) could not outlast a quota resetting at midnight, so the transcript was DROPPED. The miss was permanent -- the poll window is only `POLL_INTERVAL + 10` min, so by the next reset the meeting had scrolled out of range. Broke 2026-08-06 (emails stopped 05:09Z, ~35 min before 2.27.0 went live), diagnosed 2026-08-19: 195/245 polls 429'd, 0 Phase-1 runs, 0 notification emails | Fixed @2.29.0 on three levels. (1) `POLL_INTERVAL_MINUTES=60` on Railway -- 24 calls/day, leaving headroom for webhook fetches. (2) [fireflies_client.py](fireflies_client.py) now raises `FirefliesQuotaExceeded` on the 429, honors the machine-readable `extensions.metadata.retryAfter`, and **short-circuits every call until the reset** (persisted at `/data/fireflies_quota.json`, so a restart cannot re-burn). (3) A transcript that cannot be fetched is PARKED at `/data/fireflies_deferred.json` and retried by `drain_deferred_transcripts` on the next poll, so a meeting arriving in a dead window is no longer lost. For a historical backlog use `recover_missed_meetings.py` |
 | Meeting never got a Phase-1 email (no webhook log line for its transcript id) | Poll's fallback window used to gate on meeting START time only ([fireflies_client.py](fireflies_client.py) `get_recent_transcripts`); a meeting longer than the window (default 15 min) had its start timestamp scroll out of the cutoff before the transcript was ready, and if the webhook also missed it the meeting was silently never processed | Fixed @2.27.0 -- window now gates on end time (start + duration). If a meeting still slips through, replay it manually via `/process/<transcript_id>` |
 | X-video STT replay fails immediately | `ffmpeg` missing in container or `XAI_API_KEY` unset | Dockerfile installs ffmpeg; STT uses `XAI_API_KEY` (not `SPOKEN_API_KEY`) |
@@ -491,6 +611,17 @@ Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_AP
 Fireflies polling: `POLL_INTERVAL_MINUTES` (default 5 in code, **set to 60 on Railway**). This is a quota-critical value, not a latency knob -- Fireflies allows ~50 API requests/day workspace-wide and each poll costs one, plus one per new transcript fetched. Never lower it without recounting the daily budget (webhook fetches and any Fireflies MCP use draw on the same 50). State files: `/data/fireflies_quota.json` (the "quota spent until X" note that gates every call) and `/data/fireflies_deferred.json` (transcript ids parked for retry). Both are safe to delete -- worst case is one wasted request or a re-fetch.
 
 Read/Learn: optional `LEARN_LOOKBACK_DAYS` (trailing window for normal/cron runs, default 14; read/unread agnostic), `LEARN_CONCURRENCY`, `LEARN_CURRENCY_CHECK`, `LEARN_YT_ATTEMPTS` (YouTube caption attempts on a TRANSIENT error, default 3) / `LEARN_YT_RETRY_WAIT` (backoff seconds, default 2), resolver keys `XAI_API_KEY` / `SPOKEN_API_KEY` / `JINA_API_KEY` (read at call time; absent = degrade, never fabricate).
+
+followup-engine: `FOLLOWUP_LIVE` (set `1` to arm draft creation; UNSET at ship
+= report-only), `FOLLOWUP_HOUR` (daily check hour, default 17), `FOLLOWUP_TZ`
+(daily check timezone, IANA name so DST is handled automatically, default
+`America/Chicago`), `FOLLOWUP_INTAKE_MINUTES` (15),
+`FOLLOWUP_DEFAULT_BUSINESS_DAYS` (2),
+`FOLLOWUP_MAX_NUDGES` (3), `FOLLOWUP_MAX_WATCHES` (100),
+`FOLLOWUP_INTAKE_MAX_MESSAGES` (25), `FOLLOWUP_PARSE_MODEL` /
+`FOLLOWUP_DRAFT_MODEL` (sonnet) / `FOLLOWUP_VERDICT_MODEL` (haiku),
+`FOLLOWUP_ALERT_CC` (bk@negevlabs.com). Reuses `BOT_SENDER_EMAIL`,
+`CLAUDE_API_KEY`, `MS_GRAPH_*`, `INTERNAL_DOMAINS`.
 
 FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY` / `FYI_BROADCAST_DOMAINS` (broker/ESP blast domains -> deterministic NOISE) / `FYI_HELD_DOMAINS` + `FYI_HELD_NAMES` (tracked holdings -> material IR is deterministic IMPORTANT) and `INTERNAL_DOMAINS` (own-outbound -> deterministic NOISE).
 
