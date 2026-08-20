@@ -6,7 +6,7 @@ existing references and tests (app_module.X) keep resolving. ASCII-only.
 
 import json
 
-from config import PENDING_FILE, PROCESSED_FILE, SYNC_MAP_FILE
+from config import FIREFLIES_DEFERRED_FILE, PENDING_FILE, PROCESSED_FILE, SYNC_MAP_FILE
 
 def load_pending() -> dict:
     try:
@@ -29,6 +29,22 @@ def load_processed() -> set:
 def save_processed(processed: set):
     with open(PROCESSED_FILE, "w") as f:
         json.dump(list(processed), f)
+
+def load_fireflies_deferred() -> dict:
+    """Transcript ids awaiting retry after a Fireflies quota block.
+
+    Shape: {transcript_id: {"queued_at": iso, "attempts": int}}
+    """
+    try:
+        with open(FIREFLIES_DEFERRED_FILE, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def save_fireflies_deferred(deferred: dict):
+    with open(FIREFLIES_DEFERRED_FILE, "w") as f:
+        json.dump(deferred, f, indent=2, default=str)
 
 def load_sync_map() -> dict:
     """Load Asana<->To-Do mapping from /data/asana_todo_map.json."""

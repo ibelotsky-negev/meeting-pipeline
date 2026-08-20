@@ -136,6 +136,10 @@ os.makedirs(DATA_DIR, exist_ok=True)
 PROCESSED_FILE = os.path.join(DATA_DIR, "processed_transcripts.json")
 PENDING_FILE = os.path.join(DATA_DIR, "pending_approvals.json")
 SYNC_MAP_FILE = os.path.join(DATA_DIR, "asana_todo_map.json")
+# Fireflies transcript ids whose fetch was deferred because the daily API
+# quota was spent. Drained once the quota frees up -- without this a
+# webhook arriving inside a dead window is lost for good.
+FIREFLIES_DEFERRED_FILE = os.path.join(DATA_DIR, "fireflies_deferred.json")
 
 # To-Do sync config
 TODO_LIST_NAME = os.environ.get("TODO_LIST_NAME", "Asana Tasks")
@@ -221,22 +225,32 @@ def resolve_internal_organizer(organizer_email: str, participants: list, interna
     """Determine internal organizer for task/draft ownership.
     If meeting organizer is internal, use them.
     If external, prefer Claude-detected internal_lead (most active speaker),
-    then HUBSPOT_OWNER_MAP members, then first internal participant."""
+    then HUBSPOT_OWNER_MAP members, then first internal participant.
+
+    Always returns the CANONICAL team address. A meeting organized from
+    @palomar-labs.com resolves to the matching @negevlabs.com identity, which
+    is what HUBSPOT_OWNER_MAP, Asana and the To-Do sync are all keyed on.
+    Returning the raw alias meant find_asana_user_by_email() missed the user
+    and the To-Do sync skipped the task outright (it filters on
+    @negevlabs.com) -- silent, because HubSpot normalizes internally and so
+    looked fine."""
     if organizer_email and is_internal_email(organizer_email):
-        return organizer_email.lower()
+        return normalize_team_email(organizer_email)
     # External organizer -- Claude identified most active internal speaker
     if internal_lead_email and is_internal_email(internal_lead_email):
         logger.info(f"[organizer] External organizer {organizer_email} -> internal lead {internal_lead_email} (Claude-detected)")
-        return internal_lead_email.lower()
-    # Fallback: internal participant in HUBSPOT_OWNER_MAP
+        return normalize_team_email(internal_lead_email)
+    # Fallback: internal participant in HUBSPOT_OWNER_MAP. The map is keyed on
+    # canonical addresses, so normalize before the membership test -- an
+    # @palomar-labs.com participant would otherwise never match.
     for email in (participants or []):
-        if is_internal_email(email) and email.lower() in HUBSPOT_OWNER_MAP:
+        if is_internal_email(email) and normalize_team_email(email) in HUBSPOT_OWNER_MAP:
             logger.info(f"[organizer] External organizer {organizer_email} -> internal owner {email} (from owner map)")
-            return email.lower()
+            return normalize_team_email(email)
     # Fallback: any internal participant
     for email in (participants or []):
         if is_internal_email(email):
             logger.info(f"[organizer] External organizer {organizer_email} -> internal fallback {email}")
-            return email.lower()
+            return normalize_team_email(email)
     logger.warning(f"[organizer] No internal participant found, keeping original: {organizer_email}")
     return organizer_email
