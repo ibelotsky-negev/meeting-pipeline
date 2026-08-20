@@ -542,6 +542,71 @@ def test_run_intake_dry_run_writes_nothing(intake_world):
     assert intake_world["replies"] == []
 
 
+def _cap_filler(n, status="answered"):
+    """n watches from an UNRELATED intake conversation, so _find_existing_watch
+    can never match them and the cap is the only thing under test."""
+    return [_watch_in_registry(status=status, ask=f"unrelated ask {i}",
+                               intake_conversation_id="conv-other")
+            for i in range(n)]
+
+
+def test_run_intake_watch_cap_counts_only_non_terminal_watches(intake_world, monkeypatch):
+    # FINDING 3 (final review): the cap counted answered/cancelled/exhausted
+    # watches, and nothing ever prunes them -- so it ratcheted shut over the
+    # pilot's life. Three TERMINAL watches at a cap of 3 must not block a
+    # new registration.
+    monkeypatch.setattr(fue, "FOLLOWUP_MAX_WATCHES", 3)
+    fue._save_registry({"watches": _cap_filler(1, "answered")
+                        + _cap_filler(1, "cancelled") + _cap_filler(1, "exhausted")})
+    out = fue.run_intake()
+    assert out["registered"] == 2 and out["failures"] == 0
+    assert len(intake_world["replies"]) == 1
+    assert "maximum" not in intake_world["replies"][0][1]
+
+
+def test_run_intake_watch_cap_replies_instead_of_going_silent(intake_world, monkeypatch):
+    # The silence half of finding 3: with the cap full on the FIRST ask,
+    # `new` and `matched_existing` are both empty so NEITHER reply branch
+    # fired -- yet mid was marked processed, so the request was never
+    # reconsidered. The teammate got total, permanent silence.
+    monkeypatch.setattr(fue, "FOLLOWUP_MAX_WATCHES", 2)
+    fue._save_registry({"watches": _cap_filler(2, "active")})
+    out = fue.run_intake()
+    assert out["registered"] == 0 and out["failures"] == 1
+    assert [o["kind"] for o in out["outcomes"]] == ["watch_cap"]
+    assert out["outcomes"][0]["dropped"] == ["investigation status", "summary report"]
+    replies = intake_world["replies"]
+    assert len(replies) == 1                       # NOT silence
+    body = replies[0][1]
+    assert "investigation status" in body and "summary report" in body
+    assert "maximum of 2" in body
+    assert len(fue._load_registry()["watches"]) == 2   # nothing registered
+    # Idempotent: the message is marked processed, so no repeat reply.
+    assert fue.run_intake()["failures"] == 0 and len(replies) == 1
+
+
+def test_run_intake_watch_cap_mid_loop_confirms_what_fit_and_names_what_did_not(intake_world, monkeypatch):
+    # Same shape mid-loop: the confirmation used to silently list only the
+    # asks that fit. It must now also name the ones it dropped.
+    monkeypatch.setattr(fue, "FOLLOWUP_MAX_WATCHES", 2)
+    fue._save_registry({"watches": _cap_filler(1, "active")})
+    out = fue.run_intake()
+    assert out["registered"] == 1 and out["failures"] == 1
+    assert out["outcomes"][-1]["kind"] == "registered"
+    dropped = [o for o in out["outcomes"] if o["kind"] == "watch_cap"][0]["dropped"]
+    assert dropped == ["summary report"]
+    body = intake_world["replies"][0][1]
+    assert "Registered 1 follow-up watch" in body      # what fit
+    assert "summary report" in body and "maximum of 2" in body   # what did not
+
+
+def test_open_watch_count_ignores_terminal_statuses():
+    reg = {"watches": [_watch_in_registry(status=s) for s in
+                       ("active", "paused", "answered", "cancelled", "exhausted")]}
+    assert fue._open_watch_count(reg) == 2
+    assert fue._open_watch_count({}) == 0
+
+
 def test_run_intake_ignores_external_and_media(monkeypatch, fue_files):
     ext = _intake_msg("x1", "spam@evil.com", "follow up", "follow up please")
     media = _intake_msg("x2", "dan@negevlabs.com", "fyi",

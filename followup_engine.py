@@ -477,10 +477,35 @@ def _confirmation_html(watches: list) -> str:
             "cancel, <b>resume</b> to re-arm a paused watch.</p>")
 
 
+# A watch in one of these statuses is finished: nothing will ever draft for
+# it again, and nothing prunes it from the registry either.
+_TERMINAL_STATUSES = ("answered", "cancelled", "exhausted")
+
+
+def _open_watch_count(reg: dict) -> int:
+    """FINDING 3 (final review): only NON-TERMINAL watches count toward
+    FOLLOWUP_MAX_WATCHES. Counting finished ones ratcheted the cap shut
+    over the pilot's life, since nothing prunes them -- and once shut, an
+    intake produced neither `new` nor `matched_existing`, so NEITHER reply
+    branch fired while mid was still marked processed: the teammate got
+    total, permanent silence."""
+    return sum(1 for w in (reg.get("watches") or [])
+               if w.get("status") not in _TERMINAL_STATUSES)
+
+
 def _failure_html(reason: str) -> str:
     return (f"<p>I could not register that follow-up: {_esc(reason)}</p>"
             "<p>Forward the thread again (keeping its subject line), or name the "
             "exact subject and who should reply.</p>")
+
+
+def _cap_failure_html(dropped: list) -> str:
+    """Honest failure, never silence (this module's own rule): name EVERY
+    ask the watch cap dropped, and say how to free a slot."""
+    return _failure_html(
+        f"I am already watching the maximum of {FOLLOWUP_MAX_WATCHES} open follow-ups, "
+        f"so {len(dropped)} ask(s) were NOT registered: {'; '.join(dropped)}. "
+        f"Reply 'stop' with a finished watch's id to free a slot")
 
 
 def _apply_command(reg: dict, watches: list, cmd: str) -> list:
@@ -618,6 +643,7 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
         today = _today_il()
         new = []
         matched_existing = []
+        capped = []
         for ask in parsed["asks"]:
             ask_text = ask["ask"].strip()
             existing = _find_existing_watch(reg, new, conv, ask_text)
@@ -631,9 +657,13 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
                 # can still go out below, instead of being lost for good.
                 matched_existing.append(existing)
                 continue
-            if len(reg["watches"]) + len(new) >= FOLLOWUP_MAX_WATCHES:
-                logger.warning("[followup] watch cap reached; skipping remaining asks")
-                break
+            if _open_watch_count(reg) + len(new) >= FOLLOWUP_MAX_WATCHES:
+                # `continue`, not `break` -- every dropped ask has to be
+                # named in the reply below, not just the first one.
+                logger.warning(f"[followup] watch cap ({FOLLOWUP_MAX_WATCHES}) reached; "
+                               f"not registering ask: {ask_text}")
+                capped.append(ask_text)
+                continue
             days = ask.get("days")
             # is None (not falsy) check -- an explicit days=0 ("chase the
             # same day") must not be silently upgraded to the default by an
@@ -657,13 +687,22 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
                 interval_days=interval, deadline=deadline,
                 intake_conversation_id=conv))
         registered += len(new)
+        # FINDING 3: whatever else happened, an ask dropped by the cap is
+        # reported. Appended to the SAME reply as any confirmation so the
+        # teammate gets one message telling them both what was registered
+        # and what was not.
+        cap_note = ""
+        if capped:
+            failures += 1
+            cap_note = _cap_failure_html(capped)
+            outcomes.append({"from": sender, "kind": "watch_cap", "dropped": capped})
         if new:
             outcomes.append({"from": sender, "kind": "registered",
                              "watches": [w["id"] for w in new]})
             if not dry_run:
                 reg["watches"].extend(new)
                 _save_registry(reg)
-                xte.send_threaded_reply(m.get("id"), _confirmation_html(new))
+                xte.send_threaded_reply(m.get("id"), _confirmation_html(new) + cap_note)
         elif matched_existing:
             # Every ask already had a watch -- the confirmation for them
             # never went out (that is exactly why mid was never marked
@@ -672,7 +711,10 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
             outcomes.append({"from": sender, "kind": "reconfirmed",
                              "watches": [w["id"] for w in matched_existing]})
             if not dry_run:
-                xte.send_threaded_reply(m.get("id"), _confirmation_html(matched_existing))
+                xte.send_threaded_reply(m.get("id"),
+                                        _confirmation_html(matched_existing) + cap_note)
+        elif capped and not dry_run:
+            xte.send_threaded_reply(m.get("id"), cap_note)
         processed.add(mid)
         _persist_processed(processed, dry_run)
 
