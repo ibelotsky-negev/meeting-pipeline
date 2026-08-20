@@ -3301,7 +3301,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.29.0-fireflies-quota", "deployed": "2026-08-19"})
+    return jsonify({"version": "2.29.1-process-bookkeeping", "deployed": "2026-08-20"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3369,7 +3369,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.29.0-fireflies-quota", "steps": {}}
+    results = {"version": "2.29.1-process-bookkeeping", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4030,6 +4030,18 @@ def manual_process(transcript_id: str):
                 logger.error(f"Transcript not found: {transcript_id}")
                 return
             approval_id = process_transcript_phase1(transcript)
+            # Record it, exactly as the poll and webhook paths do. Without
+            # this, replaying a meeting still inside the poll window
+            # (POLL_INTERVAL + 10 min) meant the next poll processed it again
+            # and sent the organizer a SECOND notification. It also broke the
+            # invariant the rest of the pipeline relies on -- that a
+            # transcript in the processed store has already been notified.
+            # This endpoint deliberately does not SKIP an already-processed
+            # id (manual replay is the whole point); it only records the
+            # outcome afterwards.
+            proc = load_processed()
+            proc.add(transcript_id)
+            save_processed(proc)
             logger.info(f"Phase 1 complete: approval_id={approval_id}")
         except Exception as e:
             logger.error(f"Background processing failed for {transcript_id}: {e}", exc_info=True)
