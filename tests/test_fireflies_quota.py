@@ -416,3 +416,72 @@ def test_status_endpoint_reports_block_and_parked_queue(flask_client):
     assert body["deferred_count"] == 1
     assert body["deferred"]["t-parked"]["reason"] == "quota exhausted when webhook arrived"
     assert body["deferred"]["t-parked"]["attempts"] == 0
+
+
+# ------------------------------------------------- /process/<id> bookkeeping
+
+
+def test_manual_process_records_transcript_as_processed(monkeypatch, flask_client):
+    """Replaying via /process must record the id.
+
+    Without it, replaying a meeting still inside the poll window
+    (POLL_INTERVAL + 10 min) let the next poll process it again and send the
+    organizer a SECOND notification -- and it broke the invariant that a
+    transcript in the processed store has already been notified.
+    """
+    monkeypatch.setattr(app_module, "get_transcript_by_id", lambda tid: {"id": tid, "title": "Replayed"})
+    monkeypatch.setattr(app_module, "process_transcript_phase1", lambda t: "appr-x")
+
+    resp = flask_client.post("/process/t-replay")
+    assert resp.status_code == 200
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if "t-replay" in app_module.load_processed():
+            break
+        time.sleep(0.02)
+
+    assert "t-replay" in app_module.load_processed()
+
+
+def test_manual_process_does_not_record_when_transcript_missing(monkeypatch, flask_client):
+    """A 404 from Fireflies must not poison the processed store -- otherwise a
+    transcript that later becomes available would be skipped forever."""
+    monkeypatch.setattr(app_module, "get_transcript_by_id", lambda tid: None)
+
+    def _boom(_t):
+        raise AssertionError("Phase 1 must not run without a transcript")
+
+    monkeypatch.setattr(app_module, "process_transcript_phase1", _boom)
+
+    resp = flask_client.post("/process/t-missing")
+    assert resp.status_code == 200
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    assert "t-missing" not in app_module.load_processed()
+
+
+def test_manual_process_still_replays_an_already_processed_id(monkeypatch, flask_client):
+    """Manual replay must NOT skip a known id -- that is what the endpoint is
+    for (it is how the 08-06..08-19 backlog was recovered)."""
+    processed = app_module.load_processed()
+    processed.add("t-known")
+    app_module.save_processed(processed)
+
+    ran = {}
+    monkeypatch.setattr(app_module, "get_transcript_by_id", lambda tid: {"id": tid})
+    monkeypatch.setattr(app_module, "process_transcript_phase1", lambda t: ran.setdefault("id", t["id"]))
+
+    resp = flask_client.post("/process/t-known")
+    assert resp.status_code == 200
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if ran.get("id"):
+            break
+        time.sleep(0.02)
+
+    assert ran.get("id") == "t-known"
