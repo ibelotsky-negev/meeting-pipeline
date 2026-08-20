@@ -847,6 +847,19 @@ def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
     return events
 
 
+def _graph_error_status(exc: Exception):
+    """Best-effort HTTP status code from a Graph request exception. A
+    requests.exceptions.HTTPError (what eps.graph_get raises for a clean
+    non-2xx response) carries a populated .response.status_code; a
+    network-level failure (connection error, timeout) or anything else
+    without a real response has none, so this returns None. Duck-typed via
+    getattr so this module does not need to import requests just to read an
+    attribute another module's exception already carries -- not a new
+    cross-module helper, just a private local reader."""
+    resp = getattr(exc, "response", None)
+    return getattr(resp, "status_code", None) if resp is not None else None
+
+
 def sweep_unsent(reg: dict) -> list:
     """A draft that no longer exists (404) or is no longer isDraft was sent or
     deleted by the owner -- stop listing it. Anything still isDraft is UNSENT
@@ -861,7 +874,26 @@ def sweep_unsent(reg: dict) -> list:
     _apply_command's cancel path (Task 4) only flips status and never
     touches w["drafts"]. Only "cancelled" is skipped -- paused, answered,
     and exhausted watches still get their stale drafts reported, unchanged
-    from the brief."""
+    from the brief.
+
+    FINDING (review, Important): only a DEFINITIVE "gone" response (404 or
+    410) may mark a draft sent. eps.graph_get retries 429/5xx up to 3 times
+    and then RAISES -- so a persistent 5xx, an expired-token 401, or a
+    network partition must NOT be treated as "gone", or a draft still
+    sitting unsent in the owner's Drafts folder is silently dropped from
+    every future report (the same defect class the cancelled-watch ruling
+    already settled, reached here through an error path instead of a
+    status field). On any non-404/410 failure: leave sent False, log why,
+    and let the next run re-check it -- this cycle reports the draft as
+    still unsent rather than guessing it is gone.
+
+    KNOWN, ACCEPTED PERFORMANCE GAP (not fixed here, see task-6-report.md):
+    a genuine 404 still costs eps.graph_get's full 429/5xx retry loop
+    (0/5/10/15s sleeps) before raising, because _request_with_retry's own
+    ok_statuses short-circuit is not reachable through graph_get's current
+    signature. Avoiding that would mean adding an ok_statuses passthrough
+    to email_pipeline_sync.graph_get -- a SHARED helper used by every other
+    module in this codebase -- which is out of scope for this fix."""
     unsent = []
     for w in reg.get("watches") or []:
         if w.get("status") == "cancelled":
@@ -873,8 +905,14 @@ def sweep_unsent(reg: dict) -> list:
             try:
                 msg = eps.graph_get(f"{base}/{d['message_id']}", params={"$select": "isDraft"}) or {}
                 still_draft = bool(msg.get("isDraft"))
-            except Exception:
-                still_draft = False  # gone -> sent or deleted either way
+            except Exception as e:
+                status = _graph_error_status(e)
+                if status in (404, 410):
+                    still_draft = False  # confirmed gone -- sent or deleted
+                else:
+                    logger.warning(f"[followup] sweep_unsent: could not confirm draft "
+                                   f"{d['message_id']} status ({e}); reporting as still unsent")
+                    still_draft = True  # ambiguous failure -- never one-way-flip sent
             if still_draft:
                 unsent.append({"owner": w["owner"], "watch_id": w["id"], "ask": w["ask"],
                                "web_link": d.get("web_link") or "", "created": d.get("created") or ""})

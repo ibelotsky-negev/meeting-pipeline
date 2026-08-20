@@ -1259,6 +1259,20 @@ def test_process_deadlines_exhaustion(monkeypatch, fue_files):
     assert reg["watches"][0]["status"] == "exhausted"
 
 
+class _FakeHTTPError(Exception):
+    """Mimics requests.exceptions.HTTPError's .response.status_code shape
+    (what eps.graph_get actually raises on a clean non-2xx response)
+    without importing requests into this test file. A bare RuntimeError
+    with "404" in its message -- the brief's original mock -- does NOT
+    carry a status code the way a real Graph failure does, and the
+    dry-run-inertness-class fix below needs to distinguish a genuine 404
+    from a persistent 5xx or a network error by STATUS CODE, not by
+    string content."""
+    def __init__(self, status_code):
+        super().__init__(f"HTTP {status_code}")
+        self.response = type("_Resp", (), {"status_code": status_code})()
+
+
 def test_sweep_unsent_marks_sent_on_404(monkeypatch, fue_files):
     w = _watch_in_registry()
     w["drafts"] = [{"message_id": "d1", "web_link": "L1", "created": "c", "sent": False},
@@ -1266,12 +1280,80 @@ def test_sweep_unsent_marks_sent_on_404(monkeypatch, fue_files):
     reg = {"watches": [w]}
     def _get(url, params=None):
         if "/messages/d1" in url:
-            raise RuntimeError("404 Not Found")   # sent or deleted -> gone
+            raise _FakeHTTPError(404)   # sent or deleted -> gone
         return {"id": "d2", "isDraft": True}
     monkeypatch.setattr(eps, "graph_get", _get)
     unsent = fue.sweep_unsent(reg)
     assert w["drafts"][0]["sent"] is True
     assert [u["web_link"] for u in unsent] == ["L2"]
+
+
+def test_sweep_unsent_410_gone_marks_sent(monkeypatch, fue_files):
+    # 410 Gone gets the identical "definitively gone" treatment as 404.
+    w = _watch_in_registry()
+    w["drafts"] = [{"message_id": "d1", "web_link": "L1", "created": "c", "sent": False}]
+    reg = {"watches": [w]}
+
+    def _get(url, params=None):
+        raise _FakeHTTPError(410)
+
+    monkeypatch.setattr(eps, "graph_get", _get)
+    unsent = fue.sweep_unsent(reg)
+    assert w["drafts"][0]["sent"] is True
+    assert unsent == []
+
+
+def test_sweep_unsent_persistent_5xx_does_not_mark_sent(monkeypatch, fue_files):
+    # FINDING (review, Important): a persistent 5xx -- eps.graph_get's own
+    # 429/5xx retry loop already exhausted and raised -- is NOT a
+    # definitive "gone" response. Only 404/410 may flip sent; anything
+    # else must leave it False and still report the draft as unsent, or a
+    # transient/persistent Graph outage would silently drop a draft still
+    # sitting unsent in the owner's mailbox from every future report (the
+    # same defect class the cancelled-watch ruling already settled,
+    # reached here through an error path instead of a status field).
+    w = _watch_in_registry()
+    w["drafts"] = [{"message_id": "d1", "web_link": "L1", "created": "c", "sent": False}]
+    reg = {"watches": [w]}
+
+    def _get(url, params=None):
+        raise _FakeHTTPError(503)  # retries already exhausted upstream, then raised
+
+    monkeypatch.setattr(eps, "graph_get", _get)
+    unsent = fue.sweep_unsent(reg)
+    assert w["drafts"][0]["sent"] is False  # nothing written one-way
+    assert [u["web_link"] for u in unsent] == ["L1"]  # still reported as unsent
+
+
+def test_sweep_unsent_generic_connection_error_does_not_mark_sent(monkeypatch, fue_files):
+    # Same guarantee for a raw network-level failure with no HTTP response
+    # at all (no .response attribute, unlike _FakeHTTPError) -- must not be
+    # confused with a definitive "gone".
+    w = _watch_in_registry()
+    w["drafts"] = [{"message_id": "d1", "web_link": "L1", "created": "c", "sent": False}]
+    reg = {"watches": [w]}
+
+    def _get(url, params=None):
+        raise ConnectionError("network partition")
+
+    monkeypatch.setattr(eps, "graph_get", _get)
+    unsent = fue.sweep_unsent(reg)
+    assert w["drafts"][0]["sent"] is False
+    assert [u["web_link"] for u in unsent] == ["L1"]
+
+
+def test_sweep_unsent_isdraft_true_still_reported(monkeypatch, fue_files):
+    # Third required case, explicit: no exception at all, isDraft: True ->
+    # unchanged behavior, still reported unsent. (Already exercised
+    # incidentally by other tests in this file; pinned directly here for a
+    # clean, explicitly-named three-case set alongside the two above.)
+    w = _watch_in_registry()
+    w["drafts"] = [{"message_id": "d1", "web_link": "L1", "created": "c", "sent": False}]
+    reg = {"watches": [w]}
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"isDraft": True})
+    unsent = fue.sweep_unsent(reg)
+    assert w["drafts"][0]["sent"] is False
+    assert [u["web_link"] for u in unsent] == ["L1"]
 
 
 # Task 6 self-review additions -- mutation-testing driven. The brief's own
@@ -1583,12 +1665,31 @@ def test_create_draft_cleanup_failure_does_not_mask_original_error(monkeypatch, 
 
 def test_create_draft_and_module_never_call_send(monkeypatch, fue_files):
     # THE ABSOLUTE RULE: this module has no code path that sends to a
-    # counterparty. A runtime test can only prove "/send" is not called for
-    # the specific scenarios it exercises; a static source scan proves it
-    # for every scenario, including branches no test happens to hit.
+    # counterparty. A runtime test can only prove a forbidden call is not
+    # made for the specific scenarios it exercises; a static source scan
+    # proves it for every scenario, including branches no test happens to
+    # hit. HARDENING (review): beyond the literal "/send", also scan for
+    # sendmail, /replyall, and /microsoft.graph.send -- three OTHER real
+    # Graph send-equivalent endpoints. In particular, a createReplyAll ->
+    # replyAll swap (create a DRAFT reply-all vs. immediately SEND one)
+    # would slip past a /send-only scan entirely, since neither
+    # "replyAll" (the dangerous endpoint) nor "createReplyAll" (the safe
+    # one already in use) contains the substring "/send". The "/replyall"
+    # pattern (WITH the leading slash) is chosen precisely so it does not
+    # false-positive against the legitimate "createReplyAll" call: in that
+    # literal the "/" sits before "create", never immediately before
+    # "reply" -- confirmed by the sanity check below, which would fail
+    # loudly if that reasoning were ever wrong.
     import inspect
-    assert "/send" not in inspect.getsource(fue._create_draft)
-    assert "/send" not in inspect.getsource(fue)
+    forbidden = ["/send", "sendmail", "/replyall", "/microsoft.graph.send"]
+    create_draft_src = inspect.getsource(fue._create_draft).lower()
+    module_src = inspect.getsource(fue).lower()
+    for pattern in forbidden:
+        assert pattern not in create_draft_src, f"found forbidden pattern {pattern!r} in _create_draft"
+        assert pattern not in module_src, f"found forbidden pattern {pattern!r} in the module"
+    # Not vacuous: the legitimate createReplyAll call is still present and
+    # correctly did NOT trip the /replyall scan above.
+    assert "createreplyall" in create_draft_src
 
 
 def test_compose_draft_wraps_paragraphs_and_escapes_html(monkeypatch):
