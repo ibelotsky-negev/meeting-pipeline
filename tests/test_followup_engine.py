@@ -2290,7 +2290,7 @@ def test_followup_run_route_refuses_concurrent_run(fue_files):
         client = app_module.app.test_client()
         resp = client.get("/followup/run?sync=1")
         assert resp.status_code == 409
-        assert resp.get_json() == {"status": "already-running"}
+        assert resp.get_json() == {"status": "already_running"}
     finally:
         app_module._followup_run_lock.release()
 
@@ -2351,7 +2351,7 @@ def test_followup_intake_route_refuses_concurrent_run(fue_files):
         client = app_module.app.test_client()
         resp = client.get("/followup/intake?sync=1")
         assert resp.status_code == 409
-        assert resp.get_json() == {"status": "already-running"}
+        assert resp.get_json() == {"status": "already_running"}
     finally:
         app_module._followup_intake_lock.release()
 
@@ -2413,3 +2413,70 @@ def test_followup_intake_run_skips_when_lock_held(fue_files, monkeypatch):
     finally:
         app_module._followup_intake_lock.release()
     assert calls == []
+
+
+# ----------------------------------------------------------------------
+#  Fix round: async trigger must acquire the lock in the REQUEST thread
+#  (matching transcribe_email_run), not inside the background thread --
+#  otherwise a busy lock still returns 200 "started" while the spawned
+#  thread quietly no-ops.
+# ----------------------------------------------------------------------
+
+def test_followup_run_route_async_refuses_when_lock_held(fue_files, monkeypatch):
+    import app as app_module
+    import time
+    calls = []
+    monkeypatch.setattr(fue, "run_daily", lambda dry_run=False: calls.append(dry_run))
+    assert app_module._followup_run_lock.acquire(blocking=False)
+    try:
+        client = app_module.app.test_client()
+        resp = client.get("/followup/run?dry_run=1")  # no sync= -> async path
+        assert resp.status_code == 409
+        body = resp.get_json()
+        assert body == {"status": "already_running"}
+        assert body.get("status") != "started"
+    finally:
+        app_module._followup_run_lock.release()
+    # No thread should have been spawned at all -- not just "hasn't run yet".
+    time.sleep(0.05)
+    assert calls == []
+
+
+def test_followup_run_route_async_exception_still_releases_lock(fue_files, monkeypatch):
+    import app as app_module
+    import threading
+    failed = threading.Event()
+
+    def boom(dry_run=False):
+        failed.set()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fue, "run_daily", boom)
+    client = app_module.app.test_client()
+    resp = client.get("/followup/run?dry_run=1")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"status": "started", "dry_run": True}
+    assert failed.wait(timeout=5), "background followup run never executed"
+    assert app_module._followup_run_lock.acquire(timeout=5)
+    app_module._followup_run_lock.release()
+
+
+def test_followup_run_route_async_thread_start_failure_releases_lock(fue_files, monkeypatch):
+    """Folded-in minor: Thread(...).start() is now guarded like
+    transcribe_email_run's -- if spawning itself fails, the route must
+    still report a clean JSON error (not let the exception hit Flask's
+    default handler) and must not orphan the lock it already holds."""
+    import app as app_module
+
+    def boom_start(self, *a, **kw):
+        raise RuntimeError("thread start boom")
+
+    monkeypatch.setattr(app_module._threading.Thread, "start", boom_start)
+    client = app_module.app.test_client()
+    resp = client.get("/followup/run?dry_run=1")
+    assert resp.status_code == 500
+    payload = resp.get_json()
+    assert payload["status"] == "error"
+    assert "thread start boom" in payload["error"]
+    assert app_module._followup_run_lock.acquire(timeout=5)
+    app_module._followup_run_lock.release()

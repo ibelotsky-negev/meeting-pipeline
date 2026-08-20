@@ -3159,9 +3159,17 @@ def _followup_route(lock, fn_name, dry_run, sync):
     def _invoke():
         import followup_engine
         return getattr(followup_engine, fn_name)(dry_run=dry_run)
+
+    # Acquire in the REQUEST thread, before sync/async branch and before any
+    # thread is spawned -- matches transcribe_email_run's _xte_trigger_lock
+    # pattern. Async previously acquired inside _bg(), so a busy lock (e.g.
+    # the paired cron job already running) still returned 200 "started" while
+    # the background thread quietly did nothing. Now both paths 409 alike.
+    if not lock.acquire(blocking=False):
+        logger.info(f"[followup] {fn_name} already in progress; refusing trigger")
+        return jsonify({"status": "already_running"}), 409
+
     if sync:
-        if not lock.acquire(blocking=False):
-            return jsonify({"status": "already-running"}), 409
         try:
             return jsonify(_invoke())
         except Exception as e:
@@ -3171,15 +3179,20 @@ def _followup_route(lock, fn_name, dry_run, sync):
             lock.release()
 
     def _bg():
-        if not lock.acquire(blocking=False):
-            return
         try:
             _invoke()
         except Exception as e:
             logger.error(f"[followup] {fn_name} failed: {e}", exc_info=True)
         finally:
             lock.release()
-    _threading.Thread(target=_bg, daemon=True).start()
+
+    t = _threading.Thread(target=_bg, daemon=True)
+    try:
+        t.start()
+    except Exception as e:
+        lock.release()  # never orphan the trigger lock if the thread won't start
+        logger.error(f"[followup] {fn_name}: failed to start background thread: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": f"could not start run: {e}"}), 500
     return jsonify({"status": "started", "dry_run": dry_run})
 
 
