@@ -920,3 +920,163 @@ def sweep_unsent(reg: dict) -> list:
                 d["sent"] = True
                 _note(w, f"draft {d['message_id']} left the Drafts folder")
     return unsent
+
+
+# ----------------------------------------------------------------------
+#  Daily report + orchestration
+# ----------------------------------------------------------------------
+
+
+def _send_email(to_list: list, subject: str, html_body: str):
+    """Only place in this module allowed to call Graph sendMail. Always
+    from Sara's own inbox (SARA_MAILBOX) to the given internal addresses --
+    the caller passes the owner (and, on an escalation, FOLLOWUP_ALERT_CC).
+    Takes only a recipient list, a subject, and body text -- no per-thread
+    id can be smuggled in through a parameter that does not exist. This is
+    the ONE exemption in the module's static send-guard test; see
+    test_send_email_exempt_call_is_locked_down in the test suite for what
+    keeps that exemption from being abused."""
+    body = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": html_body},
+            "toRecipients": [{"emailAddress": {"address": a}} for a in to_list],
+        },
+        "saveToSentItems": False,
+    }
+    eps.graph_post(f"{eps.MS_GRAPH_BASE}/users/{SARA_MAILBOX}/sendMail", body)
+
+
+def build_report(owner: str, events: list, unsent: list) -> str:
+    parts = []
+    drafts = [e for e in events if e["type"] == "draft"]
+    woulds = [e for e in events if e["type"] == "would_draft"]
+    replies = [e for e in events if e["type"].startswith("reply_")]
+    exhausted = [e for e in events if e["type"] == "exhausted"]
+
+    if drafts:
+        parts.append("<h3>New reminder drafts in your Drafts folder</h3>")
+        for e in drafts:
+            link = (f'<p><a href="{_esc(e["web_link"])}">Open draft in Outlook</a></p>'
+                    if e.get("web_link") else "")
+            parts.append(
+                f"<p><b>{_esc(e['ask'])}</b> (watch <code>{_esc(e['watch_id'])}</code>, "
+                f"reminder {e['escalation']}) -> {_esc(', '.join(e['recipients']))}</p>"
+                f"<blockquote>{e['body']}</blockquote>{link}")
+    if woulds:
+        parts.append("<h3>Report-only mode: I WOULD have drafted these "
+                     "(set FOLLOWUP_LIVE=1 to arm)</h3>")
+        for e in woulds:
+            parts.append(
+                f"<p><b>{_esc(e['ask'])}</b> (watch <code>{_esc(e['watch_id'])}</code>, "
+                f"reminder {e['escalation']}) -> {_esc(', '.join(e['recipients']))}</p>"
+                f"<blockquote>{e['body']}</blockquote>")
+    if replies:
+        parts.append("<h3>Replies detected</h3><ul>")
+        for e in replies:
+            state = "answered -- watch closed" if e["type"] == "reply_answered" \
+                else "did not answer -- watch paused (reply 'resume' to keep chasing)"
+            parts.append(f"<li><b>{_esc(e['ask'])}</b>: {_esc(e['who'])} replied "
+                         f"at {_esc(e['when'])} -- {state} "
+                         f"(<code>{_esc(e['watch_id'])}</code>)</li>")
+        parts.append("</ul>")
+    if exhausted:
+        parts.append("<h3>Escalations -- max reminders reached, over to you</h3><ul>")
+        for e in exhausted:
+            parts.append(f"<li><b>{_esc(e['ask'])}</b> "
+                         f"(<code>{_esc(e['watch_id'])}</code>): "
+                         f"{e['escalation']} reminders went unanswered.</li>")
+        parts.append("</ul>")
+    if unsent:
+        parts.append("<h3>Still unsent from earlier days</h3><ul>")
+        for u in unsent:
+            link = (f' -- <a href="{_esc(u["web_link"])}">open draft</a>'
+                    if u.get("web_link") else "")
+            parts.append(f"<li><b>{_esc(u['ask'])}</b> (drafted {_esc(u['created'][:10])}, "
+                         f"<code>{_esc(u['watch_id'])}</code>){link}</li>")
+        parts.append("</ul>")
+    parts.append("<p>Reply <b>stop</b> or <b>resume</b> with a watch id to control "
+                 "a watch. -- Sara Follow-Up Engine</p>")
+    return "".join(parts)
+
+
+def run_daily(dry_run: bool = False) -> dict:
+    started = datetime.now(timezone.utc)
+    reg = _load_registry()
+    events = check_replies(reg)
+    today = _today_il()
+    events += process_deadlines(reg, today, dry_run)
+    unsent = [] if dry_run else sweep_unsent(reg)
+
+    owners = sorted({e["owner"] for e in events} | {u["owner"] for u in unsent})
+    reports = 0
+    for owner in owners:
+        ev = [e for e in events if e["owner"] == owner]
+        un = [u for u in unsent if u["owner"] == owner]
+        if not ev and not un:
+            continue
+        n_new = sum(1 for e in ev if e["type"] in ("draft", "would_draft"))
+        subject = (f"[follow-up] {n_new} draft(s) ready, "
+                   f"{len(un)} still unsent -- {today.isoformat()}")
+        html_body = build_report(owner, ev, un)
+        if not dry_run:
+            to = [owner]
+            if any(e["type"] == "exhausted" for e in ev) and ALERT_CC.lower() != owner.lower():
+                to.append(ALERT_CC)
+            try:
+                _send_email(to, subject, html_body)
+            except Exception as e:
+                logger.error(f"[followup] report email to {owner} failed: {e}")
+                continue
+        reports += 1
+    if not dry_run:
+        _save_registry(reg)
+    result = {"started": started.isoformat(), "dry_run": dry_run,
+              "live": _live(), "watches": len(reg.get("watches") or []),
+              "events": events, "unsent": len(unsent), "reports": reports,
+              "finished": datetime.now(timezone.utc).isoformat()}
+    # DRY-RUN INVARIANT (carried from Task 6, EXTENDED here by explicit
+    # instruction): a dry run must be safe to invoke at any time against
+    # live state and must persist NOTHING -- not just the registry (guarded
+    # above, unchanged from the brief) but the STATUS FILE too.
+    # status_summary() and the /followup/status route (Task 8) read
+    # STATUS_PATH as "the last REAL run's outcome"; writing it
+    # unconditionally would let a dry-run preview silently clobber that
+    # with preview numbers -- exactly the wart CLAUDE.md already documents
+    # for a sibling module (learn_digest's /learn/stt-replay: "a dry_run
+    # list-only call REWRITES the status file, clobbering the last live
+    # result"). Deliberately NOT repeated here: the brief's own Step 3 code
+    # called _write_status(result) unconditionally; this guard is a
+    # deliberate, requested deviation from that literal code.
+    if not dry_run:
+        _write_status(result)
+    logger.info(f"[followup] daily: {len(events)} events, {len(unsent)} unsent, "
+                f"{reports} reports (dry={dry_run}, live={_live()})")
+    return result
+
+
+def status_summary() -> dict:
+    reg = _load_registry()
+    keep = ("id", "owner", "subject", "ask", "recipients", "status",
+            "deadline", "nudges_sent", "max_nudges", "last_checked", "created")
+    return {"last_run": read_status(),
+            "live": _live(),
+            "watches": [{k: w.get(k) for k in keep} for w in reg.get("watches") or []]}
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Follow-Up Engine (pilot)")
+    ap.add_argument("--intake", action="store_true", help="run the inbox intake scan")
+    ap.add_argument("--check", action="store_true", help="run the daily thread check")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO)
+    if args.intake:
+        print(json.dumps(run_intake(dry_run=args.dry_run), indent=2, default=str))
+    if args.check or not args.intake:
+        print(json.dumps(run_daily(dry_run=args.dry_run), indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

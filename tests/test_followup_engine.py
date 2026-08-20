@@ -1680,16 +1680,48 @@ def test_create_draft_and_module_never_call_send(monkeypatch, fue_files):
     # literal the "/" sits before "create", never immediately before
     # "reply" -- confirmed by the sanity check below, which would fail
     # loudly if that reasoning were ever wrong.
+    #
+    # NARROWED (Task 7, controller ruling -- cross-task collision with the
+    # brief's own _send_email): Task 7 adds the ONE legitimate sendMail
+    # call in this module -- _send_email, which reports the run's outcome
+    # to the OWNER (and FOLLOWUP_ALERT_CC on an escalation), both internal
+    # addresses, from Sara's own mailbox. A blanket "no sendmail/send
+    # anywhere in the module" scan cannot coexist with that any more, so
+    # the guard is narrowed to two layers instead of weakened to nothing:
+    # (a) the DRAFTING path -- _create_draft, process_deadlines,
+    # sweep_unsent, named explicitly since those are exactly the functions
+    # that touch a draft or a reply-all and must never gain a send call --
+    # stays scanned exactly as before; (b) the WHOLE MODULE minus
+    # _send_email's own source is ALSO still scanned, so every other
+    # function -- present, or added by a future task -- stays completely
+    # clean; only _send_email itself is exempted, and it is pinned down
+    # separately and tightly in test_send_email_exempt_call_is_locked_down
+    # below (recipients/subject/body only, fixed to SARA_MAILBOX, no
+    # watch/mailbox/draft-id parameter for a later edit to abuse), so the
+    # one carve-out cannot be repurposed to send a draft to a counterparty.
     import inspect
     forbidden = ["/send", "sendmail", "/replyall", "/microsoft.graph.send"]
-    create_draft_src = inspect.getsource(fue._create_draft).lower()
-    module_src = inspect.getsource(fue).lower()
+
+    drafting_funcs = [fue._create_draft, fue.process_deadlines, fue.sweep_unsent]
+    for fn in drafting_funcs:
+        src = inspect.getsource(fn).lower()
+        for pattern in forbidden:
+            assert pattern not in src, f"found forbidden pattern {pattern!r} in {fn.__name__}"
+
+    module_src = inspect.getsource(fue)
+    send_email_src = inspect.getsource(fue._send_email)
+    # Sanity: an exact substring, not a paraphrase -- if this ever fails,
+    # the replace() below would silently no-op and the scan would be
+    # vacuous (scanning the WHOLE module, exemption included).
+    assert send_email_src in module_src
+    remainder = module_src.replace(send_email_src, "", 1).lower()
     for pattern in forbidden:
-        assert pattern not in create_draft_src, f"found forbidden pattern {pattern!r} in _create_draft"
-        assert pattern not in module_src, f"found forbidden pattern {pattern!r} in the module"
+        assert pattern not in remainder, (
+            f"found forbidden pattern {pattern!r} outside the one _send_email exemption")
+
     # Not vacuous: the legitimate createReplyAll call is still present and
     # correctly did NOT trip the /replyall scan above.
-    assert "createreplyall" in create_draft_src
+    assert "createreplyall" in inspect.getsource(fue._create_draft).lower()
 
 
 def test_compose_draft_wraps_paragraphs_and_escapes_html(monkeypatch):
@@ -1807,3 +1839,361 @@ def test_process_deadlines_dry_run_exhausted_watch_emits_event_without_mutating(
     assert events[0]["type"] == "exhausted"  # still reported in the preview
     assert reg["watches"][0]["status"] == "active"  # NOT flipped for real
     assert reg["watches"][0]["notes"] == []  # unchanged
+
+
+# ----------------------------------------------------------------------
+#  Task 7: daily report email, orchestration (run_daily), status, CLI
+# ----------------------------------------------------------------------
+
+
+def _sendmail_capture(monkeypatch):
+    sent = []
+    def _post(url, json_body):
+        if url.endswith("/sendMail"):
+            sent.append(json_body)
+            return {}
+        if url.endswith("/createReplyAll"):
+            return {"id": "d1", "webLink": "https://outlook.example/d1"}
+        return {}
+    monkeypatch.setattr(eps, "graph_post", _post)
+    monkeypatch.setattr(eps, "graph_patch", lambda url, json_body: {})
+    monkeypatch.setattr(eps, "graph_delete", lambda url: {})
+    return sent
+
+
+def test_run_daily_reports_would_draft_per_owner(monkeypatch, fue_files):
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    reg = {"watches": [
+        _watch_in_registry(deadline="2026-08-07"),
+        _watch_in_registry(owner="ka@negevlabs.com", mailbox="ka@negevlabs.com",
+                           deadline="2026-08-07"),
+    ]}
+    fue._save_registry(reg)
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    sent = _sendmail_capture(monkeypatch)
+    out = fue.run_daily()
+    assert out["reports"] == 2 and len(sent) == 2
+    recipients = {s["message"]["toRecipients"][0]["emailAddress"]["address"] for s in sent}
+    assert recipients == {"dan@negevlabs.com", "ka@negevlabs.com"}
+    body = sent[0]["message"]["body"]["content"]
+    assert "Reminder body" in body and "report-only" in body.lower()
+    saved = fue._load_registry()
+    # CORRECTED (brief/reality conflict, documented in task-7-report.md):
+    # the brief's literal assertion here was `nudges_sent == 1`. That
+    # contradicts the Task 6 controller ruling already shipped and
+    # regression-tested -- FOLLOWUP_LIVE is unset in THIS exact test
+    # (report-only mode), and process_deadlines' report-only branch
+    # deliberately leaves nudges_sent UNTOUCHED so repeated report-only
+    # runs can never silently exhaust a watch that was never really
+    # drafted for (see test_process_deadlines_report_only_never_
+    # exhausts_the_nudge_budget, which asserts nudges_sent == 0 across 10
+    # report-only cycles and names the ruling explicitly). Reproduced and
+    # confirmed here via mutation testing (see report). "persisted" is
+    # still true -- just via the fields report-only mode DOES advance
+    # (check_replies' last_checked stamp; process_deadlines' deadline
+    # advance and note) -- not nudges_sent.
+    assert saved["watches"][0]["nudges_sent"] == 0
+    assert saved["watches"][0]["last_checked"] is not None
+    assert saved["watches"][0]["deadline"] != "2026-08-07"
+
+
+def test_run_daily_quiet_day_sends_nothing(monkeypatch, fue_files):
+    fue._save_registry({"watches": [_watch_in_registry(deadline="2026-12-31")]})
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    sent = _sendmail_capture(monkeypatch)
+    out = fue.run_daily()
+    assert out["reports"] == 0 and sent == []
+    assert fue.read_status()["reports"] == 0
+
+
+def test_run_daily_escalation_ccs_alert(monkeypatch, fue_files):
+    fue._save_registry({"watches": [
+        _watch_in_registry(deadline="2026-08-07", nudges_sent=3)]})
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    sent = _sendmail_capture(monkeypatch)
+    fue.run_daily()
+    addrs = [r["emailAddress"]["address"]
+             for r in sent[0]["message"]["toRecipients"]]
+    assert addrs == ["dan@negevlabs.com", fue.ALERT_CC]
+
+
+def test_run_daily_dry_run_persists_nothing(monkeypatch, fue_files):
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    fue._save_registry({"watches": [_watch_in_registry(deadline="2026-08-07")]})
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    sent = _sendmail_capture(monkeypatch)
+    out = fue.run_daily(dry_run=True)
+    assert out["reports"] == 1 and sent == []           # counted, not sent
+    saved = fue._load_registry()["watches"][0]
+    assert saved["nudges_sent"] == 0  # not persisted
+    # MUTATION-TESTING FINDING (report-worthy): nudges_sent alone is a
+    # WEAK witness for "the registry was not saved" -- process_deadlines
+    # never touches nudges_sent under dry_run regardless of whether the
+    # result gets persisted, so this assertion passes identically whether
+    # or not `if not dry_run: _save_registry(reg)` is even there.
+    # check_replies, by contrast, has NO dry_run parameter of its own and
+    # unconditionally sets last_checked on the in-memory watch on every
+    # call -- so it is last_checked, not nudges_sent, that actually proves
+    # the save was skipped: reverting the registry-save guard to
+    # unconditional reproduces a real timestamp here even under
+    # dry_run=True (confirmed by deliberately reintroducing that mutation
+    # and rerunning this test -- see task-7-report.md).
+    assert saved["last_checked"] is None  # untouched on disk
+
+
+def test_status_summary_shape(fue_files):
+    fue._save_registry({"watches": [_watch_in_registry()]})
+    fue._write_status({"reports": 0})
+    s = fue.status_summary()
+    assert s["last_run"] == {"reports": 0}
+    assert s["watches"][0]["ask"] == "investigation status"
+    assert "conversation_id" not in s["watches"][0]  # trimmed view
+
+
+# Task 7 self-review additions -- carry-forward confirmations (dry-run must
+# write NOTHING, including the status file) and explicit mutation-tested
+# coverage for the per-owner grouping isolation, the exhausted rendering,
+# and the "nothing happened -> no email" rule's more interesting flip side
+# (nothing NEW happened, but something is still unsent). See
+# task-7-report.md for the mutation-testing narrative these back up.
+
+
+def test_run_daily_dry_run_does_not_touch_status_file(monkeypatch, fue_files):
+    # CARRY-FORWARD (must-satisfy #1, status-file half): a dry run must be
+    # safe to invoke at any time against live state and persist NOTHING --
+    # the brief's own Step 3 code calls _write_status(result)
+    # UNCONDITIONALLY, which would let a dry-run preview silently clobber
+    # the last REAL run's recorded outcome. Seed a "real" status first so a
+    # regression has something to clobber, then prove a dry run leaves it
+    # byte-identical.
+    fue._write_status({"reports": 999, "marker": "prior-real-run"})
+    fue._save_registry({"watches": [_watch_in_registry(deadline="2026-08-07")]})
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    _sendmail_capture(monkeypatch)
+    fue.run_daily(dry_run=True)
+    assert fue.read_status() == {"reports": 999, "marker": "prior-real-run"}
+
+
+def test_run_daily_per_owner_report_excludes_other_owners_content(monkeypatch, fue_files):
+    # SELF-REVIEW: "would an owner ever see another owner's watches in
+    # their report?" -- a real risk in a per-owner grouping loop, and
+    # there are TWO independent filters that could leak (the events list
+    # and the unsent list), so this exercises both, each with its own
+    # DISTINCT, uniquely-markered ask text (unlike the brief's own
+    # per-owner test, which uses the same default ask for both watches and
+    # so cannot tell a leak from a coincidence). MUTATION-TESTED (see
+    # task-7-report.md): a prior version of this test carried no unsent
+    # items at all and passed unchanged even with the `un = [u for u in
+    # unsent if u["owner"] == owner]` filter deleted outright -- a real
+    # gap, closed by giving each owner their own stale unsent draft too.
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    dan_event = _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+                                   ask="Dan's would-draft ask", deadline="2026-08-07")
+    ka_event = _watch_in_registry(owner="ka@negevlabs.com", mailbox="ka@negevlabs.com",
+                                  ask="Ka's would-draft ask", deadline="2026-08-07")
+    dan_unsent = _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+                                    ask="Dan's stale unsent ask", deadline="2026-12-31")
+    dan_unsent["drafts"] = [{"message_id": "d-dan-old", "web_link": "https://outlook.example/d-dan",
+                             "created": "2026-08-01T00:00:00Z", "sent": False}]
+    ka_unsent = _watch_in_registry(owner="ka@negevlabs.com", mailbox="ka@negevlabs.com",
+                                   ask="Ka's stale unsent ask", deadline="2026-12-31")
+    ka_unsent["drafts"] = [{"message_id": "d-ka-old", "web_link": "https://outlook.example/d-ka",
+                            "created": "2026-08-01T00:00:00Z", "sent": False}]
+    fue._save_registry({"watches": [dan_event, ka_event, dan_unsent, ka_unsent]})
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+
+    def _graph_get_router(url, params=None):
+        if url.endswith("/messages"):
+            return {"value": []}  # check_replies: no new thread messages
+        return {"id": url.rsplit("/", 1)[-1], "isDraft": True}  # sweep_unsent per-draft check
+    monkeypatch.setattr(eps, "graph_get", _graph_get_router)
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    sent = _sendmail_capture(monkeypatch)
+    fue.run_daily()
+    assert len(sent) == 2
+    by_owner = {s["message"]["toRecipients"][0]["emailAddress"]["address"]:
+                s["message"]["body"]["content"] for s in sent}
+    assert "Dan's would-draft ask" in by_owner["dan@negevlabs.com"]
+    assert "Dan's stale unsent ask" in by_owner["dan@negevlabs.com"]
+    assert "Ka's would-draft ask" not in by_owner["dan@negevlabs.com"]
+    assert "Ka's stale unsent ask" not in by_owner["dan@negevlabs.com"]
+    assert "Ka's would-draft ask" in by_owner["ka@negevlabs.com"]
+    assert "Ka's stale unsent ask" in by_owner["ka@negevlabs.com"]
+    assert "Dan's would-draft ask" not in by_owner["ka@negevlabs.com"]
+    assert "Dan's stale unsent ask" not in by_owner["ka@negevlabs.com"]
+
+
+def test_run_daily_sends_report_for_unsent_only_no_new_events(monkeypatch, fue_files):
+    # Flip side of "nothing happened -> no email": nothing NEW happened
+    # this run (deadline far in the future, no replies), but an earlier
+    # draft is still sitting unsent -- spec step 4 requires it be reported
+    # "daily until sent or cancelled", so a report must still go out with
+    # zero new events.
+    w = _watch_in_registry(deadline="2026-12-31")
+    w["drafts"] = [{"message_id": "d-old", "web_link": "https://outlook.example/d-old",
+                     "created": "2026-08-01T00:00:00Z", "sent": False}]
+    fue._save_registry({"watches": [w]})
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+
+    def _graph_get_router(url, params=None):
+        if url.endswith("/messages"):
+            return {"value": []}  # check_replies: no new thread messages
+        return {"id": "d-old", "isDraft": True}  # sweep_unsent's per-draft check
+    monkeypatch.setattr(eps, "graph_get", _graph_get_router)
+    sent = _sendmail_capture(monkeypatch)
+    out = fue.run_daily()
+    assert out["reports"] == 1 and len(sent) == 1
+    body = sent[0]["message"]["body"]["content"]
+    assert "Still unsent" in body
+    assert "https://outlook.example/d-old" in body
+    assert "2026-08-01" in body
+
+
+def test_run_daily_alert_cc_not_duplicated_when_owner_is_alert_cc(monkeypatch, fue_files):
+    # Edge case in the CC logic the brief's own test does not reach: if
+    # the owner IS FOLLOWUP_ALERT_CC, the escalation must not add a
+    # duplicate recipient.
+    fue._save_registry({"watches": [
+        _watch_in_registry(owner=fue.ALERT_CC, mailbox=fue.ALERT_CC,
+                           deadline="2026-08-07", nudges_sent=3)]})
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    sent = _sendmail_capture(monkeypatch)
+    fue.run_daily()
+    addrs = [r["emailAddress"]["address"] for r in sent[0]["message"]["toRecipients"]]
+    assert addrs == [fue.ALERT_CC]  # not [ALERT_CC, ALERT_CC]
+
+
+def test_run_daily_send_failure_for_one_owner_does_not_block_others(monkeypatch, fue_files):
+    reg = {"watches": [
+        _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+                           deadline="2026-08-07"),
+        _watch_in_registry(owner="ka@negevlabs.com", mailbox="ka@negevlabs.com",
+                           deadline="2026-08-07"),
+    ]}
+    fue._save_registry(reg)
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 7))
+    monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": []})
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    sent = []
+    def _post(url, json_body):
+        if url.endswith("/sendMail"):
+            to_addr = json_body["message"]["toRecipients"][0]["emailAddress"]["address"]
+            if to_addr == "dan@negevlabs.com":
+                raise RuntimeError("simulated Graph 503")
+            sent.append(json_body)
+            return {}
+        if url.endswith("/createReplyAll"):
+            return {"id": "d1", "webLink": "https://outlook.example/d1"}
+        return {}
+    monkeypatch.setattr(eps, "graph_post", _post)
+    monkeypatch.setattr(eps, "graph_patch", lambda url, json_body: {})
+    monkeypatch.setattr(eps, "graph_delete", lambda url: {})
+    out = fue.run_daily()
+    assert out["reports"] == 1  # only ka@ succeeded
+    assert len(sent) == 1
+    assert sent[0]["message"]["toRecipients"][0]["emailAddress"]["address"] == "ka@negevlabs.com"
+
+
+def test_build_report_renders_all_section_headings():
+    # CARRY-FORWARD (must-satisfy #3): build_report must actually RENDER
+    # the exhausted event type (not just compute it) -- and, more broadly,
+    # every section the spec's step 4 promises (new drafts, report-only
+    # woulds, replies of both verdicts, escalations, still-unsent). None
+    # of the brief's own given tests exercise the replies/exhausted/unsent
+    # sections at the build_report level at all.
+    events = [
+        {"type": "draft", "owner": "dan@negevlabs.com", "watch_id": "fw_draft001",
+         "ask": "draft ask", "recipients": ["cro@example.com"], "body": "<p>d</p>",
+         "web_link": "https://outlook.example/draft1", "escalation": 1},
+        {"type": "would_draft", "owner": "dan@negevlabs.com", "watch_id": "fw_would001",
+         "ask": "would ask", "recipients": ["cro@example.com"], "body": "<p>w</p>",
+         "escalation": 1},
+        {"type": "reply_answered", "owner": "dan@negevlabs.com", "watch_id": "fw_ans0001",
+         "ask": "answered ask", "who": "cro@example.com", "when": "2026-08-06T09:00:00Z"},
+        {"type": "reply_paused", "owner": "dan@negevlabs.com", "watch_id": "fw_pau0001",
+         "ask": "paused ask", "who": "cro@example.com", "when": "2026-08-06T09:00:00Z"},
+        {"type": "exhausted", "owner": "dan@negevlabs.com", "watch_id": "fw_exh0001",
+         "ask": "exhausted ask", "recipients": ["cro@example.com"], "escalation": 3},
+    ]
+    unsent = [{"owner": "dan@negevlabs.com", "watch_id": "fw_uns0001", "ask": "unsent ask",
+               "web_link": "https://outlook.example/old", "created": "2026-08-01T00:00:00Z"}]
+    out = fue.build_report("dan@negevlabs.com", events, unsent)
+    assert "New reminder drafts" in out and "fw_draft001" in out
+    assert "report-only" in out.lower() and "fw_would001" in out
+    assert "Replies detected" in out
+    assert "fw_ans0001" in out and "answered -- watch closed" in out
+    assert "fw_pau0001" in out and "did not answer" in out
+    assert "Escalations" in out and "fw_exh0001" in out and "3 reminders went unanswered" in out
+    assert "Still unsent" in out and "fw_uns0001" in out and "2026-08-01" in out
+
+
+def test_build_report_escapes_counterparty_controlled_text():
+    # Global constraint: HTML built here is emailed to a human, so anything
+    # that came from a counterparty (subjects, ask text, names) must be
+    # escaped -- a malformed subject/ask must not break or inject into the
+    # report.
+    events = [{"type": "would_draft", "owner": "dan@negevlabs.com", "watch_id": "fw_xss0001",
+               "ask": "<script>evil()</script>", "recipients": ["<img src=x onerror=alert(1)>"],
+               "body": "<p>safe</p>", "escalation": 1}]
+    out = fue.build_report("dan@negevlabs.com", events, [])
+    assert "<script>evil()</script>" not in out
+    assert "&lt;script&gt;" in out
+    assert "<img src=x onerror=alert(1)>" not in out
+
+
+def test_send_email_exempt_call_is_locked_down():
+    # Companion to the narrowed static guard (test_create_draft_and_
+    # module_never_call_send above): pins the ONE permitted sendMail call
+    # down tight enough that it cannot be repurposed later to reach a
+    # counterparty or send an existing draft. Fixed to SARA_MAILBOX
+    # (Sara's own inbox, i.e. BOT_SENDER_EMAIL) and reachable only via a
+    # recipient list, subject, and body -- no mailbox/watch/draft-id
+    # parameter for a future edit to plug an owner-mailbox or draft id
+    # into.
+    import inspect
+    params = list(inspect.signature(fue._send_email).parameters)
+    assert params == ["to_list", "subject", "html_body"]
+
+    src = inspect.getsource(fue._send_email).lower()
+    assert "sendmail" in src
+    assert "/users/{sara_mailbox}/sendmail" in src  # Sara's own mailbox, never a per-watch one
+    for reachable_via_state in ("draft_id", "message_id", "['mailbox']", '["mailbox"]',
+                                ".get(\"mailbox\")", ".get('mailbox')", "/messages/"):
+        assert reachable_via_state not in src, (
+            f"_send_email must not be reachable via {reachable_via_state!r}")
+
+
+def test_main_default_runs_check_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fue, "run_intake", lambda dry_run=False: calls.append(("intake", dry_run)) or {})
+    monkeypatch.setattr(fue, "run_daily", lambda dry_run=False: calls.append(("check", dry_run)) or {})
+    monkeypatch.setattr("sys.argv", ["followup_engine.py"])
+    fue.main()
+    assert calls == [("check", False)]
+
+
+def test_main_intake_only_flag_skips_check(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fue, "run_intake", lambda dry_run=False: calls.append(("intake", dry_run)) or {})
+    monkeypatch.setattr(fue, "run_daily", lambda dry_run=False: calls.append(("check", dry_run)) or {})
+    monkeypatch.setattr("sys.argv", ["followup_engine.py", "--intake", "--dry-run"])
+    fue.main()
+    assert calls == [("intake", True)]
+
+
+def test_main_intake_and_check_flags_run_both(monkeypatch):
+    calls = []
+    monkeypatch.setattr(fue, "run_intake", lambda dry_run=False: calls.append(("intake", dry_run)) or {})
+    monkeypatch.setattr(fue, "run_daily", lambda dry_run=False: calls.append(("check", dry_run)) or {})
+    monkeypatch.setattr("sys.argv", ["followup_engine.py", "--intake", "--check"])
+    fue.main()
+    assert calls == [("intake", False), ("check", False)]
