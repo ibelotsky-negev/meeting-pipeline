@@ -778,6 +778,79 @@ def test_run_intake_targetless_command_that_is_really_a_registration_still_regis
     assert "Registered 2 follow-up watch" in body
 
 
+def test_run_intake_subject_id_from_a_non_owner_acts_on_nothing(monkeypatch, fue_files):
+    # DEFECT 2 (cross-owner). RESTORES the guard the deleted _owns_watch
+    # provided, on the path that now carries the risk. FOLLOWUP_ALERT_CC
+    # (bk@negevlabs.com by default) is CC'd on every escalation report, and
+    # those subjects name the OWNER's watch ids -- so a CC'd teammate
+    # replying "Done, thanks!" cancelled someone else's watch. Silently:
+    # the confirmation createReply's to the CC, not the owner. And
+    # permanently: a cancelled watch is skipped by check_replies,
+    # process_deadlines and sweep_unsent, so it just vanishes from the
+    # owner's reports.
+    w = _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@negevlabs.com")
+    fue._save_registry({"watches": [w]})
+    subject = "RE: " + fue._report_subject(1, 0, date(2026, 8, 7), [w["id"]])
+    replies = _report_reply_world(monkeypatch, "Done, thanks!",
+                                  sender="ka@negevlabs.com", subject=subject)
+    out = fue.run_intake()
+    assert out["commands"] == 0 and out["failures"] == 0 and out["outcomes"] == []
+    assert fue._load_registry()["watches"][0]["status"] == "active"
+    # Silently ignored, by choice: no unsolicited reply to a CC who never
+    # asked for one, and NOT marked processed -- this inbox is shared, so
+    # a message that is not ours stays untouched for its real handler.
+    assert replies == []
+    assert fue._load_processed() == set()
+
+
+def test_run_intake_subject_id_from_the_real_owner_still_cancels(monkeypatch, fue_files):
+    # The other half of the ownership check: scoping subject ids to the
+    # sender's own watches must not cost the OWNER their report reply --
+    # including when they reply from the @palomar-labs.com alias, which
+    # config.normalize_team_email resolves to the canonical owner.
+    w = _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@negevlabs.com")
+    fue._save_registry({"watches": [w]})
+    subject = "RE: " + fue._report_subject(1, 0, date(2026, 8, 7), [w["id"]])
+    replies = _report_reply_world(monkeypatch, "Done, thanks!",
+                                  sender="dan@palomar-labs.com", subject=subject)
+    out = fue.run_intake()
+    assert out["commands"] == 1 and out["failures"] == 0
+    assert fue._load_registry()["watches"][0]["status"] == "cancelled"
+    assert len(replies) == 1 and w["id"] in replies[0][1]
+
+
+def test_run_intake_typed_body_id_still_acts_across_owners(monkeypatch, fue_files):
+    # Deliberately UNCHANGED: an id the sender TYPED is a deliberate act,
+    # and acting on another owner's watch through it is accepted,
+    # documented behavior. Only the ids Sara injects into a report SUBJECT
+    # -- which ride on every reply, unasked for -- are ownership-scoped.
+    w = _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@negevlabs.com")
+    fue._save_registry({"watches": [w]})
+    replies = _report_reply_world(monkeypatch, f"stop {w['id']} please",
+                                  sender="ka@negevlabs.com", subject="RE: registered")
+    out = fue.run_intake()
+    assert out["commands"] == 1
+    assert fue._load_registry()["watches"][0]["status"] == "cancelled"
+    assert len(replies) == 1
+
+
+def test_owns_watch_matches_owner_mailbox_and_alias():
+    # RESTORED with _owns_watch itself (DEFECT 2). Deleting this unit test
+    # and test_run_intake_bare_stop_lists_only_the_senders_own_watches left
+    # cross-owner targeting with no guard at all, which is how a subject id
+    # came to act on another owner's watch.
+    w = _watch_in_registry(owner="dan@negevlabs.com", mailbox="dan@negevlabs.com")
+    assert fue._owns_watch(w, "dan@negevlabs.com")
+    assert fue._owns_watch(w, "DAN@negevlabs.com")
+    assert fue._owns_watch(w, "dan@palomar-labs.com")     # alias -> canonical
+    assert not fue._owns_watch(w, "ka@negevlabs.com")
+    assert not fue._owns_watch(w, "")
+    # A forward sent from an alias address stores the RAW sender as mailbox.
+    aliased = _watch_in_registry(owner="dan@negevlabs.com",
+                                 mailbox="dan@palomar-labs.com")
+    assert fue._owns_watch(aliased, "dan@palomar-labs.com")
+
+
 def test_run_intake_registration_replied_into_a_report_thread_still_registers(monkeypatch, fue_files):
     # DEFECT 1 (ordering): the SUBJECT-id resolution ran ABOVE the trigger
     # and is_request gates, so a genuine NEW registration sent as a REPLY

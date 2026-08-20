@@ -532,6 +532,29 @@ def _failure_html(reason: str) -> str:
             "exact subject and who should reply.</p>")
 
 
+def _owns_watch(watch: dict, sender: str) -> bool:
+    """Does this sender own this watch? RESTORED (with the helper's
+    original matching rules) to scope SUBJECT-derived command targets to
+    the sender's OWN watches. FOLLOWUP_ALERT_CC is CC'd on every
+    escalation report and those subjects name the OWNER's watch ids, so
+    without this a CC'd teammate's "Done, thanks!" cancelled another
+    owner's watch -- silently, since the confirmation replies to the CC
+    rather than the owner, and permanently, since a cancelled watch is
+    then skipped by check_replies, process_deadlines and sweep_unsent.
+    Matches the canonical owner, the raw mailbox the forward came from,
+    and an alias address resolved through config.normalize_team_email."""
+    s = (sender or "").strip().lower()
+    if not s:
+        return False
+    known = {(watch.get("owner") or "").strip().lower(),
+             (watch.get("mailbox") or "").strip().lower()}
+    known.discard("")
+    if s in known:
+        return True
+    norm = (config.normalize_team_email(sender) or "").strip().lower()
+    return bool(norm) and norm in known
+
+
 def _handle_subject_command(reg: dict, msg: dict, sender: str, cmd: str,
                             dry_run: bool):
     """Act on the watch ids the daily report carries in its SUBJECT.
@@ -546,13 +569,28 @@ def _handle_subject_command(reg: dict, msg: dict, sender: str, cmd: str,
     different and stay resolved up front: typing one is a deliberate act,
     while the subject's list rides on every reply to a report.
 
+    Scoped to watches the sender OWNS (_owns_watch), unlike a typed body
+    id: a subject id is one WE put there, and it rides on every reply to
+    that report -- including the escalation reports FOLLOWUP_ALERT_CC is
+    CC'd on, whose subjects name the OWNER's ids. Cross-owner action
+    through a typed id stays allowed and documented; it must not ride
+    along in a subject the sender never chose.
+
     Returns the outcome to record, or None when the subject names no id at
     all -- in which case the caller leaves the message exactly as it found
     it, since this inbox is shared."""
     ids = set(_WATCH_ID_RE.findall(msg.get("subject") or ""))
     if not ids:
         return None
-    watches = [w for w in (reg.get("watches") or []) if w["id"] in ids]
+    known = [w for w in (reg.get("watches") or []) if w["id"] in ids]
+    watches = [w for w in known if _owns_watch(w, sender)]
+    if known and not watches:
+        # The subject named a real watch, just not this sender's. Ignore
+        # it in silence -- the shared-mailbox-safe default. A reply here
+        # would be unsolicited mail to someone who only ever got CC'd, and
+        # it would leak another owner's watch to them; and the watch's
+        # real owner is not on this thread to be told anything anyway.
+        return None
     if not watches:
         return {"from": sender, "kind": "unknown_watch_id"}
     changed = [] if dry_run else _apply_command(reg, watches, cmd)

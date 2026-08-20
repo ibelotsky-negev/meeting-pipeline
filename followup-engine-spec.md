@@ -80,7 +80,10 @@ the subject's ids ride on every reply while a typed id is deliberate. It
 is also resolved LAST -- only once the trigger gate and the parser have
 established the message is not a registration -- so a genuine
 registration replied into a report thread still registers instead of
-being swallowed as a command.
+being swallowed as a command; and it acts only on watches the SENDER
+OWNS, since escalation report subjects reach `FOLLOWUP_ALERT_CC` too. A
+subject id naming someone else's watch is ignored in silence. A typed
+body id still acts cross-owner: typing one is deliberate.
 Targets: named ids, else all watches registered from that intake
 conversation. Confirmed by reply. A command with NEITHER -- no id in body
 or subject, no matching intake conversation -- is NOT a request: no reply,

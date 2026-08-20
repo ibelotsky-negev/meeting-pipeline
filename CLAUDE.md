@@ -518,7 +518,16 @@ share it.
   otherwise a real registration replied INTO a report thread ("Keep on
   top of this: follow up with Vimta...") is read as a command, answered
   "Done: resume applied to no eligible watches", and marked processed,
-  losing the ask. Targets: named `fw_` ids, else all watches from
+  losing the ask. A SUBJECT id is also OWNERSHIP-SCOPED (`_owns_watch`:
+  canonical owner, raw forwarding mailbox, or alias via
+  `config.normalize_team_email`): `FOLLOWUP_ALERT_CC` is CC'd on every
+  escalation report and those subjects name the OWNER's ids, so without
+  it a CC'd teammate's "Done, thanks!" cancelled someone else's watch --
+  silently (the confirmation replies to the CC) and invisibly (a
+  cancelled watch drops out of the owner's reports). A subject id naming
+  a watch the sender does not own is IGNORED IN SILENCE, never answered.
+  A typed BODY id is unchanged and may still act cross-owner: typing one
+  is deliberate. Targets: named `fw_` ids, else all watches from
   that intake conversation. A command with NEITHER is NOT a request: no
   reply, no state write, nothing marked processed. (Through the previous
   fix wave it got a "which watch did you mean?" reply, which over-fired --
