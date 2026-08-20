@@ -854,6 +854,25 @@ def test_run_intake_unknown_subject_id_is_ignored_without_a_reply(monkeypatch, f
     assert fue._load_processed() == set()
 
 
+def test_run_intake_dry_run_subject_command_mutates_no_field(monkeypatch, fue_files):
+    # The dry-run invariant on the NEW path: _handle_subject_command
+    # reports the command it WOULD apply and touches nothing -- no status,
+    # no note, not even `updated` -- sends no reply, and marks nothing
+    # processed. Same shape as the body-id path
+    # (test_run_intake_dry_run_command_leaves_registry_untouched), pinned
+    # separately because it is a different function.
+    w = _watch_in_registry()
+    fue._save_registry({"watches": [w]})
+    subject = "RE: " + fue._report_subject(1, 0, date(2026, 8, 7), [w["id"]])
+    replies = _report_reply_world(monkeypatch, "stop", subject=subject)
+    out = fue.run_intake(dry_run=True)
+    assert out["commands"] == 1
+    saved = fue._load_registry()["watches"][0]
+    assert saved["status"] == "active"
+    assert saved["notes"] == [] and saved["updated"] == w["updated"]
+    assert replies == [] and fue._load_processed() == set()
+
+
 def test_owns_watch_matches_owner_mailbox_and_alias():
     # RESTORED with _owns_watch itself (DEFECT 2). Deleting this unit test
     # and test_run_intake_bare_stop_lists_only_the_senders_own_watches left
