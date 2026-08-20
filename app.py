@@ -3125,13 +3125,30 @@ _xte_trigger_lock = _threading.Lock()
 #  until FOLLOWUP_LIVE=1. The engine NEVER sends to a counterparty.
 # ======================================================================
 
-_followup_run_lock = _threading.Lock()
-_followup_intake_lock = _threading.Lock()
+# ONE lock for the WHOLE follow-up subsystem -- intake (every 15 min) and
+# the daily check (17:00) both do _load_registry -> mutate -> _save_registry
+# on the same followups.json, and last writer wins on the WHOLE document.
+# With the two independent trigger locks this section used to hold, an
+# intake save landing inside a daily run's window silently discarded the
+# new watch AFTER its owner had been told its id -- and in the other order
+# the daily run's entire update was lost, drafts[] included, so under LIVE a
+# draft sitting in an owner's mailbox was never recorded, sweep_unsent could
+# never surface it, and the un-consumed budget drafted it again next run.
+#
+# ACQUISITION ORDER: there is nothing to order. This is the only lock in
+# the subsystem, it is never held while acquiring another, and every
+# acquire is non-blocking -- so no nesting, no waiting, and no deadlock is
+# structurally possible. Contention SKIPS (cron) or 409s (route), which is
+# safe: a skipped intake marks nothing processed and retries in 15 minutes,
+# and a skipped daily check re-runs on its next tick with the deadline
+# arithmetic unchanged. test_followup_subsystem_exposes_exactly_one_lock
+# guards against an accidental re-split.
+_followup_lock = _threading.Lock()
 
 
 def followup_daily_run():
-    if not _followup_run_lock.acquire(blocking=False):
-        logger.info("[followup] daily run already in progress; skipping")
+    if not _followup_lock.acquire(blocking=False):
+        logger.info("[followup] another follow-up run is in progress; skipping daily run")
         return
     try:
         import followup_engine
@@ -3139,12 +3156,12 @@ def followup_daily_run():
     except Exception as e:
         logger.error(f"[followup] daily run failed: {e}", exc_info=True)
     finally:
-        _followup_run_lock.release()
+        _followup_lock.release()
 
 
 def followup_intake_run():
-    if not _followup_intake_lock.acquire(blocking=False):
-        logger.info("[followup] intake already in progress; skipping")
+    if not _followup_lock.acquire(blocking=False):
+        logger.info("[followup] another follow-up run is in progress; skipping intake")
         return
     try:
         import followup_engine
@@ -3152,7 +3169,7 @@ def followup_intake_run():
     except Exception as e:
         logger.error(f"[followup] intake run failed: {e}", exc_info=True)
     finally:
-        _followup_intake_lock.release()
+        _followup_lock.release()
 
 
 def _followup_route(lock, fn_name, dry_run, sync):
@@ -3165,6 +3182,8 @@ def _followup_route(lock, fn_name, dry_run, sync):
     # pattern. Async previously acquired inside _bg(), so a busy lock (e.g.
     # the paired cron job already running) still returned 200 "started" while
     # the background thread quietly did nothing. Now both paths 409 alike.
+    # The lock passed in is always _followup_lock -- see its comment above
+    # for why intake and the daily check must not run concurrently.
     if not lock.acquire(blocking=False):
         logger.info(f"[followup] {fn_name} already in progress; refusing trigger")
         return jsonify({"status": "already_running"}), 409
@@ -3200,20 +3219,27 @@ def _followup_route(lock, fn_name, dry_run, sync):
 def followup_run_route():
     dry_run = request.args.get("dry_run", "").lower() in ("1", "true")
     sync = request.args.get("sync", "").lower() in ("1", "true")
-    return _followup_route(_followup_run_lock, "run_daily", dry_run, sync)
+    return _followup_route(_followup_lock, "run_daily", dry_run, sync)
 
 
 @app.route("/followup/intake", methods=["GET", "POST"])
 def followup_intake_route():
     dry_run = request.args.get("dry_run", "").lower() in ("1", "true")
     sync = request.args.get("sync", "").lower() in ("1", "true")
-    return _followup_route(_followup_intake_lock, "run_intake", dry_run, sync)
+    return _followup_route(_followup_lock, "run_intake", dry_run, sync)
 
 
 @app.route("/followup/status")
 def followup_status_route():
     import followup_engine
-    return jsonify(followup_engine.status_summary())
+    try:
+        return jsonify(followup_engine.status_summary())
+    except followup_engine.RegistryUnreadable as e:
+        # The registry was unusable; the engine has preserved it aside and
+        # refused to invent state. Report that rather than 500ing blank --
+        # this endpoint is how the failure gets diagnosed.
+        logger.error(f"[followup] status: {e}")
+        return jsonify({"status": "registry_unreadable", "error": str(e)}), 500
 
 
 @app.route("/transcribe-email/run", methods=["GET", "POST"])

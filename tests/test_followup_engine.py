@@ -72,9 +72,76 @@ def test_new_watch_interval_days_zero_vs_none():
     assert w_none["interval_days"] == fue.FOLLOWUP_DEFAULT_BUSINESS_DAYS
 
 
-def test_registry_corrupt_file_degrades_empty(fue_files, tmp_path):
+def test_load_registry_preserves_corrupt_file_and_fails_loudly(fue_files, tmp_path):
+    # REPLACES test_registry_corrupt_file_degrades_empty (final review,
+    # finding 1). That test pinned the DEFECT: a JSONDecodeError silently
+    # became {"watches": []}, and the very next _save_registry wrote that
+    # empty document back over the real file -- total, silent registry
+    # loss. The new contract: preserve the unreadable bytes next to the
+    # registry and raise, so nothing overwrites state that a human can
+    # still recover.
     (tmp_path / "followups.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(fue.RegistryUnreadable):
+        fue._load_registry()
+    assert not (tmp_path / "followups.json").exists()
+    aside = list(tmp_path.glob("followups.corrupt-*.json"))
+    assert len(aside) == 1
+    assert aside[0].read_text(encoding="utf-8") == "{not json"  # bytes preserved
+    # Having quarantined the bad file, the pilot self-heals into a clean
+    # (empty) registry rather than wedging every 15 minutes forever.
     assert fue._load_registry() == {"watches": []}
+
+
+def test_load_registry_rejects_non_dict_document(fue_files, tmp_path):
+    # A JSON document that parses but is not an object would previously
+    # reach data.setdefault(...) outside the try and blow up with an
+    # AttributeError; it is the same "unusable file" class and gets the
+    # same preserve-and-raise treatment.
+    (tmp_path / "followups.json").write_text("[1, 2, 3]", encoding="utf-8")
+    with pytest.raises(fue.RegistryUnreadable):
+        fue._load_registry()
+    assert len(list(tmp_path.glob("followups.corrupt-*.json"))) == 1
+
+
+def test_save_registry_failure_leaves_previous_file_intact(monkeypatch, fue_files, tmp_path):
+    # Finding 1, second half: _save_registry used to open the LIVE path
+    # "w", truncating it before a single byte of the new document was
+    # written. Any failure mid-write (disk full, crash, serialization
+    # error) therefore left a truncated file -- which _load_registry then
+    # could not parse. Atomic write (temp sibling + os.replace) means a
+    # failed save leaves the previous registry byte-identical.
+    fue._save_registry({"watches": [_watch_in_registry()]})
+    good = (tmp_path / "followups.json").read_text(encoding="utf-8")
+
+    def _partial_then_boom(obj, fh, **kw):
+        fh.write('{"watches": [')          # a real half-written document
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(fue.json, "dump", _partial_then_boom)
+    fue._save_registry({"watches": []})    # swallowed + logged, as before
+    assert (tmp_path / "followups.json").read_text(encoding="utf-8") == good
+    assert list(tmp_path.glob("*.tmp")) == []   # no orphaned temp file left
+
+
+def test_save_registry_replaces_atomically(monkeypatch, fue_files, tmp_path):
+    # Pins the MECHANISM, not just the symptom: the live path is only ever
+    # reached through os.replace of a sibling temp file, never through a
+    # truncating open() on the path itself.
+    seen = []
+    real_replace = fue.os.replace
+
+    def _spy(src, dst):
+        seen.append((src, dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(fue.os, "replace", _spy)
+    fue._save_registry({"watches": [_watch_in_registry()]})
+    assert len(seen) == 1
+    src, dst = seen[0]
+    assert dst == fue.REGISTRY_PATH
+    assert src != fue.REGISTRY_PATH
+    assert fue.os.path.dirname(src) == fue.os.path.dirname(fue.REGISTRY_PATH)
+    assert fue._load_registry()["watches"][0]["ask"] == "investigation status"
 
 
 def test_processed_persist_and_dry_run(fue_files):
@@ -2237,8 +2304,8 @@ def test_followup_run_route_sync_dry_run_true(fue_files, monkeypatch):
     assert resp.status_code == 200
     assert resp.get_json() == {"status": "ok", "dry_run": True}
     assert seen["dry_run"] is True
-    assert app_module._followup_run_lock.acquire(timeout=5)
-    app_module._followup_run_lock.release()
+    assert app_module._followup_lock.acquire(timeout=5)
+    app_module._followup_lock.release()
 
 
 def test_followup_run_route_sync_defaults_to_live(fue_files, monkeypatch):
@@ -2257,8 +2324,8 @@ def test_followup_run_route_sync_defaults_to_live(fue_files, monkeypatch):
     resp = client.get("/followup/run?sync=1")
     assert resp.status_code == 200
     assert seen["dry_run"] is False
-    assert app_module._followup_run_lock.acquire(timeout=5)
-    app_module._followup_run_lock.release()
+    assert app_module._followup_lock.acquire(timeout=5)
+    app_module._followup_lock.release()
 
 
 def test_followup_run_route_async_runs_in_background(fue_files, monkeypatch):
@@ -2279,20 +2346,20 @@ def test_followup_run_route_async_runs_in_background(fue_files, monkeypatch):
     assert resp.get_json() == {"status": "started", "dry_run": True}
     assert ran.wait(timeout=5), "background followup run never executed"
     assert seen["dry_run"] is True
-    assert app_module._followup_run_lock.acquire(timeout=5)
-    app_module._followup_run_lock.release()
+    assert app_module._followup_lock.acquire(timeout=5)
+    app_module._followup_lock.release()
 
 
 def test_followup_run_route_refuses_concurrent_run(fue_files):
     import app as app_module
-    assert app_module._followup_run_lock.acquire(blocking=False)
+    assert app_module._followup_lock.acquire(blocking=False)
     try:
         client = app_module.app.test_client()
         resp = client.get("/followup/run?sync=1")
         assert resp.status_code == 409
         assert resp.get_json() == {"status": "already_running"}
     finally:
-        app_module._followup_run_lock.release()
+        app_module._followup_lock.release()
 
 
 def test_followup_run_route_sync_error_returns_500(fue_files, monkeypatch):
@@ -2308,8 +2375,8 @@ def test_followup_run_route_sync_error_returns_500(fue_files, monkeypatch):
     payload = resp.get_json()
     assert payload["status"] == "error"
     assert "boom" in payload["error"]
-    assert app_module._followup_run_lock.acquire(timeout=5)
-    app_module._followup_run_lock.release()
+    assert app_module._followup_lock.acquire(timeout=5)
+    app_module._followup_lock.release()
 
 
 def test_followup_intake_route_sync_calls_run_intake_not_run_daily(fue_files, monkeypatch):
@@ -2326,34 +2393,69 @@ def test_followup_intake_route_sync_calls_run_intake_not_run_daily(fue_files, mo
     assert "wrong_fn_called" not in seen
 
 
-def test_followup_intake_route_has_independent_lock_from_run_route(fue_files, monkeypatch):
-    """CLAUDE.md requires a trigger lock shared PER manual-route/scheduled-job
-    pair (the x-transcribe-email model) -- not one lock shared across both
-    followup routes, or intake would wedge behind a slow daily run."""
+def test_followup_intake_route_shares_one_lock_with_run_route(fue_files, monkeypatch):
+    """REPLACES test_followup_intake_route_has_independent_lock_from_run_route
+    (final review, finding 1). That test pinned INDEPENDENT trigger locks --
+    which is precisely what allowed followup_intake and followup_daily to
+    interleave _load_registry -> mutate -> _save_registry on the same
+    followups.json and lose each other's writes wholesale (last writer wins
+    on the whole document). The follow-up subsystem now has exactly ONE
+    lock, so a run already in progress makes the other trigger a clean 409
+    and run_intake is never entered at all. Skipping is safe by design: a
+    skipped intake marks nothing processed and the 15-minute interval job
+    retries it."""
     import app as app_module
     called = []
     monkeypatch.setattr(fue, "run_intake",
                          lambda dry_run=False: called.append(dry_run) or {"status": "ok"})
-    assert app_module._followup_run_lock.acquire(blocking=False)
+    assert app_module._followup_lock.acquire(blocking=False)
     try:
         client = app_module.app.test_client()
         resp = client.get("/followup/intake?sync=1")
-        assert resp.status_code == 200
-        assert called == [False]
+        assert resp.status_code == 409
+        assert resp.get_json() == {"status": "already_running"}
+        assert called == []          # registry never touched concurrently
     finally:
-        app_module._followup_run_lock.release()
+        app_module._followup_lock.release()
+
+
+def test_followup_subsystem_exposes_exactly_one_lock():
+    # Structural guard against an accidental re-split into two locks: the
+    # lost-update race is a property of HOW MANY locks exist, and a future
+    # edit adding a second one would silently reopen it.
+    import app as app_module
+    names = sorted(n for n in dir(app_module)
+                   if n.startswith("_followup") and "lock" in n.lower())
+    assert names == ["_followup_lock"]
+
+
+def test_followup_cron_jobs_share_the_single_subsystem_lock(fue_files, monkeypatch):
+    # The lost-update race ran between the 15-min intake JOB and the 17:00
+    # daily JOB, not only between the two manual routes -- so the same lock
+    # has to gate the cron wrappers too. Holding it must stop both.
+    import app as app_module
+    monkeypatch.setattr(fue, "run_intake",
+                        lambda dry_run=False: pytest.fail("intake ran while the lock was held"))
+    monkeypatch.setattr(fue, "run_daily",
+                        lambda dry_run=False: pytest.fail("daily ran while the lock was held"))
+    assert app_module._followup_lock.acquire(blocking=False)
+    try:
+        app_module.followup_intake_run()
+        app_module.followup_daily_run()
+    finally:
+        app_module._followup_lock.release()
 
 
 def test_followup_intake_route_refuses_concurrent_run(fue_files):
     import app as app_module
-    assert app_module._followup_intake_lock.acquire(blocking=False)
+    assert app_module._followup_lock.acquire(blocking=False)
     try:
         client = app_module.app.test_client()
         resp = client.get("/followup/intake?sync=1")
         assert resp.status_code == 409
         assert resp.get_json() == {"status": "already_running"}
     finally:
-        app_module._followup_intake_lock.release()
+        app_module._followup_lock.release()
 
 
 def test_followup_daily_run_calls_run_daily_when_lock_free(fue_files, monkeypatch):
@@ -2362,22 +2464,22 @@ def test_followup_daily_run_calls_run_daily_when_lock_free(fue_files, monkeypatc
     monkeypatch.setattr(fue, "run_daily", lambda dry_run=False: calls.append(dry_run))
     app_module.followup_daily_run()
     assert calls == [False]
-    assert app_module._followup_run_lock.acquire(timeout=5)
-    app_module._followup_run_lock.release()
+    assert app_module._followup_lock.acquire(timeout=5)
+    app_module._followup_lock.release()
 
 
 def test_followup_daily_run_skips_when_route_lock_held(fue_files, monkeypatch):
-    """Proves the cron job (followup_daily_run) shares _followup_run_lock
+    """Proves the cron job (followup_daily_run) shares _followup_lock
     with the manual /followup/run route, so a scheduled tick can never
     overlap a manual run."""
     import app as app_module
     calls = []
     monkeypatch.setattr(fue, "run_daily", lambda dry_run=False: calls.append(dry_run))
-    assert app_module._followup_run_lock.acquire(blocking=False)
+    assert app_module._followup_lock.acquire(blocking=False)
     try:
         app_module.followup_daily_run()
     finally:
-        app_module._followup_run_lock.release()
+        app_module._followup_lock.release()
     assert calls == []
 
 
@@ -2389,8 +2491,8 @@ def test_followup_daily_run_releases_lock_even_on_exception(fue_files, monkeypat
 
     monkeypatch.setattr(fue, "run_daily", boom)
     app_module.followup_daily_run()  # must not raise
-    assert app_module._followup_run_lock.acquire(timeout=5)
-    app_module._followup_run_lock.release()
+    assert app_module._followup_lock.acquire(timeout=5)
+    app_module._followup_lock.release()
 
 
 def test_followup_intake_run_calls_run_intake_when_lock_free(fue_files, monkeypatch):
@@ -2399,19 +2501,19 @@ def test_followup_intake_run_calls_run_intake_when_lock_free(fue_files, monkeypa
     monkeypatch.setattr(fue, "run_intake", lambda dry_run=False: calls.append(dry_run))
     app_module.followup_intake_run()
     assert calls == [False]
-    assert app_module._followup_intake_lock.acquire(timeout=5)
-    app_module._followup_intake_lock.release()
+    assert app_module._followup_lock.acquire(timeout=5)
+    app_module._followup_lock.release()
 
 
 def test_followup_intake_run_skips_when_lock_held(fue_files, monkeypatch):
     import app as app_module
     calls = []
     monkeypatch.setattr(fue, "run_intake", lambda dry_run=False: calls.append(dry_run))
-    assert app_module._followup_intake_lock.acquire(blocking=False)
+    assert app_module._followup_lock.acquire(blocking=False)
     try:
         app_module.followup_intake_run()
     finally:
-        app_module._followup_intake_lock.release()
+        app_module._followup_lock.release()
     assert calls == []
 
 
@@ -2427,7 +2529,7 @@ def test_followup_run_route_async_refuses_when_lock_held(fue_files, monkeypatch)
     import time
     calls = []
     monkeypatch.setattr(fue, "run_daily", lambda dry_run=False: calls.append(dry_run))
-    assert app_module._followup_run_lock.acquire(blocking=False)
+    assert app_module._followup_lock.acquire(blocking=False)
     try:
         client = app_module.app.test_client()
         resp = client.get("/followup/run?dry_run=1")  # no sync= -> async path
@@ -2436,7 +2538,7 @@ def test_followup_run_route_async_refuses_when_lock_held(fue_files, monkeypatch)
         assert body == {"status": "already_running"}
         assert body.get("status") != "started"
     finally:
-        app_module._followup_run_lock.release()
+        app_module._followup_lock.release()
     # No thread should have been spawned at all -- not just "hasn't run yet".
     time.sleep(0.05)
     assert calls == []
@@ -2457,8 +2559,8 @@ def test_followup_run_route_async_exception_still_releases_lock(fue_files, monke
     assert resp.status_code == 200
     assert resp.get_json() == {"status": "started", "dry_run": True}
     assert failed.wait(timeout=5), "background followup run never executed"
-    assert app_module._followup_run_lock.acquire(timeout=5)
-    app_module._followup_run_lock.release()
+    assert app_module._followup_lock.acquire(timeout=5)
+    app_module._followup_lock.release()
 
 
 def test_followup_run_route_async_thread_start_failure_releases_lock(fue_files, monkeypatch):
@@ -2478,5 +2580,5 @@ def test_followup_run_route_async_thread_start_failure_releases_lock(fue_files, 
     payload = resp.get_json()
     assert payload["status"] == "error"
     assert "thread start boom" in payload["error"]
-    assert app_module._followup_run_lock.acquire(timeout=5)
-    app_module._followup_run_lock.release()
+    assert app_module._followup_lock.acquire(timeout=5)
+    app_module._followup_lock.release()

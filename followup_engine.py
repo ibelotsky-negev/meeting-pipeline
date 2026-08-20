@@ -13,6 +13,7 @@ import json
 import html         # noqa: F401 -- consumed by later tasks (draft/report body escaping)
 import uuid
 import logging
+import tempfile
 from datetime import datetime, timedelta, timezone, date
 
 import email_pipeline_sync as eps      # noqa: F401 -- consumed by later tasks (Graph reuse)
@@ -68,26 +69,87 @@ def add_business_days(d: date, n: int) -> date:
 # ----------------------------------------------------------------------
 
 
+class RegistryUnreadable(RuntimeError):
+    """The registry file exists but cannot be used. Raised INSTEAD of
+    degrading to an empty registry: an empty return gets written straight
+    back over the real file by the very next _save_registry, so degrading
+    quietly turns one unreadable byte into permanent, silent loss of every
+    watch. The unreadable bytes are preserved beside the registry first, so
+    state stays recoverable by hand."""
+
+
+def _quarantine_registry(reason: str) -> RegistryUnreadable:
+    """Move an unusable registry aside and BUILD the error the caller
+    raises. Preserving beats both repairing and wedging: the original
+    document stays on disk for a human to restore from, the failure is
+    loud (ERROR log + the run aborts before touching state), and the next
+    load starts from a clean empty registry instead of failing every 15
+    minutes forever."""
+    root, ext = os.path.splitext(REGISTRY_PATH)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    aside = f"{root}.corrupt-{stamp}-{uuid.uuid4().hex[:6]}{ext or '.json'}"
+    try:
+        os.replace(REGISTRY_PATH, aside)
+        kept = aside
+    except Exception as move_err:
+        kept = None
+        logger.error(f"[followup] could not preserve unreadable registry: {move_err}")
+    logger.error(f"[followup] registry unusable ({reason}); original preserved at {kept}")
+    return RegistryUnreadable(f"{reason}; original preserved at {kept}")
+
+
 def _load_registry() -> dict:
+    """A MISSING file is the only condition that yields an empty registry --
+    that is a genuine first run. Anything else (unparseable JSON, a
+    permission error, a document whose root is not an object) is a file we
+    must not overwrite, so it is quarantined and raised. Callers are the
+    two run entrypoints and status_summary; app.py logs and reports the
+    failure instead of proceeding on invented state."""
     try:
         with open(REGISTRY_PATH, encoding="utf-8") as f:
             data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
         return {"watches": []}
     except Exception as e:
-        logger.warning(f"[followup] could not read registry ({e}); starting empty")
-        return {"watches": []}
+        raise _quarantine_registry(f"could not read registry ({e})") from e
+    if not isinstance(data, dict):
+        # Previously an AttributeError from the setdefault below, which sat
+        # outside the try (x_transcribe_email's safer isinstance guard was
+        # not followed here). Same class of unusable file, same treatment.
+        raise _quarantine_registry(
+            f"registry root is {type(data).__name__}, expected an object")
     data.setdefault("watches", [])
+    if not isinstance(data.get("watches"), list):
+        raise _quarantine_registry("registry 'watches' is not a list")
     return data
 
 
 def _save_registry(reg: dict):
+    """ATOMIC: serialize into a sibling temp file, then os.replace() it onto
+    the real path (atomic on POSIX and on Windows alike when both live in
+    the same directory). The previous in-place `open(path, "w")` TRUNCATED
+    the live registry before writing a single byte, so any failure mid-write
+    -- disk full, container kill, a serialization error -- left a truncated
+    document that _load_registry could not parse. A reader now never
+    observes a partial document, and a failed save leaves the previous
+    registry byte-identical."""
+    tmp = None
     try:
-        os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
-        with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+        directory = os.path.dirname(REGISTRY_PATH)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".followups-", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(reg, f, default=str, indent=2)
+        os.replace(tmp, REGISTRY_PATH)
+        tmp = None
     except Exception as e:
         logger.warning(f"[followup] could not write registry: {e}")
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _load_processed() -> set:
@@ -1072,6 +1134,13 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
+    # NOTE: the CLI runs in its OWN process and therefore does NOT share
+    # app.py's single _followup_lock. The registry save is atomic (a
+    # concurrent reader never sees a torn file), but a web-process run
+    # overlapping this one can still lose whichever update lands first.
+    # Run the CLI against a live /data volume only when the web process is
+    # idle -- or better, use /followup/run and /followup/intake, which take
+    # the lock.
     if args.intake:
         print(json.dumps(run_intake(dry_run=args.dry_run), indent=2, default=str))
     if args.check or not args.intake:
