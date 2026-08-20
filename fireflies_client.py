@@ -163,18 +163,22 @@ def fireflies_query(query: str, variables: dict = None) -> dict:
 def duration_to_minutes(raw) -> float:
     """Normalize the Fireflies 'duration' field to minutes.
 
-    The units are ambiguous in this codebase's history: this module treated
-    the field as MINUTES while the Weekly Pulse collector in app.py divided
-    it by 60 as SECONDS. Only one can be right, and neither was ever checked
-    against a real response -- the Pulse value only ever reached an LLM
-    prompt, where a 60x error is invisible.
+    The field is MINUTES -- confirmed against the live API on 2026-08-20 with
+    real samples: 48, 11.32, 53.25, 38.69, 72.08 (fractional, and matching the
+    meetings' actual lengths).
 
-    Rather than guess, normalize so both readings agree for any realistic
-    meeting: a value too large to be a plausible meeting length in minutes
-    can only be seconds, so it is converted. Small values stay minutes,
-    which at worst widens the poll window slightly -- harmless, because
-    already-processed transcripts are skipped by id. The result is clamped so
-    a mis-scaled value can never widen the window without bound.
+    That settles a contradiction that had sat in this codebase: this module
+    added the field as minutes, while the Weekly Pulse collector in app.py
+    divided it by 60 as SECONDS -- so a 48-minute meeting was described to
+    Claude as "1min". The Pulse side was the wrong one, and the error was
+    invisible because that value only ever reached an LLM prompt.
+
+    Deliberately does NOT try to detect seconds and rescale. Guessing that a
+    large value "must be" seconds would wrongly shrink a genuinely long
+    recording (a 12-hour session would become 12 minutes) and drop it from the
+    poll window -- the exact class of silent miss the end-time gate exists to
+    prevent. The clamp stays: it bounds the poll window if the API ever
+    returns a garbage value.
     """
     try:
         value = float(raw or 0)
@@ -182,8 +186,6 @@ def duration_to_minutes(raw) -> float:
         return 0.0
     if value <= 0:
         return 0.0
-    if value > MAX_MEETING_MINUTES:
-        value = value / 60.0
     return min(value, float(MAX_MEETING_MINUTES))
 
 

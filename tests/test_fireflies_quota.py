@@ -179,28 +179,35 @@ def test_corrupt_quota_file_is_treated_as_unblocked(quota_state):
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        (45, 45.0),            # plausible as minutes -> kept
-        (45.5, 45.5),
-        (2700, 45.0),          # only sensible as seconds -> converted
-        (5400, 90.0),          # 90 min meeting expressed in seconds
+        # Real values observed from the live API on 2026-08-20.
+        (48, 48.0),
+        (11.319999694824219, 11.319999694824219),
+        (53.25, 53.25),
+        (72.08000183105469, 72.08000183105469),
         (0, 0.0),
         (None, 0.0),
         ("", 0.0),
         ("bogus", 0.0),
         (-5, 0.0),             # never extend the window backwards
-        (10 ** 9, 600.0),      # clamped: a mis-scaled value cannot blow it open
+        (10 ** 9, 600.0),      # garbage is clamped, not rescaled
+        (2700, 600.0),         # 45 HOURS as minutes is garbage -> clamped
     ],
 )
 def test_duration_to_minutes(raw, expected):
-    """One normalizer, correct under BOTH historical readings of the field.
+    """The field is MINUTES, confirmed against live data on 2026-08-20.
 
-    app.py's Weekly Pulse collector divided `duration` by 60 (seconds) while
-    fireflies_client added it as minutes. Neither was ever validated against a
-    real response -- the Pulse value only ever reached an LLM prompt, where a
-    60x error is invisible. This resolves the contradiction rather than
-    guessing which side was right.
+    app.py's Weekly Pulse collector used to divide `duration` by 60 as SECONDS
+    while fireflies_client added it as minutes; the Pulse side was wrong, and
+    reported a 48-minute meeting to Claude as "1min". Both call sites now share
+    this normalizer.
     """
     assert fc.duration_to_minutes(raw) == expected
+
+
+def test_duration_is_never_rescaled_down():
+    """Guard against reintroducing a seconds-detection heuristic: a genuinely
+    long recording must not be shrunk 60x and dropped from the poll window."""
+    assert fc.duration_to_minutes(500) == 500.0
 
 
 def test_duration_clamp_bounds_the_poll_window():
