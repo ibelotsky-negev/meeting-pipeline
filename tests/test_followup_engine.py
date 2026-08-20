@@ -2197,3 +2197,219 @@ def test_main_intake_and_check_flags_run_both(monkeypatch):
     monkeypatch.setattr("sys.argv", ["followup_engine.py", "--intake", "--check"])
     fue.main()
     assert calls == [("intake", False), ("check", False)]
+
+
+def test_app_routes_registered():
+    import app as app_module
+    rules = {r.rule for r in app_module.app.url_map.iter_rules()}
+    assert {"/followup/run", "/followup/intake", "/followup/status"} <= rules
+
+
+def test_followup_status_route(fue_files):
+    import app as app_module
+    fue._write_status({"reports": 1})
+    client = app_module.app.test_client()
+    resp = client.get("/followup/status")
+    assert resp.status_code == 200
+    assert resp.get_json()["last_run"] == {"reports": 1}
+
+
+# ----------------------------------------------------------------------
+#  Task 8 self-review -- app.py route/job wiring: dry_run must never be
+#  silently ignored (the engine must default LIVE only from the cron
+#  wrapper, never from a route that forgot to read ?dry_run=), and the
+#  manual route must share its trigger lock with the matching scheduled
+#  job so a cron tick can never overlap a manual run (the 2.12.7-style
+#  duplicate-processing regression this project has already shipped once).
+# ----------------------------------------------------------------------
+
+def test_followup_run_route_sync_dry_run_true(fue_files, monkeypatch):
+    import app as app_module
+    seen = {}
+
+    def fake_run_daily(dry_run=False):
+        seen["dry_run"] = dry_run
+        return {"status": "ok", "dry_run": dry_run}
+
+    monkeypatch.setattr(fue, "run_daily", fake_run_daily)
+    client = app_module.app.test_client()
+    resp = client.get("/followup/run?sync=1&dry_run=1")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"status": "ok", "dry_run": True}
+    assert seen["dry_run"] is True
+    assert app_module._followup_run_lock.acquire(timeout=5)
+    app_module._followup_run_lock.release()
+
+
+def test_followup_run_route_sync_defaults_to_live(fue_files, monkeypatch):
+    """Safety-critical case: omitting ?dry_run must NOT be silently treated
+    as a dry run -- it must pass dry_run=False through, exactly like every
+    other trigger route in app.py (digest, biweekly, fyi, learn, xte)."""
+    import app as app_module
+    seen = {}
+
+    def fake_run_daily(dry_run=False):
+        seen["dry_run"] = dry_run
+        return {"status": "ok"}
+
+    monkeypatch.setattr(fue, "run_daily", fake_run_daily)
+    client = app_module.app.test_client()
+    resp = client.get("/followup/run?sync=1")
+    assert resp.status_code == 200
+    assert seen["dry_run"] is False
+    assert app_module._followup_run_lock.acquire(timeout=5)
+    app_module._followup_run_lock.release()
+
+
+def test_followup_run_route_async_runs_in_background(fue_files, monkeypatch):
+    import app as app_module
+    import threading
+    ran = threading.Event()
+    seen = {}
+
+    def fake_run_daily(dry_run=False):
+        seen["dry_run"] = dry_run
+        ran.set()
+        return {"status": "ok"}
+
+    monkeypatch.setattr(fue, "run_daily", fake_run_daily)
+    client = app_module.app.test_client()
+    resp = client.get("/followup/run?dry_run=1")
+    assert resp.status_code == 200
+    assert resp.get_json() == {"status": "started", "dry_run": True}
+    assert ran.wait(timeout=5), "background followup run never executed"
+    assert seen["dry_run"] is True
+    assert app_module._followup_run_lock.acquire(timeout=5)
+    app_module._followup_run_lock.release()
+
+
+def test_followup_run_route_refuses_concurrent_run(fue_files):
+    import app as app_module
+    assert app_module._followup_run_lock.acquire(blocking=False)
+    try:
+        client = app_module.app.test_client()
+        resp = client.get("/followup/run?sync=1")
+        assert resp.status_code == 409
+        assert resp.get_json() == {"status": "already-running"}
+    finally:
+        app_module._followup_run_lock.release()
+
+
+def test_followup_run_route_sync_error_returns_500(fue_files, monkeypatch):
+    import app as app_module
+
+    def boom(dry_run=False):
+        raise RuntimeError("graph 400: boom")
+
+    monkeypatch.setattr(fue, "run_daily", boom)
+    client = app_module.app.test_client()
+    resp = client.get("/followup/run?sync=1")
+    assert resp.status_code == 500
+    payload = resp.get_json()
+    assert payload["status"] == "error"
+    assert "boom" in payload["error"]
+    assert app_module._followup_run_lock.acquire(timeout=5)
+    app_module._followup_run_lock.release()
+
+
+def test_followup_intake_route_sync_calls_run_intake_not_run_daily(fue_files, monkeypatch):
+    import app as app_module
+    seen = {}
+    monkeypatch.setattr(fue, "run_daily",
+                         lambda dry_run=False: seen.setdefault("wrong_fn_called", True))
+    monkeypatch.setattr(fue, "run_intake",
+                         lambda dry_run=False: seen.update(dry_run=dry_run) or {"status": "ok"})
+    client = app_module.app.test_client()
+    resp = client.get("/followup/intake?sync=1&dry_run=1")
+    assert resp.status_code == 200
+    assert seen.get("dry_run") is True
+    assert "wrong_fn_called" not in seen
+
+
+def test_followup_intake_route_has_independent_lock_from_run_route(fue_files, monkeypatch):
+    """CLAUDE.md requires a trigger lock shared PER manual-route/scheduled-job
+    pair (the x-transcribe-email model) -- not one lock shared across both
+    followup routes, or intake would wedge behind a slow daily run."""
+    import app as app_module
+    called = []
+    monkeypatch.setattr(fue, "run_intake",
+                         lambda dry_run=False: called.append(dry_run) or {"status": "ok"})
+    assert app_module._followup_run_lock.acquire(blocking=False)
+    try:
+        client = app_module.app.test_client()
+        resp = client.get("/followup/intake?sync=1")
+        assert resp.status_code == 200
+        assert called == [False]
+    finally:
+        app_module._followup_run_lock.release()
+
+
+def test_followup_intake_route_refuses_concurrent_run(fue_files):
+    import app as app_module
+    assert app_module._followup_intake_lock.acquire(blocking=False)
+    try:
+        client = app_module.app.test_client()
+        resp = client.get("/followup/intake?sync=1")
+        assert resp.status_code == 409
+        assert resp.get_json() == {"status": "already-running"}
+    finally:
+        app_module._followup_intake_lock.release()
+
+
+def test_followup_daily_run_calls_run_daily_when_lock_free(fue_files, monkeypatch):
+    import app as app_module
+    calls = []
+    monkeypatch.setattr(fue, "run_daily", lambda dry_run=False: calls.append(dry_run))
+    app_module.followup_daily_run()
+    assert calls == [False]
+    assert app_module._followup_run_lock.acquire(timeout=5)
+    app_module._followup_run_lock.release()
+
+
+def test_followup_daily_run_skips_when_route_lock_held(fue_files, monkeypatch):
+    """Proves the cron job (followup_daily_run) shares _followup_run_lock
+    with the manual /followup/run route, so a scheduled tick can never
+    overlap a manual run."""
+    import app as app_module
+    calls = []
+    monkeypatch.setattr(fue, "run_daily", lambda dry_run=False: calls.append(dry_run))
+    assert app_module._followup_run_lock.acquire(blocking=False)
+    try:
+        app_module.followup_daily_run()
+    finally:
+        app_module._followup_run_lock.release()
+    assert calls == []
+
+
+def test_followup_daily_run_releases_lock_even_on_exception(fue_files, monkeypatch):
+    import app as app_module
+
+    def boom(dry_run=False):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(fue, "run_daily", boom)
+    app_module.followup_daily_run()  # must not raise
+    assert app_module._followup_run_lock.acquire(timeout=5)
+    app_module._followup_run_lock.release()
+
+
+def test_followup_intake_run_calls_run_intake_when_lock_free(fue_files, monkeypatch):
+    import app as app_module
+    calls = []
+    monkeypatch.setattr(fue, "run_intake", lambda dry_run=False: calls.append(dry_run))
+    app_module.followup_intake_run()
+    assert calls == [False]
+    assert app_module._followup_intake_lock.acquire(timeout=5)
+    app_module._followup_intake_lock.release()
+
+
+def test_followup_intake_run_skips_when_lock_held(fue_files, monkeypatch):
+    import app as app_module
+    calls = []
+    monkeypatch.setattr(fue, "run_intake", lambda dry_run=False: calls.append(dry_run))
+    assert app_module._followup_intake_lock.acquire(blocking=False)
+    try:
+        app_module.followup_intake_run()
+    finally:
+        app_module._followup_intake_lock.release()
+    assert calls == []

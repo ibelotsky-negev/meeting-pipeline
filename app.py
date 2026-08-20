@@ -3119,6 +3119,90 @@ def fyi_status():
 _xte_trigger_lock = _threading.Lock()
 
 
+# ======================================================================
+#  FOLLOW-UP ENGINE (pilot) -- silent-thread reminder drafts
+#  Spec: followup-engine-spec.md. Module imported lazily; report-only
+#  until FOLLOWUP_LIVE=1. The engine NEVER sends to a counterparty.
+# ======================================================================
+
+_followup_run_lock = _threading.Lock()
+_followup_intake_lock = _threading.Lock()
+
+
+def followup_daily_run():
+    if not _followup_run_lock.acquire(blocking=False):
+        logger.info("[followup] daily run already in progress; skipping")
+        return
+    try:
+        import followup_engine
+        followup_engine.run_daily()
+    except Exception as e:
+        logger.error(f"[followup] daily run failed: {e}", exc_info=True)
+    finally:
+        _followup_run_lock.release()
+
+
+def followup_intake_run():
+    if not _followup_intake_lock.acquire(blocking=False):
+        logger.info("[followup] intake already in progress; skipping")
+        return
+    try:
+        import followup_engine
+        followup_engine.run_intake()
+    except Exception as e:
+        logger.error(f"[followup] intake run failed: {e}", exc_info=True)
+    finally:
+        _followup_intake_lock.release()
+
+
+def _followup_route(lock, fn_name, dry_run, sync):
+    def _invoke():
+        import followup_engine
+        return getattr(followup_engine, fn_name)(dry_run=dry_run)
+    if sync:
+        if not lock.acquire(blocking=False):
+            return jsonify({"status": "already-running"}), 409
+        try:
+            return jsonify(_invoke())
+        except Exception as e:
+            logger.error(f"[followup] {fn_name} failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e)}), 500
+        finally:
+            lock.release()
+
+    def _bg():
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            _invoke()
+        except Exception as e:
+            logger.error(f"[followup] {fn_name} failed: {e}", exc_info=True)
+        finally:
+            lock.release()
+    _threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({"status": "started", "dry_run": dry_run})
+
+
+@app.route("/followup/run", methods=["GET", "POST"])
+def followup_run_route():
+    dry_run = request.args.get("dry_run", "").lower() in ("1", "true")
+    sync = request.args.get("sync", "").lower() in ("1", "true")
+    return _followup_route(_followup_run_lock, "run_daily", dry_run, sync)
+
+
+@app.route("/followup/intake", methods=["GET", "POST"])
+def followup_intake_route():
+    dry_run = request.args.get("dry_run", "").lower() in ("1", "true")
+    sync = request.args.get("sync", "").lower() in ("1", "true")
+    return _followup_route(_followup_intake_lock, "run_intake", dry_run, sync)
+
+
+@app.route("/followup/status")
+def followup_status_route():
+    import followup_engine
+    return jsonify(followup_engine.status_summary())
+
+
 @app.route("/transcribe-email/run", methods=["GET", "POST"])
 def transcribe_email_run():
     """Manually scan Sara's inbox for internal mail carrying x.com links and
@@ -3301,7 +3385,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.28.3-yt-retry", "deployed": "2026-08-17"})
+    return jsonify({"version": "2.29.0-followup-pilot", "deployed": "2026-08-20"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3339,7 +3423,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.28.3-yt-retry", "steps": {}}
+    results = {"version": "2.29.0-followup-pilot", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -4287,6 +4371,26 @@ def start_scheduler():
         minutes=int(os.environ.get("XTE_INTERVAL_MINUTES", "15")),
         id="x_transcribe_email",
         replace_existing=True,
+    )
+    # Follow-Up Engine: intake scan every 15min (registrations + commands);
+    # daily thread check 17:00 Asia/Jerusalem -- drafts land in time for an
+    # early-evening send that tops a CRO's next-morning inbox in India.
+    _scheduler.add_job(
+        followup_intake_run,
+        trigger="interval",
+        minutes=int(os.environ.get("FOLLOWUP_INTAKE_MINUTES", "15")),
+        id="followup_intake",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        followup_daily_run,
+        trigger="cron",
+        hour=int(os.environ.get("FOLLOWUP_HOUR", "17")),
+        minute=0,
+        timezone="Asia/Jerusalem",
+        id="followup_daily",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
     # Renewal job: every 45min, renews if expiry < 30min away (Graph max is 59min for this resource)
     _scheduler.add_job(
