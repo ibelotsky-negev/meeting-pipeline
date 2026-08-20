@@ -527,11 +527,21 @@ def _failure_html(reason: str) -> str:
 
 def _cap_failure_html(dropped: list) -> str:
     """Honest failure, never silence (this module's own rule): name EVERY
-    ask the watch cap dropped, and say how to free a slot."""
-    return _failure_html(
-        f"I am already watching the maximum of {FOLLOWUP_MAX_WATCHES} open follow-ups, "
-        f"so {len(dropped)} ask(s) were NOT registered: {'; '.join(dropped)}. "
-        f"Reply 'stop' with a finished watch's id to free a slot")
+    ask the watch cap dropped, and say how to free a slot.
+
+    FINDING 3 (final polish): does NOT delegate to _failure_html any more.
+    Two pieces of impossible advice went out with a cap failure: "Reply
+    'stop' with a FINISHED watch's id to free a slot" -- the same fix wave
+    stopped counting terminal watches toward the cap, so stopping a
+    finished watch frees nothing -- and _failure_html's inherited "Forward
+    the thread again", which meets the same full cap. Keeps _failure_html's
+    escaping of the model-derived ask text."""
+    return (f"<p>I could not register that follow-up: I am already watching the "
+            f"maximum of {FOLLOWUP_MAX_WATCHES} open follow-ups, so {len(dropped)} "
+            f"ask(s) were NOT registered: {_esc('; '.join(dropped))}.</p>"
+            f"<p>The cap counts OPEN watches only. Reply <b>stop</b> with an open "
+            f"watch's id to free a slot, or wait for one to be answered or to run "
+            f"out of reminders -- then forward this thread again.</p>")
 
 
 def _apply_command(reg: dict, watches: list, cmd: str) -> list:

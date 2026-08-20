@@ -814,6 +814,32 @@ def test_run_intake_watch_cap_mid_loop_confirms_what_fit_and_names_what_did_not(
     assert "summary report" in body and "maximum of 2" in body   # what did not
 
 
+def test_cap_failure_html_names_the_real_remedy_not_a_finished_watch(monkeypatch):
+    # FINDING 3 (final polish): the copy told the reader to "Reply 'stop'
+    # with a FINISHED watch's id to free a slot" -- impossible advice, since
+    # the same fix wave made terminal watches stop counting toward the cap,
+    # so stopping a finished watch frees nothing. It also inherited
+    # _failure_html's "Forward the thread again" tail, which cannot help a
+    # cap failure either: a re-forward meets the same full cap.
+    monkeypatch.setattr(fue, "FOLLOWUP_MAX_WATCHES", 2)
+    out = fue._cap_failure_html(["investigation status", "summary report"])
+    # Still says what was dropped and why (unchanged, and relied on by the
+    # run_intake cap tests above).
+    assert "maximum of 2" in out
+    assert "investigation status" in out and "summary report" in out
+    # The impossible advice is gone.
+    assert "finished watch" not in out
+    assert "Forward the thread again (keeping its subject line)" not in out
+    # The real remedy is named: the cap counts OPEN watches, so a slot comes
+    # from stopping an open one or letting one finish on its own.
+    low = out.lower()
+    assert "open" in low and "stop" in low
+    assert "answered" in low
+    # Ask text is model-derived from a teammate's mail -- it stayed escaped
+    # through the rewrite (it used to inherit _failure_html's _esc).
+    assert "&lt;script&gt;" in fue._cap_failure_html(["<script>alert(1)</script>"])
+
+
 def test_open_watch_count_ignores_terminal_statuses():
     reg = {"watches": [_watch_in_registry(status=s) for s in
                        ("active", "paused", "answered", "cancelled", "exhausted")]}
