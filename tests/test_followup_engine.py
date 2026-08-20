@@ -1597,20 +1597,24 @@ def test_process_deadlines_second_reminder_escalates_to_2(monkeypatch, fue_files
     assert reg["watches"][0]["nudges_sent"] == 2
 
 
-def test_process_deadlines_report_only_does_not_escalate_across_runs(monkeypatch, fue_files):
-    # The direct counterpart to the LIVE test above: repeated report-only
-    # runs stay at escalation level 1 forever (nudges_sent never leaves 0),
-    # which is the ACCEPTED, INTENDED consequence of the controller ruling
-    # ("the reported escalation stays 1 and the tone never climbs"), not a
-    # separate bug.
+def test_process_deadlines_report_only_escalates_across_runs(monkeypatch, fue_files):
+    # REPLACES test_process_deadlines_report_only_does_not_escalate_across_runs
+    # (final review, finding 2). That test pinned escalation staying 1
+    # forever and called it "ACCEPTED, INTENDED". The human partner has
+    # since ruled the opposite: the reported escalation must reflect the
+    # new report_only_nudges counter, so the ladder is VISIBLE in
+    # report-only instead of permanently reading "reminder 1". The half
+    # worth keeping -- nudges_sent, the REAL budget, never moves without a
+    # real draft behind it -- is kept and still asserted.
     monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
     reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=2)]}
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     first = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
     assert first[0]["type"] == "would_draft" and first[0]["escalation"] == 1
     second = fue.process_deadlines(reg, date(2026, 8, 11), dry_run=False)
-    assert second[0]["type"] == "would_draft" and second[0]["escalation"] == 1  # still 1, not 2
-    assert reg["watches"][0]["nudges_sent"] == 0
+    assert second[0]["type"] == "would_draft" and second[0]["escalation"] == 2  # ladder climbs
+    assert reg["watches"][0]["nudges_sent"] == 0            # real budget untouched
+    assert reg["watches"][0]["report_only_nudges"] == 2
 
 
 def test_process_deadlines_live_mode_advances_nudges_and_deadline(monkeypatch, fue_files):
@@ -1629,27 +1633,96 @@ def test_process_deadlines_live_mode_advances_nudges_and_deadline(monkeypatch, f
     assert reg["watches"][0]["deadline"] == "2026-08-11"  # Fri + 2bd -> Tue
 
 
-def test_process_deadlines_report_only_never_exhausts_the_nudge_budget(monkeypatch, fue_files):
-    # THE motivating defect, directly reproduced and guarded against:
-    # repeated report-only runs, well past max_nudges (default 3), must
-    # NEVER flip the watch to "exhausted" or emit an "exhausted" event --
-    # because zero real drafts were ever created in anyone's mailbox. Runs
-    # the SAME watch through 10 consecutive report-only cycles (more than
-    # 3x max_nudges), each one landing exactly on the deadline the PREVIOUS
-    # cycle reported, simulating 10 real daily-cron days.
+def test_process_deadlines_report_only_terminates_without_spending_the_real_budget(monkeypatch, fue_files):
+    # REPLACES test_process_deadlines_report_only_never_exhausts_the_nudge_budget
+    # (final review, finding 2). The old test asserted a report-only watch
+    # NEVER exhausts -- true, and the reason an unanswered thread emitted a
+    # would_draft plus a report email every single day forever, always
+    # labelled "reminder 1", in the SHIP state. The valuable half is kept
+    # and still asserted (nudges_sent stays 0: a real nudge is never spent
+    # without a real draft behind it). The termination half is replaced:
+    # report-only now climbs its OWN counter and exhausts at max_nudges,
+    # exactly as a live run would. Walks the same watch cycle by cycle,
+    # each landing on the deadline the previous cycle reported.
     monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
     reg = {"watches": [_watch_in_registry(deadline="2026-08-07", interval_days=1)]}
     monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
     today = date(2026, 8, 7)
+    seen = []
     for _ in range(10):
         events = fue.process_deadlines(reg, today, dry_run=False)
-        assert all(e["type"] == "would_draft" for e in events)
+        seen += [(e["type"], e.get("escalation")) for e in events]
         w = reg["watches"][0]
-        assert w["status"] == "active"
-        today = date.fromisoformat(w["deadline"])  # advance to the next reported deadline
-    assert reg["watches"][0]["nudges_sent"] == 0
-    assert reg["watches"][0]["status"] == "active"
-    assert not any("max reminders" in n["text"] for n in reg["watches"][0]["notes"])
+        if w["status"] != "active":
+            break
+        today = date.fromisoformat(w["deadline"])
+    w = reg["watches"][0]
+    assert seen == [("would_draft", 1), ("would_draft", 2), ("would_draft", 3),
+                    ("exhausted", 3)]
+    assert w["nudges_sent"] == 0                 # real budget never spent
+    assert w["report_only_nudges"] == 3          # == max_nudges
+    assert w["status"] == "exhausted"            # terminates, stops nagging daily
+    assert any("max reminders" in n["text"] for n in w["notes"])
+
+
+def test_escalation_step_none_safe_and_max_of_both_counters():
+    # is None (not falsy) guard: a legitimate stored 0 survives, an absent
+    # key (older registry) reads 0, an explicit null reads 0.
+    assert fue._escalation_step({}) == 0
+    assert fue._escalation_step({"nudges_sent": None, "report_only_nudges": None}) == 0
+    assert fue._escalation_step({"nudges_sent": 0, "report_only_nudges": 0}) == 0
+    assert fue._escalation_step({"nudges_sent": 2}) == 2
+    assert fue._escalation_step({"report_only_nudges": 3}) == 3
+    assert fue._escalation_step({"nudges_sent": 1, "report_only_nudges": 3}) == 3
+    assert fue._escalation_step({"nudges_sent": 4, "report_only_nudges": 2}) == 4
+
+
+def test_new_watch_starts_report_only_nudges_at_zero():
+    w = _watch_in_registry()
+    assert w["report_only_nudges"] == 0
+
+
+def test_process_deadlines_dry_run_does_not_advance_report_only_nudges(monkeypatch, fue_files):
+    # The dry-run contract covers the NEW counter too: dry_run mutates NO
+    # field of any watch.
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", report_only_nudges=1)]}
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=True)
+    w = reg["watches"][0]
+    assert events[0]["type"] == "would_draft" and events[0]["escalation"] == 2
+    assert w["report_only_nudges"] == 1
+    assert w["nudges_sent"] == 0 and w["deadline"] == "2026-08-07" and w["notes"] == []
+
+
+def test_process_deadlines_legacy_watch_without_report_only_nudges_field(monkeypatch, fue_files):
+    # A watch written before this field existed has no report_only_nudges
+    # key at all -- a missing value must read as 0 and never crash.
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    legacy = _watch_in_registry(deadline="2026-08-07")
+    legacy.pop("report_only_nudges")
+    reg = {"watches": [legacy]}
+    monkeypatch.setattr(ld, "_call_claude_text", lambda *a, **kw: "Reminder body")
+    events = fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    assert events[0]["escalation"] == 1
+    assert reg["watches"][0]["report_only_nudges"] == 1
+
+
+def test_process_deadlines_report_only_exhaustion_prompt_uses_the_climbing_ladder(monkeypatch, fue_files):
+    # The tone must climb with the ladder, not sit on "reminder 1": the
+    # draft prompt's escalation number is what makes reminder 3 firm.
+    monkeypatch.delenv("FOLLOWUP_LIVE", raising=False)
+    reg = {"watches": [_watch_in_registry(deadline="2026-08-07", report_only_nudges=2)]}
+    captured = {}
+
+    def _capture(prompt, model, max_tokens=1200, **kw):
+        captured["prompt"] = prompt
+        return "Reminder body"
+
+    monkeypatch.setattr(ld, "_call_claude_text", _capture)
+    fue.process_deadlines(reg, date(2026, 8, 7), dry_run=False)
+    flat = " ".join(captured["prompt"].split())
+    assert "reminder number 3 of at most 3" in flat
 
 
 def test_create_draft_uses_latest_message_id_over_anchor(monkeypatch, fue_files):
@@ -2201,6 +2274,21 @@ def test_build_report_renders_all_section_headings():
     assert "fw_pau0001" in out and "did not answer" in out
     assert "Escalations" in out and "fw_exh0001" in out and "3 reminders went unanswered" in out
     assert "Still unsent" in out and "fw_uns0001" in out and "2026-08-01" in out
+
+
+def test_build_report_exhausted_report_only_does_not_claim_reminders_were_sent():
+    # Finding 2 side effect: report-only can now reach exhaustion with ZERO
+    # real drafts, so the escalation line must not assert that N reminders
+    # "went unanswered" when none were ever created in anyone's mailbox.
+    report_only = [{"type": "exhausted", "owner": "dan@negevlabs.com", "watch_id": "fw_exh0002",
+                    "ask": "exhausted ask", "recipients": ["cro@example.com"],
+                    "escalation": 3, "nudges_sent": 0}]
+    out = fue.build_report("dan@negevlabs.com", report_only, [])
+    assert "3 reminders went unanswered" not in out
+    assert "3 reminder cycles passed unanswered (0 actually drafted" in out
+    # A genuinely live-drafted exhaustion keeps the original wording.
+    live = [dict(report_only[0], nudges_sent=3)]
+    assert "3 reminders went unanswered" in fue.build_report("dan@negevlabs.com", live, [])
 
 
 def test_build_report_escapes_counterparty_controlled_text():

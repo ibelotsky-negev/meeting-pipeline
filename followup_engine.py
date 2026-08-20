@@ -213,6 +213,10 @@ def new_watch(owner: str, mailbox: str, conversation_id: str, anchor_message_id:
         "deadline": deadline.isoformat(),
         "max_nudges": FOLLOWUP_MAX_NUDGES,
         "nudges_sent": 0,
+        # Report-only cycles counted for this watch. Kept SEPARATE from
+        # nudges_sent so a real nudge is never recorded without a real
+        # draft behind it -- see _escalation_step.
+        "report_only_nudges": 0,
         "status": "active",
         "last_checked": None,
         "latest_message_id": anchor_message_id,
@@ -222,6 +226,36 @@ def new_watch(owner: str, mailbox: str, conversation_id: str, anchor_message_id:
         "created": now,
         "updated": now,
     }
+
+
+def _watch_int(watch: dict, key: str) -> int:
+    """is None (not falsy) guard -- a legitimate stored 0 must survive, and
+    a watch written by an older build has no report_only_nudges key at all.
+    Same standing rule as interval_days=0; do not reintroduce `x or 0`."""
+    v = watch.get(key)
+    if v is None:
+        return 0
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _escalation_step(watch: dict) -> int:
+    """The escalation rung this watch has already climbed: the HIGHER of
+    real reminders drafted (nudges_sent) and report-only cycles counted
+    (report_only_nudges).
+
+    Exhaustion and the reminder's tone both key off this. Testing
+    exhaustion on nudges_sent alone pinned the ship state (FOLLOWUP_LIVE
+    unset) at 0 forever -- so an unanswered thread emitted a would_draft
+    plus a report email every interval FOREVER, always labelled
+    'reminder 1', and the ladder never engaged. Keeping the two counters
+    separate preserves the earlier ruling exactly: report-only still never
+    spends the REAL nudge budget, it just stops pretending no time has
+    passed."""
+    return max(_watch_int(watch, "nudges_sent"),
+               _watch_int(watch, "report_only_nudges"))
 
 
 def _note(watch: dict, text: str):
@@ -758,7 +792,7 @@ plain paragraphs separated by blank lines."""
 def _compose_draft(watch: dict) -> str:
     text = ld._call_claude_text(
         _DRAFT_PROMPT.format(ask=watch["ask"], subject=watch["subject"],
-                             escalation=watch.get("nudges_sent", 0) + 1,
+                             escalation=_escalation_step(watch) + 1,
                              max_nudges=watch.get("max_nudges", FOLLOWUP_MAX_NUDGES)),
         DRAFT_MODEL, max_tokens=1200)
     paras = [p.strip() for p in (text or "").split("\n\n") if p.strip()]
@@ -833,7 +867,7 @@ def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
             continue
         if today < deadline:
             continue
-        if w.get("nudges_sent", 0) >= w.get("max_nudges", FOLLOWUP_MAX_NUDGES):
+        if _escalation_step(w) >= w.get("max_nudges", FOLLOWUP_MAX_NUDGES):
             # DRY-RUN INVARIANT: the preview must show that this watch
             # WOULD exhaust (the event still fires), but must not actually
             # flip status or write a note -- a dry_run=True call against a
@@ -845,14 +879,17 @@ def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
                 _note(w, "max reminders reached; escalated to owner")
             events.append({"type": "exhausted", "owner": w["owner"], "watch_id": w["id"],
                            "ask": w["ask"], "recipients": w["recipients"],
-                           "escalation": w.get("nudges_sent", 0)})
+                           "escalation": _escalation_step(w),
+                           # Carried so the report never claims N reminders
+                           # "went unanswered" when report-only created none.
+                           "nudges_sent": _watch_int(w, "nudges_sent")})
             continue
         try:
             body_html = _compose_draft(w)
         except Exception as e:
             logger.warning(f"[followup] compose failed for {w['id']}: {e}")
             continue  # try again next run; deadline unchanged
-        escalation = w.get("nudges_sent", 0) + 1
+        escalation = _escalation_step(w) + 1
         # is None check -- see comment above; same anti-pattern, same fix.
         # Computed once, shared by the LIVE and REPORT-ONLY branches below
         # -- DRY RUN never uses it (it mutates nothing), but the
@@ -888,20 +925,26 @@ def process_deadlines(reg: dict, today: date, dry_run: bool) -> list:
             w["nudges_sent"] = escalation
             w["deadline"] = next_deadline
         else:
-            # CONTROLLER RULING (dry-run budget fix): REPORT-ONLY is the
-            # ship state (FOLLOWUP_LIVE unset). Advance the deadline so the
-            # watch re-surfaces on the same cadence a live run would, but
-            # leave nudges_sent UNTOUCHED -- a run that drafted nothing in
-            # anyone's mailbox must never consume the nudge budget, or
-            # every watch silently exhausts itself within max_nudges
-            # report-only days with zero real reminders ever sent (the
-            # defect: report-only used to advance nudges_sent
-            # unconditionally, so setting FOLLOWUP_LIVE=1 later found every
-            # pilot watch already dead). The exhaustion check above
-            # therefore never fires from repeated report-only runs alone --
-            # no separate guard needed, since nudges_sent structurally
-            # cannot reach max_nudges this way.
+            # CONTROLLER RULING (dry-run budget fix), AS AMENDED BY THE
+            # HUMAN RULING ON FINDING 2. REPORT-ONLY is the ship state
+            # (FOLLOWUP_LIVE unset). Advance the deadline so the watch
+            # re-surfaces on the same cadence a live run would, and leave
+            # nudges_sent UNTOUCHED -- a run that drafted nothing in
+            # anyone's mailbox must never consume the REAL nudge budget,
+            # or arming FOLLOWUP_LIVE=1 later finds every pilot watch
+            # already dead.
+            #
+            # What the original ruling missed: with nudges_sent pinned at
+            # 0, the exhaustion check could never fire either, so an
+            # unanswered thread emitted a would_draft plus a report email
+            # every interval FOREVER, always labelled 'reminder 1'.
+            # report_only_nudges is the separate counter that fixes that:
+            # the ladder climbs and the watch terminates at max_nudges,
+            # while the real budget stays untouched. Set to `escalation`
+            # (not +1 on itself) so a watch that already drafted for real
+            # under LIVE keeps climbing from the rung it actually reached.
             _note(w, f"reminder {escalation} would be drafted (report-only)")
+            w["report_only_nudges"] = escalation
             events.append({"type": "would_draft", "owner": w["owner"], "watch_id": w["id"],
                            "ask": w["ask"], "recipients": w["recipients"],
                            "body": body_html, "escalation": escalation})
@@ -1045,9 +1088,18 @@ def build_report(owner: str, events: list, unsent: list) -> str:
     if exhausted:
         parts.append("<h3>Escalations -- max reminders reached, over to you</h3><ul>")
         for e in exhausted:
+            real = e.get("nudges_sent")
+            # Report-only can now reach exhaustion with ZERO real drafts
+            # (finding 2), so do not claim reminders "went unanswered"
+            # when none were ever created in anyone's mailbox.
+            if real is not None and int(real) < int(e["escalation"]):
+                detail = (f"{e['escalation']} reminder cycles passed unanswered "
+                          f"({real} actually drafted; the rest were report-only)")
+            else:
+                detail = f"{e['escalation']} reminders went unanswered"
             parts.append(f"<li><b>{_esc(e['ask'])}</b> "
                          f"(<code>{_esc(e['watch_id'])}</code>): "
-                         f"{e['escalation']} reminders went unanswered.</li>")
+                         f"{detail}.</li>")
         parts.append("</ul>")
     if unsent:
         parts.append("<h3>Still unsent from earlier days</h3><ul>")
@@ -1120,7 +1172,8 @@ def run_daily(dry_run: bool = False) -> dict:
 def status_summary() -> dict:
     reg = _load_registry()
     keep = ("id", "owner", "subject", "ask", "recipients", "status",
-            "deadline", "nudges_sent", "max_nudges", "last_checked", "created")
+            "deadline", "nudges_sent", "report_only_nudges", "max_nudges",
+            "last_checked", "created")
     return {"last_run": read_status(),
             "live": _live(),
             "watches": [{k: w.get(k) for k in keep} for w in reg.get("watches") or []]}
