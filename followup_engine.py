@@ -503,8 +503,15 @@ def _confirmation_html(watches: list) -> str:
             "cancel, <b>resume</b> to re-arm a paused watch.</p>")
 
 
-# A watch in one of these statuses is finished: nothing will ever draft for
-# it again, and nothing prunes it from the registry either.
+# A watch in one of these statuses does not count toward the open-watch cap
+# (_open_watch_count): none of the three is currently consuming attention --
+# no drafting, no reply-checking. "answered" and "exhausted" are genuinely
+# finished; nothing in this module ever revives them. "cancelled" is
+# different since the re-arm fix (_apply_command's resume branch can bring
+# one back to "active") -- but _open_watch_count reads live status on every
+# call, so a re-armed watch counts as open again the moment it does, and a
+# DORMANT cancelled watch still costs nothing to exclude, exactly as before
+# this fix. Nothing prunes any of the three from the registry either.
 _TERMINAL_STATUSES = ("answered", "cancelled", "exhausted")
 
 
@@ -551,12 +558,23 @@ def _apply_command(reg: dict, watches: list, cmd: str) -> list:
             w["status"] = "cancelled"
             _note(w, "cancelled by owner reply")
             changed.append(w["id"])
-        elif cmd == "resume" and w.get("status") == "paused":
+        elif cmd == "resume" and w.get("status") in ("paused", "cancelled"):
+            # Re-arms a paused OR a cancelled watch -- never "answered" or
+            # "exhausted" (genuinely finished; nothing revives those). A
+            # cancel false positive is a real trap: "done" is a cancel
+            # word, so replying "Done, thanks!" to a daily report cancels
+            # the watch(es) it names. This is the recovery path: Sara
+            # already sent a "Done: cancel applied to fw_..." confirmation,
+            # so the owner can undo it with one more reply instead of
+            # re-forwarding the original thread from scratch.
             w["status"] = "active"
             # is None (not falsy) check -- same contract as new_watch's
             # interval_days=0 (Task 1): an explicit same-day-chase cadence
             # must survive a resume, not get silently upgraded to the
-            # default by an `x or default` truthiness check on 0.
+            # default by an `x or default` truthiness check on 0. Same
+            # recompute for both origin statuses -- a watch re-armed from
+            # cancelled gets exactly the deadline a paused-then-resumed one
+            # would; no separate behavior invented for the cancelled case.
             stored_interval = w.get("interval_days")
             interval = (FOLLOWUP_DEFAULT_BUSINESS_DAYS if stored_interval is None
                         else int(stored_interval))
@@ -575,7 +593,16 @@ def _find_existing_watch(reg: dict, new: list, intake_conversation_id: str, ask_
     call new_watch() again with a fresh random id. A CANCELLED prior watch
     does not block re-registration -- the owner may deliberately cancel and
     re-ask for the same thing. Compares only fields already in the watch
-    schema (intake_conversation_id, ask, status); adds no new field."""
+    schema (intake_conversation_id, ask, status); adds no new field.
+
+    Unchanged by the cancel-is-re-armable fix: matching a cancelled watch
+    here would only mark it matched_existing, which RE-SENDS the original
+    confirmation text and nothing else -- telling the owner the ask is
+    being watched while the watch stays cancelled underneath. That is
+    worse than the harmless extra watch this function already accepts. A
+    deliberate re-ask still gets a fresh active watch; the old cancelled
+    one stays inert and stays addressable by id if the owner would rather
+    `resume` it instead."""
     for w in (reg.get("watches") or []) + new:
         if (w.get("intake_conversation_id") == intake_conversation_id
                 and w.get("ask") == ask_text and w.get("status") != "cancelled"):

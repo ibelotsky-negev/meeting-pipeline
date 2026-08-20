@@ -67,7 +67,8 @@ drafts, notifies, and stops.
 ## Commands (deterministic, no LLM)
 
 A reply to Sara cancels a watch on `stop|cancel|done`, or re-arms a paused
-watch on `resume|continue|keep`. The command word must LEAD the reply or one
+or cancelled watch -- never one that is answered or exhausted -- on
+`resume|continue|keep`. The command word must LEAD the reply or one
 of its lines (an optional short greeting is skipped) unless the body names an
 explicit `fw_xxxxxxxx` id, in which case the word may appear anywhere.
 Ids are read from the body, and -- only when the body names none --

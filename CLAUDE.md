@@ -499,7 +499,9 @@ share it.
   failed to send) matches the existing watch on that intake conversation
   instead of duplicating it, and re-sends the confirmation instead of
   re-registering. Owner commands, deterministic, no LLM: stop/cancel/done
-  cancels, resume/continue/keep re-arms a paused watch -- the command word
+  cancels, resume/continue/keep re-arms a paused OR CANCELLED watch (never
+  answered/exhausted -- genuinely finished, nothing revives those) -- the
+  command word
   must LEAD the reply or one of its lines (an optional short greeting is
   skipped) UNLESS the body names an explicit `fw_` id, where the match is
   anywhere in the body as before. Ids come from the body, and only if the

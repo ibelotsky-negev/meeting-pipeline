@@ -565,12 +565,15 @@ def test_run_intake_dry_run_writes_nothing(intake_world):
 
 
 def _report_reply_world(monkeypatch, body, sender="dan@negevlabs.com", cid="conv-report-9",
-                        subject="RE: [follow-up] 1 draft(s) ready"):
+                        subject="RE: [follow-up] 1 draft(s) ready", mid="rep1"):
     """Sara's inbox holds ONE reply that arrived on a conversation the intake
     has never seen -- exactly the shape of an owner replying to a daily
     REPORT email (a report is a new conversation, and uniqueBody strips the
-    quoted body, which is why the fw_ ids now ride in the SUBJECT)."""
-    msg = _intake_msg("rep1", sender, subject, body, cid=cid)
+    quoted body, which is why the fw_ ids now ride in the SUBJECT). `mid`
+    defaults to the original fixed id so every existing call site is
+    unaffected; pass a distinct one to simulate a SECOND report reply in
+    the same test (e.g. a resume that follows a cancel)."""
+    msg = _intake_msg(mid, sender, subject, body, cid=cid)
     monkeypatch.setattr(eps, "graph_get", lambda url, params=None: {"value": [msg]})
     replies = []
     monkeypatch.setattr(xte, "send_threaded_reply",
@@ -649,6 +652,42 @@ def test_run_intake_resume_reply_to_a_report_re_arms_the_watch_the_subject_names
     saved = fue._load_registry()["watches"][0]
     assert saved["status"] == "active" and saved["deadline"] == "2026-08-11"
     assert len(replies) == 1
+
+
+def test_run_intake_done_thanks_reply_then_resume_round_trip(monkeypatch, fue_files):
+    # The false-positive trap this fix exists for: "done" is a cancel word,
+    # so a grateful "Done, thanks!" reply to a daily report cancels the
+    # watch(es) its subject names. A following "resume" must bring the
+    # SAME watch (same id, not a new registration) back to active -- that
+    # is the whole point of making cancel re-armable instead of a dead end
+    # that needs re-forwarding the original thread from scratch.
+    w = _watch_in_registry(ask="investigation status")
+    fue._save_registry({"watches": [w]})
+    cancel_subject = "RE: " + fue._report_subject(1, 0, date(2026, 8, 7), [w["id"]])
+    replies = _report_reply_world(monkeypatch, "Done, thanks!", subject=cancel_subject)
+    out = fue.run_intake()
+    assert out["commands"] == 1 and out["failures"] == 0
+    cancelled = fue._load_registry()["watches"][0]
+    assert cancelled["status"] == "cancelled" and cancelled["id"] == w["id"]
+    assert len(replies) == 1 and w["id"] in replies[0][1]
+
+    # A later reply on a FRESH report conversation naming the same watch
+    # resumes it. Distinct message id (mid="rep2") so intake does not treat
+    # this as a repeat of the already-processed cancel reply.
+    monkeypatch.setattr(fue, "_today_il", lambda: date(2026, 8, 10))
+    resume_subject = "RE: " + fue._report_subject(0, 1, date(2026, 8, 10), [w["id"]])
+    replies2 = _report_reply_world(monkeypatch, "resume", subject=resume_subject,
+                                   cid="conv-report-10", mid="rep2")
+    out2 = fue.run_intake()
+    assert out2["commands"] == 1 and out2["failures"] == 0
+    watches = fue._load_registry()["watches"]
+    assert len(watches) == 1                        # no duplicate created
+    resumed = watches[0]
+    assert resumed["id"] == w["id"]                  # same watch, id unchanged
+    assert resumed["status"] == "active"
+    assert resumed["deadline"] == fue.add_business_days(
+        date(2026, 8, 10), w["interval_days"]).isoformat()
+    assert len(replies2) == 1 and w["id"] in replies2[0][1]
 
 
 def test_run_intake_leaves_a_corrections_style_reply_completely_alone(monkeypatch, fue_files):
@@ -847,6 +886,22 @@ def test_open_watch_count_ignores_terminal_statuses():
     assert fue._open_watch_count({}) == 0
 
 
+def test_open_watch_count_across_cancel_then_rearm():
+    # The cap counts OPEN (non-terminal) watches. Cancelling must free the
+    # slot (cancelled stays in _TERMINAL_STATUSES), and a following resume
+    # must make it count again immediately -- _open_watch_count reads live
+    # status on every call, so there is no stale-count window to exploit.
+    w = _watch_in_registry(status="active")
+    reg = {"watches": [w]}
+    assert fue._open_watch_count(reg) == 1
+    fue._apply_command(reg, [w], "cancel")
+    assert w["status"] == "cancelled"
+    assert fue._open_watch_count(reg) == 0
+    fue._apply_command(reg, [w], "resume")
+    assert w["status"] == "active"
+    assert fue._open_watch_count(reg) == 1
+
+
 def test_run_intake_ignores_external_and_media(monkeypatch, fue_files):
     ext = _intake_msg("x1", "spam@evil.com", "follow up", "follow up please")
     media = _intake_msg("x2", "dan@negevlabs.com", "fyi",
@@ -985,6 +1040,66 @@ def test_apply_command_cancel_ignores_terminal_watch():
     changed = fue._apply_command({"watches": [w]}, [w], "cancel")
     assert changed == []
     assert w["status"] == "answered"
+
+
+def test_apply_command_resume_reactivates_cancelled_watch():
+    # The human ruling this task ships: resume must re-arm a CANCELLED
+    # watch, not just a paused one -- recovering the "done" false-positive
+    # trap (see the round-trip test above) must not require re-forwarding
+    # the original thread from scratch.
+    w = fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid1", anchor_message_id="m1",
+        anchor_received="2026-08-05T04:23:00Z", subject="s", ask="a",
+        recipients=[], interval_days=3, deadline=date(2026, 8, 7),
+        intake_conversation_id="conv-intake")
+    w["status"] = "cancelled"
+    today = fue._today_il()
+    changed = fue._apply_command({"watches": [w]}, [w], "resume")
+    assert changed == [w["id"]]
+    assert w["status"] == "active"
+    # Sane future deadline, recomputed from the watch's own interval --
+    # same recompute the existing paused-resume branch already does, not
+    # invented behavior for the cancelled case.
+    assert w["deadline"] == fue.add_business_days(today, 3).isoformat()
+    assert w["deadline"] > today.isoformat()
+    assert any("re-arm" in n["text"] for n in w["notes"])
+
+
+def test_apply_command_resume_from_cancelled_preserves_interval_days_zero():
+    # Same falsy-check bug class the paused branch was fixed for (Task 1 /
+    # Task 4): an explicit interval_days=0 (same-day chase) must survive a
+    # resume from CANCELLED too. Do not reintroduce `x or default`.
+    w = fue.new_watch(
+        owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+        conversation_id="cid1", anchor_message_id="m1",
+        anchor_received="2026-08-05T04:23:00Z", subject="s", ask="a",
+        recipients=[], interval_days=0, deadline=date(2026, 8, 7),
+        intake_conversation_id="conv-intake")
+    w["status"] = "cancelled"
+    fue._apply_command({"watches": [w]}, [w], "resume")
+    assert w["status"] == "active"
+    assert w["deadline"] == fue._today_il().isoformat()
+
+
+def test_apply_command_resume_does_not_revive_answered_or_exhausted():
+    # Genuinely finished statuses must stay finished: reviving them would
+    # resurrect a chase the counterparty already answered, or one that
+    # already climbed its full reminder ladder. Only paused and cancelled
+    # are re-armable.
+    for status in ("answered", "exhausted"):
+        w = fue.new_watch(
+            owner="dan@negevlabs.com", mailbox="dan@negevlabs.com",
+            conversation_id="cid1", anchor_message_id="m1",
+            anchor_received="2026-08-05T04:23:00Z", subject="s", ask="a",
+            recipients=[], interval_days=2, deadline=date(2026, 8, 7),
+            intake_conversation_id="conv-intake")
+        w["status"] = status
+        original_deadline = w["deadline"]
+        changed = fue._apply_command({"watches": [w]}, [w], "resume")
+        assert changed == [], f"resume must not revive a {status!r} watch"
+        assert w["status"] == status
+        assert w["deadline"] == original_deadline
 
 
 def test_run_intake_skips_own_outbound(monkeypatch, fue_files):
