@@ -50,9 +50,12 @@ drafts, notifies, and stops.
 
 ## Commands (deterministic, no LLM)
 
-A reply to Sara containing `stop|cancel|done` cancels; `resume|continue|keep`
-re-arms a paused watch. Targets: explicit `fw_xxxxxxxx` ids found in the body,
-else all watches registered from that intake conversation. Confirmed by reply.
+A reply to Sara cancels a watch on `stop|cancel|done`, or re-arms a paused
+watch on `resume|continue|keep`. The command word must LEAD the reply or one
+of its lines (an optional short greeting is skipped) unless the body names an
+explicit `fw_xxxxxxxx` id, in which case the word may appear anywhere.
+Targets: named ids, else all watches registered from that intake
+conversation. Confirmed by reply.
 
 ## Live gate
 

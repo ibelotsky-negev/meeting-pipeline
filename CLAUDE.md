@@ -147,6 +147,9 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/fyi/status` | Last FYI Triage run outcome (scanned/important/moved + per-message decisions) + heartbeat + `fyi_live_env` |
 | `/transcribe-email/run` | Email-to-transcript: scan Sara's inbox for team mail with x.com/YouTube links, reply with transcript+summary (`?dry_run=&sync=&limit=`) |
 | `/transcribe-email/status` | Last x-transcribe-email scan outcome (scanned/replied + per-message links) |
+| `/followup/run` | Manual Follow-Up Engine daily check (`?dry_run=&sync=`) |
+| `/followup/intake` | Manual Follow-Up Engine inbox intake scan (`?dry_run=&sync=`) |
+| `/followup/status` | Follow-Up Engine last run + per-watch summaries (all statuses) |
 
 ## Architecture Notes
 
@@ -451,6 +454,55 @@ machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, 
   sharing `_xte_trigger_lock` with the manual route so a scheduled scan never overlaps
   `/transcribe-email/run`. CLI: `python x_transcribe_email.py [--dry-run] [--limit N]`.
 
+## followup-engine Module (pilot)
+
+Standalone module (`followup_engine.py`) -- watches registered email threads
+for a counterparty reply; on silence past a per-ask deadline, places a
+ready-to-send reminder draft in the thread OWNER's Outlook Drafts (app-only
+`createReplyAll` + PATCH; explicit recipients when the instruction named
+them, inherited CC preserved) and sends the owner ONE report email per run:
+new drafts (full text + Graph webLink), replies detected, escalations
+(CC `FOLLOWUP_ALERT_CC`), and every STILL UNSENT draft repeated daily until
+sent or cancelled (unsent = still `isDraft`; only a confirmed 404/410 means
+sent/deleted -- any other Graph error keeps it listed; a cancelled watch's
+draft is never re-reported). The machine NEVER sends to a counterparty --
+there is no auto-send code path (parked by team decision). `FOLLOWUP_LIVE`
+unset ships REPORT-ONLY (no drafts created, report shows would-draft text;
+deadlines still advance on schedule but `nudges_sent` does not, so
+report-only alone can never exhaust a watch); `dry_run=1` mutates no state
+at all, live or not. Full spec: `followup-engine-spec.md`. Imported lazily
+by app.py. Reuses eps Graph helpers, xte `is_auto_reply` +
+`send_threaded_reply`, ld `_call_claude_text`, config identity helpers.
+
+- Intake (15-min scan of Sara's inbox): internal sender forwards a thread with
+  an instruction ("if Vimta does not reply within 2 days, draft a reminder for
+  me to send"). Deterministic gate (trigger keyword, no media links -- those
+  belong to x-transcribe) -> Claude parse (one WATCH PER ASK) -> thread
+  resolved in the SENDER's mailbox by normalized-subject `$search` +
+  counterparty overlap (the forward itself is a NEW conversation) ->
+  confirmation reply with watch ids; unresolvable -> honest failure reply.
+  Re-parsing the same ask (e.g. a retry after the confirmation reply itself
+  failed to send) matches the existing watch on that intake conversation
+  instead of duplicating it, and re-sends the confirmation instead of
+  re-registering. Owner commands, deterministic, no LLM: stop/cancel/done
+  cancels, resume/continue/keep re-arms a paused watch -- the command word
+  must LEAD the reply or one of its lines (an optional short greeting is
+  skipped) UNLESS the body names an explicit `fw_` id, where the match is
+  anywhere in the body as before. Targets: named `fw_` ids, else all
+  watches from that intake conversation.
+- Daily check (17:00 Asia/Jerusalem): per active watch, new thread messages
+  since last check; external non-auto-reply messages get a per-ask Haiku
+  verdict -- ANSWERED closes, a human non-answer PAUSES (owner re-arms);
+  internal/own messages ignored (pilot limitation: an owner's manual chase
+  does not reset the clock). Active past deadline -> Sonnet drafts an
+  escalating status-request-only reminder (nudge N of max 3), deadline
+  advances by the watch's business-day interval (Mon-Fri); at max ->
+  `exhausted` + escalation. Quiet day (no events, nothing unsent) -> no email.
+- State on /data: `followups.json` (registry), `followup_processed.json`
+  (intake dedup, persisted after EACH handled message), `followup_status.json`.
+- Endpoints: `/followup/run`, `/followup/intake` (both `?dry_run=&sync=`),
+  `/followup/status`. CLI: `python followup_engine.py --intake|--check [--dry-run]`.
+
 ## Common Failure Modes
 
 | Symptom | Cause | Fix |
@@ -487,6 +539,15 @@ machinery, no duplication: `email_pipeline_sync` Graph helpers (app-only token, 
 Key vars (do not log values): `FIREFLIES_API_KEY`, `CLAUDE_API_KEY`, `HUBSPOT_API_KEY`, `ASANA_API_KEY`, `MS_GRAPH_CLIENT_ID`, `MS_GRAPH_CLIENT_SECRET`, `MS_GRAPH_TENANT_ID`, `HUBSPOT_OWNER_MAP`, `BOT_SENDER_EMAIL=sara@palomar-labs.com`, `ASANA_PROJECT_GID=1213263339592202`, `ASANA_WORKSPACE_GID=597593980065511`
 
 Read/Learn: optional `LEARN_LOOKBACK_DAYS` (trailing window for normal/cron runs, default 14; read/unread agnostic), `LEARN_CONCURRENCY`, `LEARN_CURRENCY_CHECK`, `LEARN_YT_ATTEMPTS` (YouTube caption attempts on a TRANSIENT error, default 3) / `LEARN_YT_RETRY_WAIT` (backoff seconds, default 2), resolver keys `XAI_API_KEY` / `SPOKEN_API_KEY` / `JINA_API_KEY` (read at call time; absent = degrade, never fabricate).
+
+followup-engine: `FOLLOWUP_LIVE` (set `1` to arm draft creation; UNSET at ship
+= report-only), `FOLLOWUP_HOUR` (daily check hour Asia/Jerusalem, default 17),
+`FOLLOWUP_INTAKE_MINUTES` (15), `FOLLOWUP_DEFAULT_BUSINESS_DAYS` (2),
+`FOLLOWUP_MAX_NUDGES` (3), `FOLLOWUP_MAX_WATCHES` (100),
+`FOLLOWUP_INTAKE_MAX_MESSAGES` (25), `FOLLOWUP_PARSE_MODEL` /
+`FOLLOWUP_DRAFT_MODEL` (sonnet) / `FOLLOWUP_VERDICT_MODEL` (haiku),
+`FOLLOWUP_ALERT_CC` (bk@negevlabs.com). Reuses `BOT_SENDER_EMAIL`,
+`CLAUDE_API_KEY`, `MS_GRAPH_*`, `INTERNAL_DOMAINS`.
 
 FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY` / `FYI_BROADCAST_DOMAINS` (broker/ESP blast domains -> deterministic NOISE) / `FYI_HELD_DOMAINS` + `FYI_HELD_NAMES` (tracked holdings -> material IR is deterministic IMPORTANT) and `INTERNAL_DOMAINS` (own-outbound -> deterministic NOISE).
 
