@@ -164,7 +164,7 @@ SUBSCRIPTION_FILE = os.path.join(DATA_DIR, "graph_subscription.json")
 
 PULSE_RECIPIENTS = ["bk@negevlabs.com", "vu@negevcap.com"]
 PULSE_SENDER = "sara@palomar-labs.com"
-PULSE_DOMAINS = ["negevlabs.com", "ariadnebio.com"]
+PULSE_DOMAINS = ["negevlabs.com", "ariadnebio.com", "palomar-labs.com"]
 PULSE_ARCHIVE_DIR = os.path.join(DATA_DIR, "pulse")
 PULSE_LOOKBACK_DAYS = 7
 BRIEFING_BOOK_PATH = os.path.join(DATA_DIR, "briefing-book.md")
