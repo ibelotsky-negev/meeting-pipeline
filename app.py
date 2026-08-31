@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Config and config-domain primitives live in config.py. Re-exported here
 # so existing references and tests (app_module.X) keep resolving. ASCII-only.
-from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_API_KEY, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_REFRESH_TOKEN, MS_GRAPH_AUTH_MODE, ASANA_WORKSPACE_GID, ASANA_PROJECT_GID, HUBSPOT_OWNER_ID, POLL_INTERVAL_MINUTES, APP_BASE_URL, NOTIFY_VIA, SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, BOT_SENDER_EMAIL, BOT_SENDER_NAME, INTERNAL_DOMAINS, HUBSPOT_OWNER_MAP_RAW, HUBSPOT_OWNER_MAP, TEAM_MEMBER_NAMES_RAW, TEAM_MEMBER_NAMES, TEAM_MEMBERS_LIST, EMAIL_ALIAS_MAP, EMAIL_ALIAS_MAP_RAW, DATA_DIR, PROCESSED_FILE, PENDING_FILE, SYNC_MAP_FILE, TODO_LIST_NAME, TODO_POLL_INTERVAL, RAILWAY_PUBLIC_URL, TEAMS_WEBHOOK_SECRET, TEAMS_TRANSCRIPT_ENABLED, TEAMS_ORGANIZER_USER_ID, TEAMS_POLL_USER_IDS, TEAMS_POLL_INTERVAL, SUBSCRIPTION_FILE, PULSE_RECIPIENTS, PULSE_SENDER, PULSE_DOMAINS, PULSE_ARCHIVE_DIR, PULSE_LOOKBACK_DAYS, BRIEFING_BOOK_PATH, BRIEFING_BOOK_REPO, PULSE_SKIP_SENDERS, PULSE_SKIP_DOMAINS, PULSE_SKIP_SUBJECTS, normalize_team_email, load_briefing_book, is_internal_email, resolve_internal_organizer)  # noqa: F401
+from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_API_KEY, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_REFRESH_TOKEN, MS_GRAPH_AUTH_MODE, ASANA_WORKSPACE_GID, ASANA_PROJECT_GID, HUBSPOT_OWNER_ID, POLL_INTERVAL_MINUTES, APP_BASE_URL, NOTIFY_VIA, SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, BOT_SENDER_EMAIL, BOT_SENDER_NAME, INTERNAL_DOMAINS, HUBSPOT_OWNER_MAP_RAW, HUBSPOT_OWNER_MAP, TEAM_MEMBER_NAMES_RAW, TEAM_MEMBER_NAMES, TEAM_MEMBERS_LIST, EMAIL_ALIAS_MAP, EMAIL_ALIAS_MAP_RAW, DATA_DIR, PROCESSED_FILE, PENDING_FILE, SYNC_MAP_FILE, TODO_LIST_NAME, TODO_POLL_INTERVAL, RAILWAY_PUBLIC_URL, TEAMS_WEBHOOK_SECRET, TEAMS_TRANSCRIPT_ENABLED, TEAMS_ORGANIZER_USER_ID, TEAMS_POLL_USER_IDS, TEAMS_POLL_INTERVAL, SUBSCRIPTION_FILE, PULSE_RECIPIENTS, PULSE_SENDER, PULSE_DOMAINS, PULSE_ARCHIVE_DIR, PULSE_LOOKBACK_DAYS, PULSE_MAX_INPUT_CHARS, PULSE_MAX_CHUNKS, PULSE_RATE_LIMIT_SECONDS, BRIEFING_BOOK_PATH, BRIEFING_BOOK_REPO, PULSE_SKIP_SENDERS, PULSE_SKIP_DOMAINS, PULSE_SKIP_SUBJECTS, normalize_team_email, load_briefing_book, is_internal_email, resolve_internal_organizer)  # noqa: F401
 from prompts import (PULSE_SCOPE, PULSE_ANTI_HALLUCINATION, PULSE_EMAIL_PROMPT, PULSE_TEAMS_PROMPT, PULSE_MEETINGS_PROMPT, PULSE_SYNTHESIS_PROMPT, PULSE_BRIEFING_UPDATE_PROMPT)  # noqa: F401
 from templates import REVIEW_TEMPLATE, RESULT_TEMPLATE  # noqa: F401
 from datetime_utils import to_hubspot_ms, to_graph_datetime, resolve_due_date  # noqa: F401
@@ -703,39 +703,59 @@ REQUIRED:
 # WEEKLY PULSE -> ANALYSIS PIPELINE (MULTI-PASS CLAUDE)
 # ======================================================================
 
-def _pulse_format_emails(email_data):
-    """Format email data for Claude prompt."""
-    lines = []
+def _pulse_email_blocks(email_data):
+    """One rendered block per email. Chunking groups these, never splits one."""
+    blocks = []
     for i, e in enumerate(email_data, 1):
-        lines.append(f"{i}. [{e['date'][:10]}] Subject: {e['subject']}")
+        lines = [f"{i}. [{e['date'][:10]}] Subject: {e['subject']}"]
         if e.get("bodyPreview"):
             lines.append(f"   Preview: {e['bodyPreview'][:255]}")
         lines.append(f"   From: {e['from_addr']} | To count: {e['to_count']}")
-    return "\n".join(lines) if lines else "(No emails collected)"
+        blocks.append("\n".join(lines))
+    return blocks
+
+
+def _pulse_format_emails(email_data):
+    """Format email data for Claude prompt."""
+    blocks = _pulse_email_blocks(email_data)
+    return "\n".join(blocks) if blocks else "(No emails collected)"
+
+
+def _pulse_teams_blocks(teams_data):
+    """One rendered block per Teams message."""
+    blocks = []
+    for i, m in enumerate(teams_data, 1):
+        source = m.get("channel_name") or m.get("chat_type", "chat")
+        blocks.append(f"{i}. [{m['date'][:10]}] ({source}): {m['content_preview']}")
+    return blocks
 
 
 def _pulse_format_teams(teams_data):
     """Format Teams data for Claude prompt."""
-    lines = []
-    for i, m in enumerate(teams_data, 1):
-        source = m.get("channel_name") or m.get("chat_type", "chat")
-        lines.append(f"{i}. [{m['date'][:10]}] ({source}): {m['content_preview']}")
-    return "\n".join(lines) if lines else "(No Teams messages collected)"
+    blocks = _pulse_teams_blocks(teams_data)
+    return "\n".join(blocks) if blocks else "(No Teams messages collected)"
 
 
-def _pulse_format_meetings(meeting_data):
-    """Format meeting data for Claude prompt, including Fireflies links."""
-    lines = []
+def _pulse_meeting_blocks(meeting_data):
+    """One rendered block per meeting."""
+    blocks = []
     for i, m in enumerate(meeting_data, 1):
         date_str = str(m.get('date', ''))[:10] or 'unknown'
         ff_url = m.get("fireflies_url", "")
         link_part = f" | Recording: {ff_url}" if ff_url else ""
-        lines.append(f"{i}. [{date_str}] {m['title']} ({m['duration_minutes']}min){link_part}")
+        lines = [f"{i}. [{date_str}] {m['title']} ({m['duration_minutes']}min){link_part}"]
         if m.get("summary"):
             lines.append(f"   Summary: {m['summary']}")
         if m.get("action_items"):
             lines.append(f"   Action items: {m['action_items']}")
-    return "\n".join(lines) if lines else "(No meetings collected)"
+        blocks.append("\n".join(lines))
+    return blocks
+
+
+def _pulse_format_meetings(meeting_data):
+    """Format meeting data for Claude prompt, including Fireflies links."""
+    blocks = _pulse_meeting_blocks(meeting_data)
+    return "\n".join(blocks) if blocks else "(No meetings collected)"
 
 
 def _pulse_build_meeting_links(meeting_data):
@@ -749,15 +769,127 @@ def _pulse_build_meeting_links(meeting_data):
     return "\n".join(links) if links else "(No meeting recordings available)"
 
 
-PULSE_MAX_INPUT_CHARS = 80000  # ~20K tokens at ~4 chars/token
+def _pulse_input_budget(prompt_template, placeholder):
+    """Chars available for DATA in a single call.
+
+    Subtracts the prompt scaffold AND the briefing-book system prompt. The
+    system prompt counts against the same per-request budget but was never
+    accounted for, so a large briefing book silently pushed every call past
+    the intended ceiling."""
+    scaffold = max(len(prompt_template) - len(placeholder), 0)
+    try:
+        briefing = load_briefing_book() or ""
+    except Exception:
+        briefing = ""
+    system_len = len(briefing) + 32 if briefing else 0
+    return max(PULSE_MAX_INPUT_CHARS - scaffold - system_len - 512, 4000)
 
 
-def _pulse_truncate_input(text, max_chars=PULSE_MAX_INPUT_CHARS):
-    """Truncate text to stay under ~20K token limit for a single analysis pass."""
+def _pulse_pack_chunks(blocks, budget_chars):
+    """Group rendered per-item blocks into chunks that each fit budget_chars.
+
+    Returns a list of block lists. An item is never split across chunks; an
+    item larger than a whole chunk is truncated in place rather than dropped,
+    so one oversized email cannot cost us the chunk it sits in."""
+    chunks, current, size = [], [], 0
+    for block in blocks:
+        if len(block) > budget_chars:
+            block = block[:max(budget_chars - 32, 0)] + "\n   [... item truncated ...]"
+        cost = len(block) + 1
+        if current and size + cost > budget_chars:
+            chunks.append(current)
+            current, size = [], 0
+        current.append(block)
+        size += cost
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _pulse_merge_signals(parts):
+    """Merge per-chunk signal dicts, preserving order, dropping duplicates."""
+    merged = {"green": [], "yellow": [], "red": [], "key_entities": []}
+    seen = {key: set() for key in merged}
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        for key in merged:
+            for item in (part.get(key) or []):
+                value = item.strip() if isinstance(item, str) else item
+                if isinstance(value, str):
+                    if not value:
+                        continue
+                    dedup = value.lower()
+                else:
+                    dedup = json.dumps(value, sort_keys=True, default=str)
+                if dedup in seen[key]:
+                    continue
+                seen[key].add(dedup)
+                merged[key].append(value)
+    return merged
+
+
+def _pulse_run_chunked_pass(label, prompt_template, placeholder, blocks,
+                            empty_text, rate_limit_delay, model=None):
+    """Run one extraction pass over EVERY item, splitting into as many calls
+    as the per-request budget needs and merging the per-chunk signals.
+
+    Before 2.31.0 a pass was one call whose prompt was hard-truncated at
+    PULSE_MAX_INPUT_CHARS. On 2026-08-30 that discarded 154K of 234K chars --
+    roughly two thirds of the week's email -- behind a single WARNING."""
+    import time
+    if not blocks:
+        prompt = prompt_template.replace(placeholder, empty_text)
+        return _pulse_parse_json(_pulse_call_claude(prompt, model=model))
+
+    budget = _pulse_input_budget(prompt_template, placeholder)
+    chunks = _pulse_pack_chunks(blocks, budget)
+
+    if len(chunks) > PULSE_MAX_CHUNKS:
+        dropped = sum(len(c) for c in chunks[PULSE_MAX_CHUNKS:])
+        logger.warning(
+            f"[pulse] {label}: needs {len(chunks)} chunks but PULSE_MAX_CHUNKS is "
+            f"{PULSE_MAX_CHUNKS} -- {dropped} of {len(blocks)} item(s) will NOT be "
+            f"analyzed. Raise PULSE_MAX_CHUNKS or PULSE_MAX_INPUT_CHARS.")
+        chunks = chunks[:PULSE_MAX_CHUNKS]
+
+    if len(chunks) > 1:
+        logger.info(f"[pulse] {label}: {len(blocks)} item(s) exceed the {budget}-char "
+                    f"per-call budget -- splitting into {len(chunks)} calls")
+
+    parts = []
+    for idx, chunk in enumerate(chunks, 1):
+        if idx > 1 and rate_limit_delay:
+            logger.info(f"[pulse] Waiting {rate_limit_delay}s for rate limit...")
+            time.sleep(rate_limit_delay)
+        if len(chunks) > 1:
+            logger.info(f"[pulse] {label}: chunk {idx}/{len(chunks)} "
+                        f"({len(chunk)} items)")
+        prompt = prompt_template.replace(placeholder, "\n".join(chunk))
+        parts.append(_pulse_parse_json(_pulse_call_claude(prompt, model=model)))
+
+    if len(parts) == 1:
+        return parts[0]
+    merged = _pulse_merge_signals(parts)
+    logger.info(f"[pulse] {label}: merged {len(parts)} chunk results -> "
+                f"{len(merged['green'])}G {len(merged['yellow'])}Y "
+                f"{len(merged['red'])}R")
+    return merged
+
+
+def _pulse_truncate_input(text, max_chars=None):
+    """Last-resort ceiling on a single request.
+
+    Extraction passes are chunked upstream (_pulse_run_chunked_pass), so this
+    should now only ever fire for the synthesis passes, whose input is the
+    signal JSON rather than the raw corpus. If it fires there the report is
+    losing signal -- raise PULSE_MAX_INPUT_CHARS rather than ignoring it."""
+    max_chars = PULSE_MAX_INPUT_CHARS if max_chars is None else max_chars
     if len(text) <= max_chars:
         return text
-    logger.warning(f"[pulse] Truncating input from {len(text)} to {max_chars} chars (~20K tokens)")
-    return text[:max_chars] + "\n\n[... TRUNCATED -- input exceeded 20K token limit ...]"
+    logger.warning(f"[pulse] Truncating input from {len(text)} to {max_chars} chars "
+                   f"-- {len(text) - max_chars} chars of signal DROPPED")
+    return text[:max_chars] + "\n\n[... TRUNCATED -- input exceeded the per-call limit ...]"
 
 
 PULSE_MODEL_EXTRACT = "claude-sonnet-4-6"    # Passes 1-3: signal extraction
@@ -837,12 +969,13 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
     """Run 4-pass Claude analysis. Returns (report_markdown, raw_signals_dict)."""
     logger.info("[pulse] Starting 4-pass analysis pipeline")
 
-    rate_limit_delay = 65  # seconds between Claude calls to stay under 30K TPM
+    rate_limit_delay = PULSE_RATE_LIMIT_SECONDS
 
     # Pass 1: Email signals
     logger.info(f"[pulse] Pass 1/4: Analyzing {len(email_data)} emails")
-    email_prompt = PULSE_EMAIL_PROMPT.replace("{emails_text}", _pulse_format_emails(email_data))
-    email_signals = _pulse_parse_json(_pulse_call_claude(email_prompt))
+    email_signals = _pulse_run_chunked_pass(
+        "Pass 1", PULSE_EMAIL_PROMPT, "{emails_text}",
+        _pulse_email_blocks(email_data), "(No emails collected)", rate_limit_delay)
     logger.info(f"[pulse] Pass 1 complete: {len(email_signals.get('green', []))}G "
                 f"{len(email_signals.get('yellow', []))}Y {len(email_signals.get('red', []))}R")
 
@@ -853,8 +986,10 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
 
     # Pass 2: Teams signals
     logger.info(f"[pulse] Pass 2/4: Analyzing {len(teams_data)} Teams messages")
-    teams_prompt = PULSE_TEAMS_PROMPT.replace("{teams_text}", _pulse_format_teams(teams_data))
-    teams_signals = _pulse_parse_json(_pulse_call_claude(teams_prompt))
+    teams_signals = _pulse_run_chunked_pass(
+        "Pass 2", PULSE_TEAMS_PROMPT, "{teams_text}",
+        _pulse_teams_blocks(teams_data), "(No Teams messages collected)",
+        rate_limit_delay)
     logger.info(f"[pulse] Pass 2 complete: {len(teams_signals.get('green', []))}G "
                 f"{len(teams_signals.get('yellow', []))}Y {len(teams_signals.get('red', []))}R")
 
@@ -864,8 +999,10 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
 
     # Pass 3: Meeting signals
     logger.info(f"[pulse] Pass 3/4: Analyzing {len(meeting_data)} meetings")
-    meetings_prompt = PULSE_MEETINGS_PROMPT.replace("{meetings_text}", _pulse_format_meetings(meeting_data))
-    meeting_signals = _pulse_parse_json(_pulse_call_claude(meetings_prompt))
+    meeting_signals = _pulse_run_chunked_pass(
+        "Pass 3", PULSE_MEETINGS_PROMPT, "{meetings_text}",
+        _pulse_meeting_blocks(meeting_data), "(No meetings collected)",
+        rate_limit_delay)
     logger.info(f"[pulse] Pass 3 complete: {len(meeting_signals.get('green', []))}G "
                 f"{len(meeting_signals.get('yellow', []))}Y {len(meeting_signals.get('red', []))}R")
 
@@ -3535,7 +3672,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.30.1-pulse-parse-teams-diag", "deployed": "2026-08-31"})
+    return jsonify({"version": "2.31.0-pulse-full-corpus", "deployed": "2026-08-31"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3603,7 +3740,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.30.1-pulse-parse-teams-diag", "steps": {}}
+    results = {"version": "2.31.0-pulse-full-corpus", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
