@@ -2485,8 +2485,10 @@ def pulse_check_permissions():
             if not discovered:
                 diagnostics["ChannelMessage.Read.All"] = "No Teams found in tenant"
             for team in discovered[:3]:
+                # NO $top here -- Graph rejects it on /channels with a 400.
+                # Mirror _pulse_fetch_team_channels exactly.
                 chres = requests.get(
-                    f"{MS_GRAPH_BASE}/teams/{team['id']}/channels?$select=id&$top=1",
+                    f"{MS_GRAPH_BASE}/teams/{team['id']}/channels?$select=id",
                     headers=headers, timeout=15)
                 if chres.status_code != 200:
                     diagnostics["ChannelMessage.Read.All"] = (
@@ -3672,7 +3674,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.31.0-pulse-full-corpus", "deployed": "2026-08-31"})
+    return jsonify({"version": "2.31.1-check-channels-top", "deployed": "2026-08-31"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3740,7 +3742,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.31.0-pulse-full-corpus", "steps": {}}
+    results = {"version": "2.31.1-check-channels-top", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
