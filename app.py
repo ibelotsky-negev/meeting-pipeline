@@ -13,6 +13,7 @@ Author: Negev Labs
 """
 
 import os
+import re
 import json
 import uuid
 import logging
@@ -132,7 +133,12 @@ def _pulse_has_team_in_from_or_to(msg):
 
 
 def _pulse_fetch_user_emails(user, start_iso, end_iso, headers):
-    """Fetch emails for a single user. Returns (emails_list, scanned_count, cc_skip_count)."""
+    """Fetch emails for one user.
+
+    Returns (emails_list, scanned_count, cc_skip_count, unprovisioned_mail).
+    The last element is the address when the mailbox does not exist (Graph
+    404) and None otherwise, so the caller can summarize instead of logging
+    one WARNING per empty account every run."""
     user_id = user["id"]
     url = (f"{MS_GRAPH_BASE}/users/{user_id}/messages"
            f"?$filter=receivedDateTime ge {start_iso} and receivedDateTime le {end_iso}"
@@ -145,7 +151,11 @@ def _pulse_fetch_user_emails(user, start_iso, end_iso, headers):
         resp = requests.get(url, headers=headers, timeout=30)
         if resp.status_code == 403:
             logger.warning(f"[pulse] No Mail.Read permission for {user['mail']}, skipping")
-            return emails, scanned, cc_skipped
+            return emails, scanned, cc_skipped, None
+        if resp.status_code == 404:
+            # Directory user with no provisioned mailbox -- normal for shared
+            # aliases and departed staff. Counted, not logged individually.
+            return emails, scanned, cc_skipped, user.get("mail") or user.get("id", "")
         resp.raise_for_status()
         messages = resp.json().get("value") or []
         scanned = len(messages)
@@ -166,7 +176,7 @@ def _pulse_fetch_user_emails(user, start_iso, end_iso, headers):
             })
     except Exception as e:
         logger.warning(f"[pulse] Failed to fetch emails for {user['mail']}: {e}")
-    return emails, scanned, cc_skipped
+    return emails, scanned, cc_skipped, None
 
 
 def pulse_collect_emails(start_dt, end_dt):
@@ -182,15 +192,21 @@ def pulse_collect_emails(start_dt, end_dt):
     all_emails = []
     total_scanned = 0
     skipped_cc_only = 0
+    no_mailbox = []
 
     with ThreadPoolExecutor(max_workers=len(users)) as pool:
         futures = {pool.submit(_pulse_fetch_user_emails, u, start_iso, end_iso, headers): u for u in users}
         for future in as_completed(futures):
-            emails, scanned, cc_skipped = future.result()
+            emails, scanned, cc_skipped, unprovisioned = future.result()
             all_emails.extend(emails)
             total_scanned += scanned
             skipped_cc_only += cc_skipped
+            if unprovisioned:
+                no_mailbox.append(unprovisioned)
 
+    if no_mailbox:
+        logger.info(f"[pulse] {len(no_mailbox)} directory user(s) have no mailbox, "
+                    f"skipped: {', '.join(sorted(no_mailbox))}")
     logger.info(f"[pulse] Emails: {total_scanned} scanned, {skipped_cc_only} skipped (CC/BCC only), {len(all_emails)} after filtering")
     return all_emails
 
@@ -217,6 +233,8 @@ def _pulse_fetch_channel_messages(team_id, team_name, channel, start_iso, header
         msg_url = (f"{MS_GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages?$top=50")
         msg_resp = requests.get(msg_url, headers=headers, timeout=30)
         if msg_resp.status_code != 200:
+            logger.warning(f"[pulse] Channel messages returned {msg_resp.status_code} for "
+                           f"{team_name}/{channel_name}: {msg_resp.text[:200]}")
             return results
         for msg in (msg_resp.json().get("value") or []):
             msg_date = msg.get("createdDateTime", "")
@@ -263,6 +281,13 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
     import re
     user_id = user["id"]
     results = []
+    # A refused per-chat message read used to be a bare `continue`, so a
+    # total Teams failure looked exactly like a quiet week. Tally and report
+    # once per user rather than once per chat (which would be hundreds of
+    # lines).
+    msg_errors = {}
+    first_error_body = ""
+    chats_read = 0
     try:
         chats_url = (f"{MS_GRAPH_BASE}/users/{user_id}/chats"
                      f"?$select=id,chatType&$top=50")
@@ -285,7 +310,12 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
                 msg_url = f"{MS_GRAPH_BASE}/chats/{chat_id}/messages?$top=50"
                 msg_resp = requests.get(msg_url, headers=headers, timeout=30)
                 if msg_resp.status_code != 200:
+                    if not msg_errors:
+                        first_error_body = msg_resp.text[:200]
+                    msg_errors[msg_resp.status_code] = msg_errors.get(
+                        msg_resp.status_code, 0) + 1
                     continue
+                chats_read += 1
                 for msg in (msg_resp.json().get("value") or []):
                     msg_date = msg.get("createdDateTime", "")
                     if msg_date and msg_date < start_iso:
@@ -302,6 +332,11 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
                     })
             except Exception as e:
                 logger.warning(f"[pulse] Chat messages failed {chat_id}: {e}")
+        if msg_errors:
+            logger.warning(
+                f"[pulse] Chat messages unreadable for {user['mail']}: "
+                f"{chats_read} chat(s) read, {sum(msg_errors.values())} refused "
+                f"{dict(sorted(msg_errors.items()))}; first body: {first_error_body}")
     except Exception as e:
         logger.warning(f"[pulse] Chats list failed for {user['mail']}: {e}")
     return results
@@ -371,7 +406,8 @@ def pulse_collect_teams(start_dt, end_dt):
     return all_messages
 
 
-PULSE_TEAM_DOMAINS = {"negevlabs.com", "ariadnebio.com", "zirmania.com"}
+PULSE_TEAM_DOMAINS = {"negevlabs.com", "ariadnebio.com", "zirmania.com",
+                      "palomar-labs.com"}
 # Note: negevcap.com excluded -- Negev Capital is out of pulse scope
 
 
@@ -755,17 +791,46 @@ def _pulse_call_claude(prompt_text, model=None, use_briefing=True):
     return response.content[0].text
 
 
+_PULSE_JSON_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\n(.*?)```",
+                                  re.DOTALL | re.IGNORECASE)
+
+
+def _pulse_json_candidates(raw_text):
+    """Yield candidate JSON strings from a Claude reply, likeliest first.
+
+    Claude often opens with prose ("Looking at these summaries, ...") and
+    puts the payload in a fenced block partway down. Testing only for a
+    LEADING fence silently discarded a whole pass -- on 2026-08-30 Pass 3
+    lost every meeting signal that way and reported 0G 0Y 0R. Order: whole
+    text, then any fenced block, then the outermost brace span."""
+    text = (raw_text or "").strip()
+    if not text:
+        return
+    yield text
+    for block in _PULSE_JSON_FENCE_RE.findall(text):
+        candidate = block.strip()
+        if candidate:
+            yield candidate
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        yield text[start:end + 1]
+
+
 def _pulse_parse_json(raw_text):
-    """Parse JSON from Claude response, stripping markdown fences if present."""
-    text = raw_text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        text = text.rsplit("```", 1)[0]
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        logger.warning("[pulse] Failed to parse Claude JSON, returning raw text")
-        return {"green": [], "yellow": [], "red": [], "key_entities": [], "_raw": text}
+    """Parse JSON from a Claude response, tolerating prose and md fences."""
+    for candidate in _pulse_json_candidates(raw_text):
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    text = (raw_text or "").strip()
+    logger.warning(
+        f"[pulse] Failed to parse Claude JSON from {len(text)} chars, "
+        f"returning empty signals. Raw head: {text[:400]!r}")
+    return {"green": [], "yellow": [], "red": [], "key_entities": [], "_raw": text}
 
 
 def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end):
@@ -2204,6 +2269,8 @@ def pulse_check_permissions():
     results = {
         "Mail.Read": False,
         "Chat.Read.All": False,
+        "Chat.Messages.Read": False,
+        "Group.Read.All": False,
         "ChannelMessage.Read.All": False,
         "Mail.Send": True,  # Already confirmed working (Sara sends emails)
     }
@@ -2237,37 +2304,81 @@ def pulse_check_permissions():
     # Note: /chats is delegated-only and fails with app-only tokens
     try:
         if team_users > 0:
-            chat_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/chats?$top=1"
+            chat_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/chats?$select=id&$top=5"
             resp = requests.get(chat_url, headers=headers, timeout=15)
             results["Chat.Read.All"] = resp.status_code == 200
             if resp.status_code != 200:
                 diagnostics["Chat.Read.All"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            else:
+                # Listing chats is NOT what the pulse does -- it reads MESSAGES,
+                # a separate call that used to fail silently. Probe it for real.
+                chat_ids = [c.get("id") for c in (resp.json().get("value") or []) if c.get("id")]
+                if not chat_ids:
+                    diagnostics["Chat.Messages.Read"] = "No chats available to test with"
+                for cid in chat_ids[:3]:
+                    mres = requests.get(f"{MS_GRAPH_BASE}/chats/{cid}/messages?$top=1",
+                                        headers=headers, timeout=15)
+                    if mres.status_code == 200:
+                        results["Chat.Messages.Read"] = True
+                        break
+                    diagnostics["Chat.Messages.Read"] = (
+                        f"HTTP {mres.status_code}: {mres.text[:300]}")
         else:
             diagnostics["Chat.Read.All"] = "No team users to test with"
     except Exception as e:
         logger.warning(f"[pulse] Chat.Read.All check failed: {e}")
         diagnostics["Chat.Read.All"] = str(e)
 
-    # Test ChannelMessage.Read.All: list joined teams for a user
-    # Note: /teams requires Group.Read.All; use /users/{id}/joinedTeams instead
+    # Test Group.Read.All + ChannelMessage.Read.All with the EXACT calls
+    # pulse_collect_teams makes: /groups discovers Teams, then messages are read
+    # from a channel. The old check probed /users/{id}/joinedTeams, which needs
+    # different privileges -- it reported green on 2026-08-30 while /groups was
+    # returning 403 and the entire channel path collected nothing.
     try:
-        if team_users > 0:
-            teams_url = f"{MS_GRAPH_BASE}/users/{users[0]['id']}/joinedTeams"
-            resp = requests.get(teams_url, headers=headers, timeout=15)
-            results["ChannelMessage.Read.All"] = resp.status_code == 200
-            if resp.status_code != 200:
-                diagnostics["ChannelMessage.Read.All"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+        groups_url = (f"{MS_GRAPH_BASE}/groups"
+                      f"?$filter=resourceProvisioningOptions/Any(x:x eq 'Team')"
+                      f"&$select=id,displayName&$top=5")
+        resp = requests.get(groups_url, headers=headers, timeout=15)
+        results["Group.Read.All"] = resp.status_code == 200
+        if resp.status_code != 200:
+            diagnostics["Group.Read.All"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            diagnostics["ChannelMessage.Read.All"] = "Not reached -- Teams discovery failed"
         else:
-            diagnostics["ChannelMessage.Read.All"] = "No team users to test with"
+            discovered = resp.json().get("value") or []
+            if not discovered:
+                diagnostics["ChannelMessage.Read.All"] = "No Teams found in tenant"
+            for team in discovered[:3]:
+                chres = requests.get(
+                    f"{MS_GRAPH_BASE}/teams/{team['id']}/channels?$select=id&$top=1",
+                    headers=headers, timeout=15)
+                if chres.status_code != 200:
+                    diagnostics["ChannelMessage.Read.All"] = (
+                        f"channels HTTP {chres.status_code}: {chres.text[:200]}")
+                    continue
+                channels = chres.json().get("value") or []
+                if not channels:
+                    continue
+                mres = requests.get(
+                    f"{MS_GRAPH_BASE}/teams/{team['id']}/channels/{channels[0]['id']}"
+                    f"/messages?$top=1", headers=headers, timeout=15)
+                if mres.status_code == 200:
+                    results["ChannelMessage.Read.All"] = True
+                    break
+                diagnostics["ChannelMessage.Read.All"] = (
+                    f"HTTP {mres.status_code}: {mres.text[:300]}")
     except Exception as e:
-        logger.warning(f"[pulse] ChannelMessage.Read.All check failed: {e}")
-        diagnostics["ChannelMessage.Read.All"] = str(e)
+        logger.warning(f"[pulse] Teams permission check failed: {e}")
+        diagnostics["Group.Read.All"] = str(e)
 
     ready = all(results.values()) and team_users > 0
     response = {
         "permissions": results,
         "team_users_found": team_users,
         "ready": ready,
+        # Split out so a Teams gap does not mask a healthy mail path, which is
+        # where the overwhelming majority of pulse signal comes from.
+        "mail_ready": bool(results["Mail.Read"] and results["Mail.Send"] and team_users > 0),
+        "teams_ready": bool(results["Group.Read.All"] and results["ChannelMessage.Read.All"]),
     }
     if diagnostics:
         response["diagnostics"] = diagnostics
@@ -3424,7 +3535,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.30.0-followup-pilot", "deployed": "2026-08-20"})
+    return jsonify({"version": "2.30.1-pulse-parse-teams-diag", "deployed": "2026-08-31"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3492,7 +3603,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.30.0-followup-pilot", "steps": {}}
+    results = {"version": "2.30.1-pulse-parse-teams-diag", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
