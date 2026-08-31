@@ -167,6 +167,15 @@ PULSE_SENDER = "sara@palomar-labs.com"
 PULSE_DOMAINS = ["negevlabs.com", "ariadnebio.com", "palomar-labs.com"]
 PULSE_ARCHIVE_DIR = os.path.join(DATA_DIR, "pulse")
 PULSE_LOOKBACK_DAYS = 7
+# Per-request input ceiling for one analysis pass. Data beyond it is no
+# longer dropped -- the pass is split into this many chars per call and the
+# per-chunk signals are merged (2.31.0). PULSE_RATE_LIMIT_SECONDS is the
+# pause between consecutive Claude calls; at ~20K tokens per call it keeps
+# the run under a 30K input TPM ceiling. Raise the cap / drop the delay if
+# the account moves to a higher tier.
+PULSE_MAX_INPUT_CHARS = int(os.environ.get("PULSE_MAX_INPUT_CHARS", "80000"))
+PULSE_MAX_CHUNKS = int(os.environ.get("PULSE_MAX_CHUNKS", "12"))
+PULSE_RATE_LIMIT_SECONDS = int(os.environ.get("PULSE_RATE_LIMIT_SECONDS", "65"))
 BRIEFING_BOOK_PATH = os.path.join(DATA_DIR, "briefing-book.md")
 BRIEFING_BOOK_REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "briefing-book.md")
 
