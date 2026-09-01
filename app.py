@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Config and config-domain primitives live in config.py. Re-exported here
 # so existing references and tests (app_module.X) keep resolving. ASCII-only.
-from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_API_KEY, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_REFRESH_TOKEN, MS_GRAPH_AUTH_MODE, ASANA_WORKSPACE_GID, ASANA_PROJECT_GID, HUBSPOT_OWNER_ID, POLL_INTERVAL_MINUTES, APP_BASE_URL, NOTIFY_VIA, SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, BOT_SENDER_EMAIL, BOT_SENDER_NAME, INTERNAL_DOMAINS, HUBSPOT_OWNER_MAP_RAW, HUBSPOT_OWNER_MAP, TEAM_MEMBER_NAMES_RAW, TEAM_MEMBER_NAMES, TEAM_MEMBERS_LIST, EMAIL_ALIAS_MAP, EMAIL_ALIAS_MAP_RAW, DATA_DIR, PROCESSED_FILE, PENDING_FILE, SYNC_MAP_FILE, TODO_LIST_NAME, TODO_POLL_INTERVAL, RAILWAY_PUBLIC_URL, TEAMS_WEBHOOK_SECRET, TEAMS_TRANSCRIPT_ENABLED, TEAMS_ORGANIZER_USER_ID, TEAMS_POLL_USER_IDS, TEAMS_POLL_INTERVAL, SUBSCRIPTION_FILE, PULSE_RECIPIENTS, PULSE_SENDER, PULSE_DOMAINS, PULSE_ARCHIVE_DIR, PULSE_LOOKBACK_DAYS, PULSE_MAX_INPUT_CHARS, PULSE_MAX_CHUNKS, PULSE_RATE_LIMIT_SECONDS, BRIEFING_BOOK_PATH, BRIEFING_BOOK_REPO, PULSE_SKIP_SENDERS, PULSE_SKIP_DOMAINS, PULSE_SKIP_SUBJECTS, normalize_team_email, load_briefing_book, is_internal_email, resolve_internal_organizer)  # noqa: F401
+from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_API_KEY, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_REFRESH_TOKEN, MS_GRAPH_AUTH_MODE, ASANA_WORKSPACE_GID, ASANA_PROJECT_GID, HUBSPOT_OWNER_ID, POLL_INTERVAL_MINUTES, APP_BASE_URL, NOTIFY_VIA, SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, BOT_SENDER_EMAIL, BOT_SENDER_NAME, INTERNAL_DOMAINS, HUBSPOT_OWNER_MAP_RAW, HUBSPOT_OWNER_MAP, TEAM_MEMBER_NAMES_RAW, TEAM_MEMBER_NAMES, TEAM_MEMBERS_LIST, EMAIL_ALIAS_MAP, EMAIL_ALIAS_MAP_RAW, DATA_DIR, PROCESSED_FILE, PENDING_FILE, SYNC_MAP_FILE, TODO_LIST_NAME, TODO_POLL_INTERVAL, RAILWAY_PUBLIC_URL, TEAMS_WEBHOOK_SECRET, TEAMS_TRANSCRIPT_ENABLED, TEAMS_ORGANIZER_USER_ID, TEAMS_POLL_USER_IDS, TEAMS_POLL_INTERVAL, SUBSCRIPTION_FILE, PULSE_RECIPIENTS, PULSE_SENDER, PULSE_DOMAINS, PULSE_ARCHIVE_DIR, PULSE_LOOKBACK_DAYS, PULSE_MAX_INPUT_CHARS, PULSE_MAX_CHUNKS, PULSE_RATE_LIMIT_SECONDS, PULSE_TEAM_DOMAINS, PULSE_CHAT_PAGE_LIMIT, PULSE_MESSAGE_PAGE_LIMIT, BRIEFING_BOOK_PATH, BRIEFING_BOOK_REPO, PULSE_SKIP_SENDERS, PULSE_SKIP_DOMAINS, PULSE_SKIP_SUBJECTS, normalize_team_email, load_briefing_book, is_internal_email, resolve_internal_organizer)  # noqa: F401
 from prompts import (PULSE_SCOPE, PULSE_ANTI_HALLUCINATION, PULSE_EMAIL_PROMPT, PULSE_TEAMS_PROMPT, PULSE_MEETINGS_PROMPT, PULSE_SYNTHESIS_PROMPT, PULSE_BRIEFING_UPDATE_PROMPT)  # noqa: F401
 from templates import REVIEW_TEMPLATE, RESULT_TEMPLATE  # noqa: F401
 from datetime_utils import to_hubspot_ms, to_graph_datetime, resolve_due_date  # noqa: F401
@@ -120,14 +120,18 @@ def pulse_should_skip_email(msg):
 
 
 def _pulse_has_team_in_from_or_to(msg):
-    """Check if at least one team member (PULSE_DOMAINS) is in From or To fields.
-    Emails where team is only in CC/BCC are excluded."""
+    """Check if at least one team address (PULSE_TEAM_DOMAINS) is in From or To.
+    Emails where the team is only in CC/BCC are excluded.
+
+    Gated on PULSE_TEAM_DOMAINS, NOT PULSE_DOMAINS: the scan set shrank to
+    palomar-labs.com + ariadnebio.com on 2026-09-01, but bk@negevlabs.com is
+    still the team's canonical address, and mail to it must keep counting."""
     from_addr = (msg.get("from", {}).get("emailAddress", {}).get("address") or "").lower()
-    if any(from_addr.endswith(f"@{d}") for d in PULSE_DOMAINS):
+    if any(from_addr.endswith(f"@{d}") for d in PULSE_TEAM_DOMAINS):
         return True
     for recip in (msg.get("toRecipients") or []):
         addr = (recip.get("emailAddress", {}).get("address") or "").lower()
-        if any(addr.endswith(f"@{d}") for d in PULSE_DOMAINS):
+        if any(addr.endswith(f"@{d}") for d in PULSE_TEAM_DOMAINS):
             return True
     return False
 
@@ -223,20 +227,78 @@ def pulse_should_skip_teams_msg(msg):
     return False
 
 
+def _pulse_graph_collect(url, headers, page_limit=1):
+    """GET a Graph collection, following @odata.nextLink up to page_limit pages.
+
+    Returns (items, truncated, error_status, error_body). Graph caps $top at 50
+    on /chats, /messages and /channels, and the pulse never followed nextLink --
+    so a user with 50+ chats was silently cut off at 50 (seven of the team's
+    accounts sat exactly at that cap on 2026-09-01). `truncated` is True when
+    more pages existed than page_limit allowed, so the caller can say so rather
+    than reporting a partial read as complete."""
+    items = []
+    next_url = url
+    pages = 0
+    while next_url:
+        resp = requests.get(next_url, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            return items, False, resp.status_code, resp.text[:200]
+        body = resp.json() or {}
+        items.extend(body.get("value") or [])
+        pages += 1
+        next_url = body.get("@odata.nextLink")
+        if next_url and pages >= page_limit:
+            return items, True, None, ""
+    return items, False, None, ""
+
+
+def _pulse_new_teams_stats():
+    """Per-collection counters so a coverage gap is reportable, not invisible."""
+    return {"read": 0, "refused": 0, "statuses": {}, "truncated": 0,
+            "first_error": "", "chats_seen": 0}
+
+
+def _pulse_merge_teams_stats(agg, part, kind):
+    """Fold one collection's stats into the run-level aggregate."""
+    agg[kind + "_read"] += part.get("read", 0)
+    agg[kind + "_refused"] += part.get("refused", 0)
+    agg["truncated"] += part.get("truncated", 0)
+    agg["chats_seen"] += part.get("chats_seen", 0)
+    if part.get("refused"):
+        agg["sources_with_refusals"] += 1
+    for code, n in (part.get("statuses") or {}).items():
+        agg["statuses"][code] = agg["statuses"].get(code, 0) + n
+    if part.get("first_error") and not agg["first_error"]:
+        agg["first_error"] = part["first_error"]
+
+
 def _pulse_fetch_channel_messages(team_id, team_name, channel, start_iso, headers):
-    """Fetch messages from a single channel. Returns list of message dicts."""
+    """Fetch messages from a single channel. Returns (message_dicts, stats)."""
     import re
     channel_id = channel["id"]
     channel_name = channel.get("displayName", "")
+    label = f"{team_name}/{channel_name}"
     results = []
+    stats = _pulse_new_teams_stats()
     try:
-        msg_url = (f"{MS_GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages?$top=50")
-        msg_resp = requests.get(msg_url, headers=headers, timeout=30)
-        if msg_resp.status_code != 200:
-            logger.warning(f"[pulse] Channel messages returned {msg_resp.status_code} for "
-                           f"{team_name}/{channel_name}: {msg_resp.text[:200]}")
-            return results
-        for msg in (msg_resp.json().get("value") or []):
+        msg_url = (f"{MS_GRAPH_BASE}/teams/{team_id}/channels/{channel_id}"
+                   f"/messages?$top=50")
+        msgs, truncated, err, err_body = _pulse_graph_collect(
+            msg_url, headers, PULSE_MESSAGE_PAGE_LIMIT)
+        if err is not None:
+            stats["refused"] = 1
+            stats["statuses"][err] = 1
+            stats["first_error"] = err_body
+            logger.warning(f"[pulse] Channel messages returned {err} for "
+                           f"{label}: {err_body}")
+            return results, stats
+        stats["read"] = 1
+        if truncated:
+            stats["truncated"] = 1
+            logger.warning(f"[pulse] Channel {label}: more than "
+                           f"{PULSE_MESSAGE_PAGE_LIMIT} pages of messages -- older "
+                           f"ones unread (raise PULSE_MESSAGE_PAGE_LIMIT)")
+        for msg in msgs:
             msg_date = msg.get("createdDateTime", "")
             if msg_date and msg_date < start_iso:
                 continue
@@ -247,12 +309,12 @@ def _pulse_fetch_channel_messages(team_id, team_name, channel, start_iso, header
             results.append({
                 "content_preview": text[:300],
                 "chat_type": "channel",
-                "channel_name": f"{team_name}/{channel_name}",
+                "channel_name": label,
                 "date": msg_date,
             })
     except Exception as e:
-        logger.warning(f"[pulse] Channel msgs failed {team_name}/{channel_name}: {e}")
-    return results
+        logger.warning(f"[pulse] Channel msgs failed {label}: {e}")
+    return results, stats
 
 
 def _pulse_fetch_team_channels(team, start_iso, headers, pool):
@@ -261,13 +323,17 @@ def _pulse_fetch_team_channels(team, start_iso, headers, pool):
     team_name = team.get("displayName", "")
     futures = []
     try:
-        ch_resp = requests.get(
+        # NO $top here -- Graph rejects it on /channels with a 400.
+        channels, truncated, err, err_body = _pulse_graph_collect(
             f"{MS_GRAPH_BASE}/teams/{team_id}/channels?$select=id,displayName",
-            headers=headers, timeout=30)
-        if ch_resp.status_code != 200:
-            logger.warning(f"[pulse] Channels returned {ch_resp.status_code} for {team_name}")
+            headers, PULSE_CHAT_PAGE_LIMIT)
+        if err is not None:
+            logger.warning(f"[pulse] Channels returned {err} for {team_name}: "
+                           f"{err_body}")
             return futures
-        channels = ch_resp.json().get("value") or []
+        if truncated:
+            logger.warning(f"[pulse] Team {team_name}: channel list truncated at "
+                           f"{PULSE_CHAT_PAGE_LIMIT} pages")
         for channel in channels:
             futures.append(pool.submit(
                 _pulse_fetch_channel_messages, team_id, team_name, channel, start_iso, headers))
@@ -277,25 +343,33 @@ def _pulse_fetch_team_channels(team, start_iso, headers, pool):
 
 
 def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
-    """Fetch chat messages for a single user. Returns list of message dicts."""
+    """Fetch chat messages for a single user. Returns (message_dicts, stats).
+
+    A refused per-chat message read used to be a bare `continue`, so a total
+    Teams failure looked exactly like a quiet week. Refusals are counted and
+    reported once per user rather than once per chat."""
     import re
     user_id = user["id"]
+    mail = user.get("mail") or user_id
     results = []
-    # A refused per-chat message read used to be a bare `continue`, so a
-    # total Teams failure looked exactly like a quiet week. Tally and report
-    # once per user rather than once per chat (which would be hundreds of
-    # lines).
-    msg_errors = {}
-    first_error_body = ""
-    chats_read = 0
+    stats = _pulse_new_teams_stats()
     try:
         chats_url = (f"{MS_GRAPH_BASE}/users/{user_id}/chats"
                      f"?$select=id,chatType&$top=50")
-        chats_resp = requests.get(chats_url, headers=headers, timeout=30)
-        if chats_resp.status_code != 200:
-            logger.warning(f"[pulse] Chats returned {chats_resp.status_code} for {user['mail']}")
-            return results
-        chats = chats_resp.json().get("value") or []
+        chats, chats_truncated, err, err_body = _pulse_graph_collect(
+            chats_url, headers, PULSE_CHAT_PAGE_LIMIT)
+        if err is not None:
+            logger.warning(f"[pulse] Chats returned {err} for {mail}: {err_body}")
+            stats["statuses"][err] = 1
+            stats["refused"] = 1
+            stats["first_error"] = err_body
+            return results, stats
+        stats["chats_seen"] = len(chats)
+        if chats_truncated:
+            stats["truncated"] += 1
+            logger.warning(f"[pulse] {mail}: chat list truncated at "
+                           f"{PULSE_CHAT_PAGE_LIMIT} pages ({len(chats)} chats) -- "
+                           f"raise PULSE_CHAT_PAGE_LIMIT")
         for chat in chats:
             chat_id = chat["id"]
             # Thread-safe dedup
@@ -307,16 +381,19 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
             if chat_type == "meeting":
                 continue
             try:
-                msg_url = f"{MS_GRAPH_BASE}/chats/{chat_id}/messages?$top=50"
-                msg_resp = requests.get(msg_url, headers=headers, timeout=30)
-                if msg_resp.status_code != 200:
-                    if not msg_errors:
-                        first_error_body = msg_resp.text[:200]
-                    msg_errors[msg_resp.status_code] = msg_errors.get(
-                        msg_resp.status_code, 0) + 1
+                msgs, truncated, merr, merr_body = _pulse_graph_collect(
+                    f"{MS_GRAPH_BASE}/chats/{chat_id}/messages?$top=50",
+                    headers, PULSE_MESSAGE_PAGE_LIMIT)
+                if merr is not None:
+                    if not stats["first_error"]:
+                        stats["first_error"] = merr_body
+                    stats["refused"] += 1
+                    stats["statuses"][merr] = stats["statuses"].get(merr, 0) + 1
                     continue
-                chats_read += 1
-                for msg in (msg_resp.json().get("value") or []):
+                stats["read"] += 1
+                if truncated:
+                    stats["truncated"] += 1
+                for msg in msgs:
                     msg_date = msg.get("createdDateTime", "")
                     if msg_date and msg_date < start_iso:
                         continue
@@ -332,14 +409,20 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
                     })
             except Exception as e:
                 logger.warning(f"[pulse] Chat messages failed {chat_id}: {e}")
-        if msg_errors:
+        if stats["refused"]:
             logger.warning(
-                f"[pulse] Chat messages unreadable for {user['mail']}: "
-                f"{chats_read} chat(s) read, {sum(msg_errors.values())} refused "
-                f"{dict(sorted(msg_errors.items()))}; first body: {first_error_body}")
+                f"[pulse] Chat messages unreadable for {mail}: "
+                f"{stats['read']} chat(s) read, {stats['refused']} refused "
+                f"{dict(sorted(stats['statuses'].items()))}; "
+                f"first body: {stats['first_error']}")
     except Exception as e:
-        logger.warning(f"[pulse] Chats list failed for {user['mail']}: {e}")
-    return results
+        logger.warning(f"[pulse] Chats list failed for {mail}: {e}")
+    return results, stats
+
+
+# Last pulse_collect_teams coverage numbers, surfaced by /pulse/debug.
+# Single-worker topology (see Procfile) makes a module global safe here.
+_pulse_last_teams_diag = {}
 
 
 def pulse_collect_teams(start_dt, end_dt):
@@ -353,6 +436,9 @@ def pulse_collect_teams(start_dt, end_dt):
     all_messages = []
     channel_count = 0
     chat_count = 0
+    agg = {"chat_read": 0, "chat_refused": 0, "channel_read": 0,
+           "channel_refused": 0, "statuses": {}, "truncated": 0,
+           "chats_seen": 0, "sources_with_refusals": 0, "first_error": ""}
 
     # Use a shared pool for all concurrent Graph API calls (limit to 8 to avoid throttling)
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -391,24 +477,37 @@ def pulse_collect_teams(start_dt, end_dt):
 
         # Collect all channel results
         for future in as_completed(channel_futures):
-            msgs = future.result()
+            msgs, part = future.result()
             all_messages.extend(msgs)
             channel_count += len(msgs)
+            _pulse_merge_teams_stats(agg, part, "channel")
 
         # Collect all chat results
         for future in as_completed(chat_futures):
-            msgs = future.result()
+            msgs, part = future.result()
             all_messages.extend(msgs)
             chat_count += len(msgs)
+            _pulse_merge_teams_stats(agg, part, "chat")
 
     logger.info(f"[pulse] Teams: {len(all_messages)} messages "
                 f"({channel_count} channel, {chat_count} chat)")
+    # Say the coverage gap out loud. On 2026-09-01 roughly 45% of chats came
+    # back 403 AclCheckFailed despite Chat.Read.All + ChatMessage.Read.All being
+    # granted, which is invisible unless it is summarized somewhere.
+    if agg["chat_refused"] or agg["channel_refused"] or agg["truncated"]:
+        total = agg["chat_read"] + agg["chat_refused"]
+        pct = (100.0 * agg["chat_refused"] / total) if total else 0.0
+        logger.warning(
+            f"[pulse] Teams coverage gap: chats {agg['chat_read']} read / "
+            f"{agg['chat_refused']} refused ({pct:.0f}% refused) across "
+            f"{agg['sources_with_refusals']} source(s); channels "
+            f"{agg['channel_read']} read / {agg['channel_refused']} refused; "
+            f"{agg['truncated']} collection(s) page-truncated. Statuses "
+            f"{dict(sorted(agg['statuses'].items()))}. "
+            f"First error: {agg['first_error'][:160]}")
+    _pulse_last_teams_diag.clear()
+    _pulse_last_teams_diag.update(agg)
     return all_messages
-
-
-PULSE_TEAM_DOMAINS = {"negevlabs.com", "ariadnebio.com", "zirmania.com",
-                      "palomar-labs.com"}
-# Note: negevcap.com excluded -- Negev Capital is out of pulse scope
 
 
 def _pulse_is_team_meeting(participants):
@@ -2387,7 +2486,9 @@ def pulse_debug():
 
     try:
         teams = pulse_collect_teams(start_dt, end_dt)
-        results["teams"] = {"count": len(teams), "sample": teams[:2] if teams else []}
+        results["teams"] = {"count": len(teams),
+                            "sample": teams[:2] if teams else [],
+                            "coverage": dict(_pulse_last_teams_diag)}
     except Exception as e:
         results["teams"] = {"error": str(e), "traceback": tb.format_exc()}
 
@@ -3674,7 +3775,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.31.1-check-channels-top", "deployed": "2026-08-31"})
+    return jsonify({"version": "2.31.2-teams-coverage", "deployed": "2026-09-01"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3742,7 +3843,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.31.1-check-channels-top", "steps": {}}
+    results = {"version": "2.31.2-teams-coverage", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

@@ -164,7 +164,25 @@ SUBSCRIPTION_FILE = os.path.join(DATA_DIR, "graph_subscription.json")
 
 PULSE_RECIPIENTS = ["bk@negevlabs.com", "vu@negevcap.com"]
 PULSE_SENDER = "sara@palomar-labs.com"
-PULSE_DOMAINS = ["negevlabs.com", "ariadnebio.com", "palomar-labs.com"]
+# Accounts the pulse ENUMERATES and scans (mailboxes + Teams chats).
+# negevlabs.com was dropped 2026-09-01: a live audit found it holds only
+# legacy and service accounts (bh@, test@, meetings@, michal@ plus five
+# mailbox-less directory entries). The team works out of palomar-labs.com
+# and ariadnebio.com.
+PULSE_DOMAINS = ["palomar-labs.com", "ariadnebio.com"]
+# Addresses that COUNT AS TEAM when they appear in an email From/To or on a
+# Fireflies meeting. DELIBERATELY WIDER than PULSE_DOMAINS: bk@negevlabs.com
+# is still Ken's canonical address downstream (HubSpot owner map, pulse
+# recipients), so mail to or from it must not be scored as external just
+# because that domain is no longer scanned for mailboxes.
+# Note: negevcap.com excluded -- Negev Capital is out of pulse scope.
+PULSE_TEAM_DOMAINS = {"negevlabs.com", "ariadnebio.com", "palomar-labs.com",
+                      "zirmania.com"}
+# Graph caps $top at 50 on /chats, /messages and /channels. The pulse never
+# followed @odata.nextLink, so a user with 50+ chats was silently cut off --
+# seven accounts sat exactly at 50 on 2026-09-01. These bound the paging.
+PULSE_CHAT_PAGE_LIMIT = int(os.environ.get("PULSE_CHAT_PAGE_LIMIT", "6"))
+PULSE_MESSAGE_PAGE_LIMIT = int(os.environ.get("PULSE_MESSAGE_PAGE_LIMIT", "4"))
 PULSE_ARCHIVE_DIR = os.path.join(DATA_DIR, "pulse")
 PULSE_LOOKBACK_DAYS = 7
 # Per-request input ceiling for one analysis pass. Data beyond it is no

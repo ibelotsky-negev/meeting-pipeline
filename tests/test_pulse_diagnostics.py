@@ -236,7 +236,7 @@ class TestTeamsFailuresAreLogged:
 
         route(monkeypatch, handler)
         with caplog.at_level(logging.WARNING):
-            out = app_module._pulse_fetch_user_chats(
+            out, stats = app_module._pulse_fetch_user_chats(
                 self._chat_user(), "2026-08-23T00:00:00Z", {}, set(), threading.Lock())
         assert out == []
         assert "Chat messages unreadable for bk@negevlabs.com" in caplog.text
@@ -244,6 +244,11 @@ class TestTeamsFailuresAreLogged:
         assert "protected API" in caplog.text
         # Summarized once per user, not once per chat.
         assert caplog.text.count("Chat messages unreadable") == 1
+        # The refusal must be COUNTED, not just logged -- the run-level
+        # aggregate is what makes a 45%-refused week visible.
+        assert stats["refused"] == 2 and stats["read"] == 0
+        assert stats["statuses"] == {403: 2}
+        assert "protected API" in stats["first_error"]
 
     def test_successful_chats_log_nothing(self, monkeypatch, caplog):
         def handler(url):
@@ -256,21 +261,118 @@ class TestTeamsFailuresAreLogged:
 
         route(monkeypatch, handler)
         with caplog.at_level(logging.WARNING):
-            out = app_module._pulse_fetch_user_chats(
+            out, stats = app_module._pulse_fetch_user_chats(
                 self._chat_user(), "2026-08-23T00:00:00Z", {}, set(), threading.Lock())
         assert len(out) == 1
         assert "Ichilov package" in out[0]["content_preview"]
         assert "unreadable" not in caplog.text
+        assert stats["read"] == 1 and stats["refused"] == 0
 
     def test_refused_channel_messages_are_logged(self, monkeypatch, caplog):
         route(monkeypatch, lambda url: FakeResponse(403, text="Forbidden"))
         with caplog.at_level(logging.WARNING):
-            out = app_module._pulse_fetch_channel_messages(
+            out, stats = app_module._pulse_fetch_channel_messages(
                 "t1", "Negev", {"id": "ch1", "displayName": "General"},
                 "2026-08-23T00:00:00Z", {})
         assert out == []
         assert "Channel messages returned 403" in caplog.text
         assert "Negev/General" in caplog.text
+        assert stats["refused"] == 1 and stats["statuses"] == {403: 1}
+
+
+class TestGraphPagination:
+    """Graph caps $top at 50 and the pulse never followed @odata.nextLink, so
+    seven accounts sat exactly at 50 chats on 2026-09-01 -- silently truncated."""
+
+    def test_follows_next_link_across_pages(self, monkeypatch):
+        pages = {
+            "start": {"value": [{"id": "a"}], "@odata.nextLink": "page2"},
+            "page2": {"value": [{"id": "b"}], "@odata.nextLink": "page3"},
+            "page3": {"value": [{"id": "c"}]},
+        }
+        route(monkeypatch, lambda url: FakeResponse(200, pages[url]))
+        items, truncated, err, _ = app_module._pulse_graph_collect("start", {}, 10)
+        assert [i["id"] for i in items] == ["a", "b", "c"]
+        assert truncated is False and err is None
+
+    def test_single_page_needs_no_paging(self, monkeypatch):
+        route(monkeypatch, lambda url: FakeResponse(200, {"value": [{"id": "a"}]}))
+        items, truncated, err, _ = app_module._pulse_graph_collect("start", {}, 5)
+        assert len(items) == 1 and truncated is False and err is None
+
+    def test_page_limit_reports_truncation(self, monkeypatch):
+        """A bounded read must announce itself, never look complete."""
+        route(monkeypatch, lambda url: FakeResponse(
+            200, {"value": [{"id": url}], "@odata.nextLink": "more"}))
+        items, truncated, err, _ = app_module._pulse_graph_collect("start", {}, 3)
+        assert len(items) == 3
+        assert truncated is True and err is None
+
+    def test_error_surfaces_status_and_body(self, monkeypatch):
+        route(monkeypatch, lambda url: FakeResponse(403, text="AclCheckFailed"))
+        items, truncated, err, body = app_module._pulse_graph_collect("start", {}, 5)
+        assert items == [] and err == 403 and "AclCheckFailed" in body
+
+    def test_error_midway_keeps_earlier_pages(self, monkeypatch):
+        def handler(url):
+            if url == "start":
+                return FakeResponse(200, {"value": [{"id": "a"}],
+                                          "@odata.nextLink": "boom"})
+            return FakeResponse(500, text="server error")
+        route(monkeypatch, handler)
+        items, truncated, err, _ = app_module._pulse_graph_collect("start", {}, 5)
+        assert [i["id"] for i in items] == ["a"]
+        assert err == 500
+
+    def test_user_chats_paginate_past_fifty(self, monkeypatch):
+        """The actual regression: a user with more than one page of chats."""
+        page1 = {"value": [{"id": "c%d" % i, "chatType": "oneOnOne"}
+                           for i in range(50)],
+                 "@odata.nextLink": "chats-page-2"}
+        page2 = {"value": [{"id": "c50", "chatType": "oneOnOne"}]}
+        msg = {"messageType": "message", "createdDateTime": "2026-08-25T10:00:00Z",
+               "body": {"content": "<p>a message long enough to survive</p>"}}
+
+        def handler(url):
+            if url == "chats-page-2":
+                return FakeResponse(200, page2)
+            if "/chats?" in url or url.endswith("/chats"):
+                return FakeResponse(200, page1)
+            return FakeResponse(200, {"value": [msg]})
+
+        route(monkeypatch, handler)
+        out, stats = app_module._pulse_fetch_user_chats(
+            {"id": "u1", "mail": "ken@palomar-labs.com"},
+            "2026-08-23T00:00:00Z", {}, set(), threading.Lock())
+        assert stats["chats_seen"] == 51, "the 51st chat was dropped at the cap"
+        assert stats["read"] == 51
+        assert len(out) == 51
+
+
+class TestScanVersusTeamDomains:
+    """PULSE_DOMAINS (which mailboxes to scan) and PULSE_TEAM_DOMAINS (which
+    addresses count as team) are deliberately different sets."""
+
+    def test_only_palomar_and_ariadne_are_scanned(self):
+        assert set(app_module.PULSE_DOMAINS) == {"palomar-labs.com", "ariadnebio.com"}
+        assert "negevlabs.com" not in app_module.PULSE_DOMAINS
+
+    def test_negevlabs_still_counts_as_team(self):
+        """bk@negevlabs.com is still the canonical downstream address -- mail
+        touching it must not be scored external just because the domain is no
+        longer scanned for mailboxes."""
+        assert "negevlabs.com" in app_module.PULSE_TEAM_DOMAINS
+        msg = {"from": {"emailAddress": {"address": "bk@negevlabs.com"}},
+               "toRecipients": [{"emailAddress": {"address": "vc@example.com"}}]}
+        assert app_module._pulse_has_team_in_from_or_to(msg) is True
+
+    def test_negevlabs_meeting_still_counts_as_team(self):
+        assert app_module._pulse_is_team_meeting(["bk@negevlabs.com"]) is True
+
+    def test_external_only_still_excluded(self):
+        msg = {"from": {"emailAddress": {"address": "a@example.com"}},
+               "toRecipients": [{"emailAddress": {"address": "b@example.org"}}]}
+        assert app_module._pulse_has_team_in_from_or_to(msg) is False
 
 
 # ----------------------------------------------------------------------
