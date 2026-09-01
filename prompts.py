@@ -213,4 +213,9 @@ OUTPUT (JSON):
   "no_changes_needed": true/false
 }
 
-Only include HIGH confidence changes. Medium = flag but don't auto-apply. Low = skip entirely."""
+Only include HIGH confidence changes. Medium = flag but don't auto-apply. Low = skip entirely.
+
+CRITICAL OUTPUT REQUIREMENT: reply with the JSON object above and NOTHING ELSE.
+No preamble, no summary, no markdown report, no prose before or after. The first
+character of your reply must be '{' and the last must be '}'. If nothing should
+change, return {"proposed_updates": [], "no_changes_needed": true}."""
