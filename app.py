@@ -368,6 +368,12 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
         stamp = ((chat.get("lastMessagePreview") or {}).get("createdDateTime") or "")
         return bool(stamp) and stamp < start_iso
 
+    def _msg_is_stale(msg):
+        """Same idea one level down, valid only because the message walk asks
+        for $orderby=createdDateTime desc explicitly."""
+        stamp = msg.get("createdDateTime") or ""
+        return bool(stamp) and stamp < start_iso
+
     try:
         # $orderby=lastMessagePreview/createdDateTime desc is supported here
         # (verified live 2026-09-01; $orderby=lastUpdatedDateTime is NOT). The
@@ -403,9 +409,20 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
                 stats["skipped"] += 1
                 continue
             try:
+                # $orderby=createdDateTime desc IS supported on chat messages
+                # and verified to yield STRICTLY descending order (8/8 chats,
+                # 2026-09-01). The DEFAULT order is not safe to exit early on:
+                # it sorts by lastModifiedDateTime, so an edited old message
+                # floats to the top and 3 of 6 sampled chats came back
+                # unsorted by createdDateTime. Without the explicit $orderby
+                # this stop_when would silently drop in-window messages.
+                # NOTE: channel messages REJECT $orderby (HTTP 400), which is
+                # why _pulse_fetch_channel_messages has no early exit.
                 msgs, truncated, merr, merr_body = _pulse_graph_collect(
-                    f"{MS_GRAPH_BASE}/chats/{chat_id}/messages?$top=50",
-                    headers, PULSE_MESSAGE_PAGE_LIMIT)
+                    f"{MS_GRAPH_BASE}/chats/{chat_id}/messages"
+                    f"?$top=50&$orderby=createdDateTime desc",
+                    headers, PULSE_MESSAGE_PAGE_LIMIT,
+                    stop_when=_msg_is_stale)
                 if merr is not None:
                     if not stats["first_error"]:
                         stats["first_error"] = merr_body
@@ -1332,15 +1349,20 @@ def _pulse_markdown_to_html(md_text):
     )
 
 
-def pulse_send_email(report_markdown, period_start, period_end):
-    """Send pulse report via Microsoft Graph to all PULSE_RECIPIENTS."""
+def pulse_send_email(report_markdown, period_start, period_end, recipients=None):
+    """Send pulse report via Microsoft Graph.
+
+    recipients: optional override; defaults to PULSE_RECIPIENTS. Used by replay
+    runs so a re-analysis of a past week can go to one person for comparison
+    without mailing the whole distribution list again."""
+    to_addrs = list(recipients) if recipients else list(PULSE_RECIPIENTS)
     subject = f"Weekly Pulse: {period_start.strftime('%b %d')} - {period_end.strftime('%b %d')}"
     html_body = _pulse_markdown_to_html(report_markdown)
     html_body = strip_emojis(html_body)
 
     token = get_ms_graph_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    to_list = [{"emailAddress": {"address": r}} for r in PULSE_RECIPIENTS]
+    to_list = [{"emailAddress": {"address": r}} for r in to_addrs]
     send_payload = {
         "message": {
             "subject": subject,
@@ -1352,7 +1374,7 @@ def pulse_send_email(report_markdown, period_start, period_end):
     url = f"{MS_GRAPH_BASE}/users/{PULSE_SENDER}/sendMail"
     resp = requests.post(url, json=send_payload, headers=headers, timeout=30)
     resp.raise_for_status()
-    logger.info(f"[pulse] Email sent to {PULSE_RECIPIENTS} from {PULSE_SENDER}")
+    logger.info(f"[pulse] Email sent to {to_addrs} from {PULSE_SENDER}")
 
 
 def pulse_archive(report_markdown, raw_signals, period_start, period_end, stats):
@@ -2293,7 +2315,7 @@ def _release_running_lock():
         logger.error(f"[pulse] Failed to release running lock: {e}")
 
 
-def _pulse_run_background(days, dry_run):
+def _pulse_run_background(days, dry_run, end_dt=None, recipients=None):
     """Run the full pulse pipeline in a background thread. Only one run at a time.
     Returns True if the run executed, False if it was skipped."""
     # Cross-process atomic lock -- prevents duplicate runs when 2 gunicorn workers
@@ -2310,24 +2332,69 @@ def _pulse_run_background(days, dry_run):
         return False
 
     try:
-        _pulse_run_inner(days, dry_run)
+        _pulse_run_inner(days, dry_run, end_dt=end_dt, recipients=recipients)
         return True
     finally:
         _pulse_lock.release()
         _release_running_lock()
 
 
-def _pulse_run_inner(days, dry_run):
-    """Inner pulse runner (called with lock held)."""
+class _PulseReplaySkip(Exception):
+    """Internal signal: a replay must not overwrite the archived original."""
+
+
+def _pulse_parse_end(raw):
+    """Parse an explicit window end for a replay. Accepts YYYY-MM-DD or a full
+    ISO timestamp; always returns tz-aware UTC. None when absent/unparseable."""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = datetime.strptime(text[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _pulse_parse_recipients(raw):
+    """Split a comma-separated recipient override. None when absent/empty."""
+    if not raw:
+        return None
+    out = [a.strip() for a in str(raw).split(",") if a.strip() and "@" in a]
+    return out or None
+
+
+def _pulse_run_inner(days, dry_run, end_dt=None, recipients=None):
+    """Inner pulse runner (called with lock held).
+
+    end_dt / recipients mark a REPLAY: re-analyze a past window and mail it to
+    someone specific. A replay deliberately does NOT apply briefing-book
+    updates (they were applied by the original run -- re-applying double-counts)
+    and does NOT archive (that would overwrite the original week's report, which
+    is the very thing a replay is being compared against)."""
     import traceback as tb
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    replay = bool(end_dt or recipients)
     status = {"run_id": run_id, "phase": "starting", "dry_run": dry_run, "days": days,
+              "replay": replay,
               "started_at": datetime.now(timezone.utc).isoformat()}
     _pulse_save_status(status)
 
     try:
-        end_dt = datetime.now(timezone.utc)
+        end_dt = end_dt or datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(days=days)
+        if replay:
+            logger.info(f"[pulse] REPLAY run: window {start_dt.isoformat()} -> "
+                        f"{end_dt.isoformat()}, recipients="
+                        f"{recipients or 'default'}; briefing updates and "
+                        f"archiving are SKIPPED")
+        status["period_start"] = start_dt.isoformat()
+        status["period_end"] = end_dt.isoformat()
 
         # Phase 1: collect ALL sources in parallel
         from concurrent.futures import ThreadPoolExecutor
@@ -2367,7 +2434,7 @@ def _pulse_run_inner(days, dry_run):
 
         # Phase 2b: apply briefing book updates (high confidence only)
         applied_updates = []
-        if not dry_run and briefing_updates:
+        if not dry_run and not replay and briefing_updates:
             status["phase"] = "updating briefing book"
             _pulse_save_status(status)
             try:
@@ -2404,20 +2471,25 @@ def _pulse_run_inner(days, dry_run):
             # exactly once. Belt-and-braces alongside the cross-process lock.
             if not email_sent:
                 try:
-                    pulse_send_email(report, start_dt, end_dt)
+                    pulse_send_email(report, start_dt, end_dt, recipients=recipients)
                     email_sent = True
                 except Exception as e:
                     logger.error(f"[pulse] Email send failed: {e}", exc_info=True)
                     status["email_error"] = str(e)
 
-            status["phase"] = "archiving"
+            status["phase"] = "archiving" if not replay else "skipping archive (replay)"
             _pulse_save_status(status)
             try:
+                if replay:
+                    raise _PulseReplaySkip()
                 # Include briefing updates in archive
                 raw_signals["briefing_updates"] = briefing_updates
                 raw_signals["briefing_updates_applied"] = [u for u in applied_updates]
                 pulse_archive(report, raw_signals, start_dt, end_dt, stats)
                 archived = True
+            except _PulseReplaySkip:
+                logger.info("[pulse] Replay -- not archiving, original week's "
+                            "report left intact")
             except Exception as e:
                 logger.error(f"[pulse] Archive failed: {e}", exc_info=True)
                 status["archive_error"] = str(e)
@@ -2449,10 +2521,18 @@ def pulse_trigger():
     days = int(request.args.get("days", PULSE_LOOKBACK_DAYS))
     dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
     force = request.args.get("force", "").lower() in ("true", "1", "yes")
+    # Replay: re-analyze a past window and/or send to a specific address.
+    end_dt = _pulse_parse_end(request.args.get("end"))
+    recipients = _pulse_parse_recipients(request.args.get("to"))
+    if request.args.get("end") and end_dt is None:
+        return jsonify({"status": "error",
+                        "reason": "Could not parse 'end'. Use YYYY-MM-DD or a "
+                                  "full ISO timestamp."}), 400
+    replay = bool(end_dt or recipients)
 
     # Dedupe: refuse if a completed run is still within the lock window.
     # dry_run bypasses the lock (no email sent, so no duplicate-email risk).
-    if not dry_run and not force and not pulse_can_run():
+    if not dry_run and not replay and not force and not pulse_can_run():
         return jsonify({
             "status": "skipped",
             "reason": "Pulse already ran recently. Use ?force=true to override.",
@@ -2476,8 +2556,11 @@ def pulse_trigger():
     except Exception:
         pass
 
-    logger.info(f"[pulse] Trigger: days={days}, dry_run={dry_run} -- launching background thread")
-    t = threading.Thread(target=_pulse_run_background, args=(days, dry_run), daemon=True)
+    logger.info(f"[pulse] Trigger: days={days}, dry_run={dry_run}, replay={replay} "
+                f"-- launching background thread")
+    t = threading.Thread(target=_pulse_run_background, args=(days, dry_run),
+                         kwargs={"end_dt": end_dt, "recipients": recipients},
+                         daemon=True)
     t.start()
 
     return jsonify({
@@ -2485,6 +2568,9 @@ def pulse_trigger():
         "message": "Pulse running in background. Poll /pulse/status for progress.",
         "days": days,
         "dry_run": dry_run,
+        "replay": replay,
+        "period_end": end_dt.isoformat() if end_dt else None,
+        "recipients": recipients or list(PULSE_RECIPIENTS),
     })
 
 
@@ -3806,7 +3892,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.32.0-chat-ordering", "deployed": "2026-09-01"})
+    return jsonify({"version": "2.33.0-replay-msg-ordering", "deployed": "2026-09-01"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3874,7 +3960,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.32.0-chat-ordering", "steps": {}}
+    results = {"version": "2.33.0-replay-msg-ordering", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
