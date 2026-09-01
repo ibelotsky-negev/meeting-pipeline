@@ -349,6 +349,158 @@ class TestGraphPagination:
         assert len(out) == 51
 
 
+class TestOrderedChatDiscovery:
+    """Graph confirmed live 2026-09-01: /users/{id}/chats accepts
+    $orderby=lastMessagePreview/createdDateTime desc (and rejects
+    $orderby=lastUpdatedDateTime). Ordering explicitly lets the walk stop at the
+    first out-of-window chat, which is what makes the page limit a non-event
+    rather than a silent truncation risk."""
+
+    WINDOW = "2026-08-30T00:00:00Z"
+
+    def _msg(self):
+        return {"messageType": "message", "createdDateTime": "2026-08-31T09:00:00Z",
+                "body": {"content": "<p>a message long enough to be kept</p>"}}
+
+    def test_stop_when_ends_the_walk(self, monkeypatch):
+        pages = {"start": {"value": [{"n": 1}, {"n": 2}, {"n": 99}],
+                           "@odata.nextLink": "page2"},
+                 "page2": {"value": [{"n": 3}]}}
+        route(monkeypatch, lambda url: FakeResponse(200, pages[url]))
+        items, truncated, err, _ = app_module._pulse_graph_collect(
+            "start", {}, 5, stop_when=lambda i: i["n"] == 99)
+        # The matching item and everything after it is discarded, page 2 never fetched.
+        assert [i["n"] for i in items] == [1, 2]
+        assert truncated is False and err is None
+
+    def test_stop_when_never_matching_walks_everything(self, monkeypatch):
+        pages = {"start": {"value": [{"n": 1}], "@odata.nextLink": "page2"},
+                 "page2": {"value": [{"n": 2}]}}
+        route(monkeypatch, lambda url: FakeResponse(200, pages[url]))
+        items, _, _, _ = app_module._pulse_graph_collect(
+            "start", {}, 5, stop_when=lambda i: False)
+        assert [i["n"] for i in items] == [1, 2]
+
+    def test_chat_list_is_ordered_by_recency(self, monkeypatch):
+        urls = []
+
+        def handler(url):
+            urls.append(url)
+            if "/messages" in url:
+                return FakeResponse(200, {"value": [self._msg()]})
+            return FakeResponse(200, {"value": []})
+
+        route(monkeypatch, handler)
+        app_module._pulse_fetch_user_chats(
+            {"id": "u1", "mail": "ken@palomar-labs.com"}, self.WINDOW, {},
+            set(), threading.Lock())
+        listing = [u for u in urls if "/chats" in u and "/messages" not in u]
+        assert listing, "chat listing was never requested"
+        assert "$orderby=lastMessagePreview/createdDateTime desc" in listing[0]
+        assert "$expand=lastMessagePreview" in listing[0]
+
+    def test_walk_stops_at_first_chat_outside_the_window(self, monkeypatch):
+        """ken@ has 236+ chats but only a handful are active in a given week --
+        the walk must stop rather than page through all of them."""
+        urls = []
+        fresh = {"id": "c1", "chatType": "oneOnOne",
+                 "lastMessagePreview": {"createdDateTime": "2026-08-31T10:00:00Z"}}
+        stale = {"id": "c2", "chatType": "oneOnOne",
+                 "lastMessagePreview": {"createdDateTime": "2026-07-01T10:00:00Z"}}
+
+        def handler(url):
+            urls.append(url)
+            if "/messages" in url:
+                return FakeResponse(200, {"value": [self._msg()]})
+            if url == "chats-page-2":
+                return FakeResponse(200, {"value": [fresh]})
+            return FakeResponse(200, {"value": [fresh, stale],
+                                      "@odata.nextLink": "chats-page-2"})
+
+        route(monkeypatch, handler)
+        out, stats = app_module._pulse_fetch_user_chats(
+            {"id": "u1", "mail": "ken@palomar-labs.com"}, self.WINDOW, {},
+            set(), threading.Lock())
+        assert "chats-page-2" not in urls, "paged past the window unnecessarily"
+        assert stats["chats_seen"] == 1
+        assert stats["read"] == 1
+        assert len(out) == 1
+        # A stale chat must never cost a message call.
+        assert not [u for u in urls if "/chats/c2/" in u]
+
+    def test_undated_chat_does_not_stop_the_walk(self, monkeypatch):
+        """A chat with no lastMessagePreview must not be read as 'stale' and
+        silently end discovery for that user."""
+        undated = {"id": "c1", "chatType": "oneOnOne"}
+
+        def handler(url):
+            if "/messages" in url:
+                return FakeResponse(200, {"value": [self._msg()]})
+            return FakeResponse(200, {"value": [undated]})
+
+        route(monkeypatch, handler)
+        out, stats = app_module._pulse_fetch_user_chats(
+            {"id": "u1", "mail": "ken@palomar-labs.com"}, self.WINDOW, {},
+            set(), threading.Lock())
+        assert stats["chats_seen"] == 1 and stats["read"] == 1
+
+
+class TestPseudoChatsAreSkipped:
+    """Probed live 2026-09-01: every chatType 'unknownFutureValue' came back
+    with ZERO members and a hard 403 AclCheckFailed. They are not conversations,
+    and counting them as refusals is what inflated the reported rate to 52%."""
+
+    WINDOW = "2026-08-30T00:00:00Z"
+
+    def _run(self, monkeypatch, chat_type):
+        urls = []
+
+        def handler(url):
+            urls.append(url)
+            if "/messages" in url:
+                return FakeResponse(403, text="AclCheckFailed")
+            return FakeResponse(200, {"value": [{"id": "c1", "chatType": chat_type}]})
+
+        route(monkeypatch, handler)
+        out, stats = app_module._pulse_fetch_user_chats(
+            {"id": "u1", "mail": "gene@palomar-labs.com"}, self.WINDOW, {},
+            set(), threading.Lock())
+        return out, stats, urls
+
+    def test_unknown_future_value_is_skipped_not_refused(self, monkeypatch):
+        out, stats, urls = self._run(monkeypatch, "unknownFutureValue")
+        assert out == []
+        assert stats["skipped"] == 1
+        assert stats["refused"] == 0, "a skipped pseudo-chat must not inflate refusals"
+        assert not [u for u in urls if "/messages" in u], "wasted a Graph call"
+
+    def test_meeting_chats_still_skipped(self, monkeypatch):
+        out, stats, urls = self._run(monkeypatch, "meeting")
+        assert stats["skipped"] == 1 and stats["refused"] == 0
+
+    def test_real_chat_type_is_still_read(self, monkeypatch):
+        def handler(url):
+            if "/messages" in url:
+                return FakeResponse(200, {"value": [{
+                    "messageType": "message",
+                    "createdDateTime": "2026-08-31T09:00:00Z",
+                    "body": {"content": "<p>real content worth keeping here</p>"}}]})
+            return FakeResponse(200, {"value": [{"id": "c1", "chatType": "oneOnOne"}]})
+
+        route(monkeypatch, handler)
+        out, stats = app_module._pulse_fetch_user_chats(
+            {"id": "u1", "mail": "gene@palomar-labs.com"}, self.WINDOW, {},
+            set(), threading.Lock())
+        assert len(out) == 1 and stats["skipped"] == 0 and stats["read"] == 1
+
+    def test_genuine_refusal_still_counted(self, monkeypatch):
+        """An externally-hosted federated chat 403s and MUST still be reported --
+        skipping pseudo-chats must not hide the real gap."""
+        out, stats, urls = self._run(monkeypatch, "oneOnOne")
+        assert stats["refused"] == 1 and stats["skipped"] == 0
+        assert stats["statuses"] == {403: 1}
+
+
 class TestScanVersusTeamDomains:
     """PULSE_DOMAINS (which mailboxes to scan) and PULSE_TEAM_DOMAINS (which
     addresses count as team) are deliberately different sets."""

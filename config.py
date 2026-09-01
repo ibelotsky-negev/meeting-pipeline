@@ -181,6 +181,13 @@ PULSE_TEAM_DOMAINS = {"negevlabs.com", "ariadnebio.com", "palomar-labs.com",
 # Graph caps $top at 50 on /chats, /messages and /channels. The pulse never
 # followed @odata.nextLink, so a user with 50+ chats was silently cut off --
 # seven accounts sat exactly at 50 on 2026-09-01. These bound the paging.
+# Chat kinds the pulse never reads. "meeting" is long-standing (join/leave
+# noise). "unknownFutureValue" is the Graph enum placeholder for chat kinds
+# v1.0 does not model; probed live 2026-09-01, every one came back with ZERO
+# members and a hard 403 AclCheckFailed, so they are pseudo-chats with no
+# readable content -- skipping them removes the bulk of the apparent
+# "refusal rate" and one Graph call each.
+PULSE_SKIP_CHAT_TYPES = {"meeting", "unknownFutureValue"}
 PULSE_CHAT_PAGE_LIMIT = int(os.environ.get("PULSE_CHAT_PAGE_LIMIT", "6"))
 PULSE_MESSAGE_PAGE_LIMIT = int(os.environ.get("PULSE_MESSAGE_PAGE_LIMIT", "4"))
 PULSE_ARCHIVE_DIR = os.path.join(DATA_DIR, "pulse")
