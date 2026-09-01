@@ -879,7 +879,9 @@ def run_intake(dry_run: bool = False, limit: int = None) -> dict:
                 anchor_message_id=thread["anchor_id"],
                 anchor_received=thread["anchor_received"],
                 subject=thread["subject"], ask=ask_text,
-                recipients=[r.strip() for r in (ask.get("recipients") or []) if r] or externals,
+                recipients=_resolve_recipients(
+                    ask.get("recipients") or [],
+                    [(p, "") for p in thread["participants"]]) or externals,
                 interval_days=interval, deadline=deadline,
                 intake_conversation_id=conv))
         registered += len(new)
@@ -1082,6 +1084,52 @@ def _compose_draft(watch: dict) -> str:
     return "".join(f"<p>{_esc(p)}</p>" for p in paras)
 
 
+def _resolve_recipients(stored: list, candidates: list) -> list:
+    """Map stored reminder recipients onto routable SMTP addresses.
+
+    The intake parser is asked for "recipients the sender named", and a
+    sender names PEOPLE ("chase Elana"), not addresses -- so a watch can
+    hold a bare display name. Handing that to Graph as
+    toRecipients[].emailAddress.address either fails the PATCH (orphan
+    deleted, reminder retried forever) or addresses the reminder to a word
+    that routes nowhere, having first displaced the correct reply-all
+    recipients.
+
+    Keeps entries that already are addresses, resolves a bare name against
+    `candidates` -- (address, display_name) pairs known for this thread --
+    by display name or address local part, and DROPS what it cannot
+    resolve rather than guessing at one. Order is preserved and duplicates
+    collapse. An empty result tells the caller to leave the recipients
+    reply-all already inherited alone.
+    """
+    lookup = []
+    for addr, name in candidates or []:
+        addr = (addr or "").strip()
+        if not addr:
+            continue
+        local = addr.split("@")[0].lower()
+        name = (name or "").strip().lower()
+        # "Elana" must match both "Elana Pinsky" and "elana.pinsky".
+        keys = {name, local}
+        keys.update(part for part in name.split() if part)
+        keys.update(part for part in re.split(r"[._-]+", local) if part)
+        lookup.append((addr, {k for k in keys if k}))
+
+    out = []
+    for raw_entry in stored or []:
+        entry = (raw_entry or "").strip()
+        if not entry:
+            continue
+        if "@" in entry:
+            resolved = entry
+        else:
+            key = entry.lower()
+            resolved = next((addr for addr, keys in lookup if key in keys), "")
+        if resolved and resolved not in out:
+            out.append(resolved)
+    return out
+
+
 def _create_draft(watch: dict, body_html: str) -> dict:
     """createReplyAll on the newest known thread message in the OWNER's
     mailbox, then PATCH body (+ explicit recipients, keeping inherited CC so
@@ -1095,9 +1143,18 @@ def _create_draft(watch: dict, body_html: str) -> dict:
     if not draft_id:
         raise RuntimeError("createReplyAll returned no draft id")
     patch_body = {"body": {"contentType": "HTML", "content": body_html}}
-    if watch.get("recipients"):
+    # Override the inherited reply-all recipients ONLY when the sender
+    # named people AND those names resolve to real addresses. A watch can
+    # hold a bare display name; nothing resolvable -> keep what reply-all
+    # set, which is always routable. See _resolve_recipients.
+    inherited = [((r.get("emailAddress") or {}).get("address") or "",
+                  (r.get("emailAddress") or {}).get("name") or "")
+                 for r in ((draft.get("toRecipients") or [])
+                           + (draft.get("ccRecipients") or []))]
+    wanted = _resolve_recipients(watch.get("recipients") or [], inherited)
+    if wanted:
         patch_body["toRecipients"] = [
-            {"emailAddress": {"address": r}} for r in watch["recipients"]]
+            {"emailAddress": {"address": a}} for a in wanted]
     try:
         eps.graph_patch(f"{base}/{draft_id}", patch_body)
     except Exception:
