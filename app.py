@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Config and config-domain primitives live in config.py. Re-exported here
 # so existing references and tests (app_module.X) keep resolving. ASCII-only.
-from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_API_KEY, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_REFRESH_TOKEN, MS_GRAPH_AUTH_MODE, ASANA_WORKSPACE_GID, ASANA_PROJECT_GID, HUBSPOT_OWNER_ID, POLL_INTERVAL_MINUTES, APP_BASE_URL, NOTIFY_VIA, SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, BOT_SENDER_EMAIL, BOT_SENDER_NAME, INTERNAL_DOMAINS, HUBSPOT_OWNER_MAP_RAW, HUBSPOT_OWNER_MAP, TEAM_MEMBER_NAMES_RAW, TEAM_MEMBER_NAMES, TEAM_MEMBERS_LIST, EMAIL_ALIAS_MAP, EMAIL_ALIAS_MAP_RAW, DATA_DIR, PROCESSED_FILE, PENDING_FILE, SYNC_MAP_FILE, TODO_LIST_NAME, TODO_POLL_INTERVAL, RAILWAY_PUBLIC_URL, TEAMS_WEBHOOK_SECRET, TEAMS_TRANSCRIPT_ENABLED, TEAMS_ORGANIZER_USER_ID, TEAMS_POLL_USER_IDS, TEAMS_POLL_INTERVAL, SUBSCRIPTION_FILE, PULSE_RECIPIENTS, PULSE_SENDER, PULSE_DOMAINS, PULSE_ARCHIVE_DIR, PULSE_LOOKBACK_DAYS, PULSE_MAX_INPUT_CHARS, PULSE_MAX_CHUNKS, PULSE_RATE_LIMIT_SECONDS, PULSE_TEAM_DOMAINS, PULSE_CHAT_PAGE_LIMIT, PULSE_MESSAGE_PAGE_LIMIT, BRIEFING_BOOK_PATH, BRIEFING_BOOK_REPO, PULSE_SKIP_SENDERS, PULSE_SKIP_DOMAINS, PULSE_SKIP_SUBJECTS, normalize_team_email, load_briefing_book, is_internal_email, resolve_internal_organizer)  # noqa: F401
+from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_API_KEY, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_REFRESH_TOKEN, MS_GRAPH_AUTH_MODE, ASANA_WORKSPACE_GID, ASANA_PROJECT_GID, HUBSPOT_OWNER_ID, POLL_INTERVAL_MINUTES, APP_BASE_URL, NOTIFY_VIA, SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, BOT_SENDER_EMAIL, BOT_SENDER_NAME, INTERNAL_DOMAINS, HUBSPOT_OWNER_MAP_RAW, HUBSPOT_OWNER_MAP, TEAM_MEMBER_NAMES_RAW, TEAM_MEMBER_NAMES, TEAM_MEMBERS_LIST, EMAIL_ALIAS_MAP, EMAIL_ALIAS_MAP_RAW, DATA_DIR, PROCESSED_FILE, PENDING_FILE, SYNC_MAP_FILE, TODO_LIST_NAME, TODO_POLL_INTERVAL, RAILWAY_PUBLIC_URL, TEAMS_WEBHOOK_SECRET, TEAMS_TRANSCRIPT_ENABLED, TEAMS_ORGANIZER_USER_ID, TEAMS_POLL_USER_IDS, TEAMS_POLL_INTERVAL, SUBSCRIPTION_FILE, PULSE_RECIPIENTS, PULSE_SENDER, PULSE_DOMAINS, PULSE_ARCHIVE_DIR, PULSE_LOOKBACK_DAYS, PULSE_MAX_INPUT_CHARS, PULSE_MAX_CHUNKS, PULSE_RATE_LIMIT_SECONDS, PULSE_TEAM_DOMAINS, PULSE_SKIP_CHAT_TYPES, PULSE_CHAT_PAGE_LIMIT, PULSE_MESSAGE_PAGE_LIMIT, BRIEFING_BOOK_PATH, BRIEFING_BOOK_REPO, PULSE_SKIP_SENDERS, PULSE_SKIP_DOMAINS, PULSE_SKIP_SUBJECTS, normalize_team_email, load_briefing_book, is_internal_email, resolve_internal_organizer)  # noqa: F401
 from prompts import (PULSE_SCOPE, PULSE_ANTI_HALLUCINATION, PULSE_EMAIL_PROMPT, PULSE_TEAMS_PROMPT, PULSE_MEETINGS_PROMPT, PULSE_SYNTHESIS_PROMPT, PULSE_BRIEFING_UPDATE_PROMPT)  # noqa: F401
 from templates import REVIEW_TEMPLATE, RESULT_TEMPLATE  # noqa: F401
 from datetime_utils import to_hubspot_ms, to_graph_datetime, resolve_due_date  # noqa: F401
@@ -227,7 +227,7 @@ def pulse_should_skip_teams_msg(msg):
     return False
 
 
-def _pulse_graph_collect(url, headers, page_limit=1):
+def _pulse_graph_collect(url, headers, page_limit=1, stop_when=None):
     """GET a Graph collection, following @odata.nextLink up to page_limit pages.
 
     Returns (items, truncated, error_status, error_body). Graph caps $top at 50
@@ -235,7 +235,12 @@ def _pulse_graph_collect(url, headers, page_limit=1):
     so a user with 50+ chats was silently cut off at 50 (seven of the team's
     accounts sat exactly at that cap on 2026-09-01). `truncated` is True when
     more pages existed than page_limit allowed, so the caller can say so rather
-    than reporting a partial read as complete."""
+    than reporting a partial read as complete.
+
+    stop_when: optional predicate on one item. The first item it accepts ends
+    the walk, discarding that item and everything after it. ONLY valid on a
+    DESCENDING-ordered collection, where one out-of-window item proves the rest
+    are too -- that is what makes `truncated` moot rather than merely logged."""
     items = []
     next_url = url
     pages = 0
@@ -244,7 +249,10 @@ def _pulse_graph_collect(url, headers, page_limit=1):
         if resp.status_code != 200:
             return items, False, resp.status_code, resp.text[:200]
         body = resp.json() or {}
-        items.extend(body.get("value") or [])
+        for item in (body.get("value") or []):
+            if stop_when is not None and stop_when(item):
+                return items, False, None, ""
+            items.append(item)
         pages += 1
         next_url = body.get("@odata.nextLink")
         if next_url and pages >= page_limit:
@@ -255,7 +263,7 @@ def _pulse_graph_collect(url, headers, page_limit=1):
 def _pulse_new_teams_stats():
     """Per-collection counters so a coverage gap is reportable, not invisible."""
     return {"read": 0, "refused": 0, "statuses": {}, "truncated": 0,
-            "first_error": "", "chats_seen": 0}
+            "first_error": "", "chats_seen": 0, "skipped": 0}
 
 
 def _pulse_merge_teams_stats(agg, part, kind):
@@ -264,6 +272,7 @@ def _pulse_merge_teams_stats(agg, part, kind):
     agg[kind + "_refused"] += part.get("refused", 0)
     agg["truncated"] += part.get("truncated", 0)
     agg["chats_seen"] += part.get("chats_seen", 0)
+    agg["skipped"] += part.get("skipped", 0)
     if part.get("refused"):
         agg["sources_with_refusals"] += 1
     for code, n in (part.get("statuses") or {}).items():
@@ -353,11 +362,23 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
     mail = user.get("mail") or user_id
     results = []
     stats = _pulse_new_teams_stats()
+    def _chat_is_stale(chat):
+        """True once the ordered walk reaches a chat with no activity in the
+        window. Everything after it is older still, so paging can stop."""
+        stamp = ((chat.get("lastMessagePreview") or {}).get("createdDateTime") or "")
+        return bool(stamp) and stamp < start_iso
+
     try:
+        # $orderby=lastMessagePreview/createdDateTime desc is supported here
+        # (verified live 2026-09-01; $orderby=lastUpdatedDateTime is NOT). The
+        # default order already happened to be descending, but relying on that
+        # was luck -- stating it makes the early exit below sound, and turns a
+        # page-limit truncation from a silent risk into a non-event.
         chats_url = (f"{MS_GRAPH_BASE}/users/{user_id}/chats"
-                     f"?$select=id,chatType&$top=50")
+                     f"?$select=id,chatType&$expand=lastMessagePreview"
+                     f"&$orderby=lastMessagePreview/createdDateTime desc&$top=50")
         chats, chats_truncated, err, err_body = _pulse_graph_collect(
-            chats_url, headers, PULSE_CHAT_PAGE_LIMIT)
+            chats_url, headers, PULSE_CHAT_PAGE_LIMIT, stop_when=_chat_is_stale)
         if err is not None:
             logger.warning(f"[pulse] Chats returned {err} for {mail}: {err_body}")
             stats["statuses"][err] = 1
@@ -378,7 +399,8 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
                     continue
                 seen_chat_ids.add(chat_id)
             chat_type = chat.get("chatType", "unknown")
-            if chat_type == "meeting":
+            if chat_type in PULSE_SKIP_CHAT_TYPES:
+                stats["skipped"] += 1
                 continue
             try:
                 msgs, truncated, merr, merr_body = _pulse_graph_collect(
@@ -438,7 +460,8 @@ def pulse_collect_teams(start_dt, end_dt):
     chat_count = 0
     agg = {"chat_read": 0, "chat_refused": 0, "channel_read": 0,
            "channel_refused": 0, "statuses": {}, "truncated": 0,
-           "chats_seen": 0, "sources_with_refusals": 0, "first_error": ""}
+           "chats_seen": 0, "sources_with_refusals": 0, "first_error": "",
+           "skipped": 0}
 
     # Use a shared pool for all concurrent Graph API calls (limit to 8 to avoid throttling)
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -497,11 +520,19 @@ def pulse_collect_teams(start_dt, end_dt):
     if agg["chat_refused"] or agg["channel_refused"] or agg["truncated"]:
         total = agg["chat_read"] + agg["chat_refused"]
         pct = (100.0 * agg["chat_refused"] / total) if total else 0.0
+        # A residual refusal here is expected and NOT fixable by consent: a
+        # federated chat hosted in the other party's tenant returns 403
+        # AclCheckFailed no matter what this app is granted (probed live
+        # 2026-09-01 -- ken@ 403s were all external-participant chats, while
+        # other external chats in our own tenant read fine). Memberless
+        # pseudo-chats are skipped upstream and no longer inflate this.
         logger.warning(
             f"[pulse] Teams coverage gap: chats {agg['chat_read']} read / "
-            f"{agg['chat_refused']} refused ({pct:.0f}% refused) across "
+            f"{agg['chat_refused']} refused ({pct:.0f}% refused, typically "
+            f"externally-hosted federated chats) across "
             f"{agg['sources_with_refusals']} source(s); channels "
             f"{agg['channel_read']} read / {agg['channel_refused']} refused; "
+            f"{agg['skipped']} chat(s) skipped by type; "
             f"{agg['truncated']} collection(s) page-truncated. Statuses "
             f"{dict(sorted(agg['statuses'].items()))}. "
             f"First error: {agg['first_error'][:160]}")
@@ -3775,7 +3806,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.31.2-teams-coverage", "deployed": "2026-09-01"})
+    return jsonify({"version": "2.32.0-chat-ordering", "deployed": "2026-09-01"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3843,7 +3874,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.31.2-teams-coverage", "steps": {}}
+    results = {"version": "2.32.0-chat-ordering", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
