@@ -338,3 +338,36 @@ class TestPulseCheckHonesty:
         assert body["permissions"]["Chat.Read.All"] is True
         assert body["permissions"]["Chat.Messages.Read"] is False
         assert "protected API" in body["diagnostics"]["Chat.Messages.Read"]
+
+    def test_probe_urls_are_accepted_by_graph(self, monkeypatch, flask_client):
+        """Graph rejects $top on /teams/{id}/channels with a 400:
+        "Query option 'Top' is not allowed." It IS allowed on /groups, /chats
+        and /messages, which is exactly what makes this easy to get wrong --
+        the 2.30.1 probe shipped with it and reported ChannelMessage.Read.All
+        false on a tenant where the permission was fine. Assert on the URL, not
+        just the status, because a permissive mock hides this entirely."""
+        urls = []
+
+        def handler(url):
+            urls.append(url)
+            if "/groups" in url:
+                return FakeResponse(200, {"value": [{"id": "t1", "displayName": "Negev"}]})
+            if "/channels" in url and "/messages" not in url:
+                if "$top" in url:
+                    return FakeResponse(
+                        400, text="Query option 'Top' is not allowed.")
+                return FakeResponse(200, {"value": [{"id": "ch1"}]})
+            if "/chats" in url and "/messages" not in url:
+                return FakeResponse(200, {"value": [{"id": "c1"}]})
+            return FakeResponse(200, {"value": [{"id": "m1"}]})
+
+        self._setup(monkeypatch, handler)
+        body = flask_client.get("/pulse/check").get_json()
+
+        channel_lists = [u for u in urls
+                         if "/channels" in u and "/messages" not in u]
+        assert channel_lists, "the channels endpoint was never probed"
+        for u in channel_lists:
+            assert "$top" not in u, "Graph 400s on $top for /channels: %s" % u
+        assert body["permissions"]["ChannelMessage.Read.All"] is True
+        assert body["teams_ready"] is True
