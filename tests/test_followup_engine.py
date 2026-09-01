@@ -3643,3 +3643,142 @@ def test_run_intake_registers_deadline_on_the_central_calendar_date_not_israels(
     assert w["deadline"] == "2026-08-21"
     assert w["deadline"] == fue.add_business_days(date(2026, 8, 19), 2).isoformat()
     assert w["deadline"] != fue.add_business_days(date(2026, 8, 20), 2).isoformat()
+
+
+# ----------------------------------------------------------------------
+#  Reminder recipients must be routable addresses, never display names
+# ----------------------------------------------------------------------
+# The intake parser is asked for "recipients the sender named", and a
+# sender names PEOPLE ("chase Elana"), not addresses -- live watch
+# fw_89f26534 holds ["Elana"]. Writing that into
+# toRecipients[].emailAddress.address hands Exchange a string it cannot
+# route: the PATCH either fails (orphan deleted, reminder silently retried
+# forever) or replaces the correct reply-all recipients with a name that
+# resolves to nobody.
+
+ELANA = {"emailAddress": {"address": "elana.pinsky@chop.edu", "name": "Elana Pinsky"}}
+SALIM = {"emailAddress": {"address": "salim.tamboli@vimta.com", "name": "Salim Tamboli"}}
+
+
+def _capture_writes_inherited(monkeypatch, inherited_to, draft_id="d1"):
+    """_capture_writes, but the createReplyAll draft carries the recipients
+    Graph inherited from the thread -- what a real reply-all returns."""
+    calls = []
+
+    def _post(url, json_body):
+        calls.append({"method": "POST", "url": url, "body": json_body})
+        if url.endswith("/createReplyAll"):
+            return {"id": draft_id, "webLink": "https://outlook.example/d1",
+                    "toRecipients": inherited_to}
+        return {}
+
+    def _patch(url, json_body):
+        calls.append({"method": "PATCH", "url": url, "body": json_body})
+        return {}
+
+    monkeypatch.setattr(eps, "graph_post", _post)
+    monkeypatch.setattr(eps, "graph_patch", _patch)
+    monkeypatch.setattr(eps, "graph_delete",
+                        lambda url: calls.append({"method": "DELETE", "url": url}))
+    return calls
+
+
+def _patch_body(calls):
+    return [c for c in calls if c["method"] == "PATCH"][0]["body"]
+
+
+def test_resolve_recipients_keeps_addresses_and_resolves_names():
+    cands = [("elana.pinsky@chop.edu", "Elana Pinsky"),
+             ("salim.tamboli@vimta.com", "Salim Tamboli")]
+    # A real address passes through untouched.
+    assert fue._resolve_recipients(["salim.tamboli@vimta.com"], cands) ==         ["salim.tamboli@vimta.com"]
+    # A bare first name resolves against the display name.
+    assert fue._resolve_recipients(["Elana"], cands) == ["elana.pinsky@chop.edu"]
+    # Case and surrounding whitespace do not matter.
+    assert fue._resolve_recipients(["  elana  "], cands) == ["elana.pinsky@chop.edu"]
+    # A full display name resolves too.
+    assert fue._resolve_recipients(["Elana Pinsky"], cands) == ["elana.pinsky@chop.edu"]
+
+
+def test_resolve_recipients_matches_local_part_when_no_display_name():
+    # Thread participants are often addresses with no display name at all
+    # (that is what intake has). "Elana" must still find her address.
+    cands = [("elana.pinsky@chop.edu", ""), ("salim.tamboli@vimta.com", "")]
+    assert fue._resolve_recipients(["Elana"], cands) == ["elana.pinsky@chop.edu"]
+
+
+def test_resolve_recipients_drops_what_it_cannot_resolve():
+    cands = [("salim.tamboli@vimta.com", "Salim Tamboli")]
+    assert fue._resolve_recipients(["Elana"], cands) == []
+    assert fue._resolve_recipients(["Dr. Khan", "Elana"], cands) == []
+    # Never invents: an empty candidate set resolves no name.
+    assert fue._resolve_recipients(["Elana"], []) == []
+
+
+def test_resolve_recipients_dedupes_and_preserves_order():
+    cands = [("elana.pinsky@chop.edu", "Elana Pinsky")]
+    out = fue._resolve_recipients(
+        ["Elana", "elana.pinsky@chop.edu", "Elana Pinsky"], cands)
+    assert out == ["elana.pinsky@chop.edu"]
+
+
+def test_create_draft_resolves_bare_name_against_inherited_recipients(monkeypatch, fue_files):
+    w = _watch_in_registry(recipients=["Elana"])
+    calls = _capture_writes_inherited(monkeypatch, [ELANA, SALIM])
+    fue._create_draft(w, "<p>body</p>")
+    assert _patch_body(calls)["toRecipients"] == [
+        {"emailAddress": {"address": "elana.pinsky@chop.edu"}}]
+
+
+def test_create_draft_unresolvable_name_keeps_inherited_reply_all(monkeypatch, fue_files):
+    # A name matching nobody on the thread must not become the To line, and
+    # must not cost the draft -- fall back to the inherited reply-all.
+    w = _watch_in_registry(recipients=["Elana"])
+    calls = _capture_writes_inherited(monkeypatch, [SALIM])
+    fue._create_draft(w, "<p>body</p>")
+    assert "toRecipients" not in _patch_body(calls)
+    assert not [c for c in calls if c["method"] == "DELETE"]
+
+
+def test_create_draft_never_writes_a_non_address_into_to_recipients(monkeypatch, fue_files):
+    # The invariant stated directly, whatever the mix.
+    w = _watch_in_registry(
+        recipients=["Elana", "Dr. Khan", "salim.tamboli@vimta.com"])
+    calls = _capture_writes_inherited(monkeypatch, [SALIM, ELANA])
+    fue._create_draft(w, "<p>body</p>")
+    for r in _patch_body(calls).get("toRecipients", []):
+        assert "@" in r["emailAddress"]["address"]
+
+
+def test_create_draft_keeps_explicit_addresses_unchanged(monkeypatch, fue_files):
+    # Regression guard: the Vimta case (real addresses) is untouched, and
+    # does not depend on the counterparty appearing in the inherited list.
+    w = _watch_in_registry(
+        recipients=["salim.tamboli@vimta.com", "habibur.khan@vimta.in"])
+    calls = _capture_writes_inherited(monkeypatch, [SALIM])
+    fue._create_draft(w, "<p>body</p>")
+    assert _patch_body(calls)["toRecipients"] == [
+        {"emailAddress": {"address": "salim.tamboli@vimta.com"}},
+        {"emailAddress": {"address": "habibur.khan@vimta.in"}}]
+
+
+def test_create_draft_resolves_against_inherited_cc_not_just_to(monkeypatch, fue_files):
+    # Reply-all puts the prime counterparty in To and others in CC; a named
+    # person can be in either.
+    w = _watch_in_registry(recipients=["Elana"])
+    calls = []
+
+    def _post(url, json_body):
+        calls.append({"method": "POST", "url": url, "body": json_body})
+        if url.endswith("/createReplyAll"):
+            return {"id": "d1", "webLink": "https://outlook.example/d1",
+                    "toRecipients": [SALIM], "ccRecipients": [ELANA]}
+        return {}
+
+    monkeypatch.setattr(eps, "graph_post", _post)
+    monkeypatch.setattr(eps, "graph_patch",
+                        lambda url, json_body: calls.append({"method": "PATCH", "url": url, "body": json_body}))
+    monkeypatch.setattr(eps, "graph_delete", lambda url: None)
+    fue._create_draft(w, "<p>body</p>")
+    assert _patch_body(calls)["toRecipients"] == [
+        {"emailAddress": {"address": "elana.pinsky@chop.edu"}}]
