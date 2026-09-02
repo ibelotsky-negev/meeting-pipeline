@@ -1142,6 +1142,65 @@ PULSE_JSON_CONTRACT = (
 )
 
 
+_PULSE_SIGNAL_KEYS = ("green", "yellow", "red", "key_entities")
+
+
+def _pulse_drop_one_signal(work):
+    """Remove one item from the currently-longest signal list. True if dropped."""
+    best = None
+    best_len = 0
+    for pk in sorted(work):
+        node = work.get(pk)
+        if not isinstance(node, dict):
+            continue
+        for sk in _PULSE_SIGNAL_KEYS:
+            items = node.get(sk)
+            if isinstance(items, list) and len(items) > best_len:
+                best, best_len = (pk, sk), len(items)
+    if best is None:
+        return False
+    work[best[0]][best[1]].pop()
+    return True
+
+
+def _pulse_build_within_budget(build_fn, payloads, budget_chars, label):
+    """Assemble a prompt, trimming WHOLE signal items until it fits.
+
+    _pulse_truncate_input cuts the ASSEMBLED prompt from the END -- which is
+    exactly where the output contract, the JSON schema, and Ken's standing
+    corrections live. On 2026-09-02 that decapitated Pass 5: 13,481 chars were
+    cut, the model never saw "OUTPUT (JSON)", and it answered with a markdown
+    report -- twice, because the retry appended the contract to the end where it
+    was cut again. Pass 4 lost the tail of its corrections block the same way.
+
+    Trimming the DATA keeps every instruction intact, and dropping WHOLE items
+    (rather than slicing characters) keeps the embedded JSON well-formed."""
+    import copy
+    work = copy.deepcopy(payloads)
+    dropped = 0
+    prompt = build_fn(work)
+    while len(prompt) > budget_chars and _pulse_drop_one_signal(work):
+        dropped += 1
+        prompt = build_fn(work)
+    if dropped:
+        logger.warning(
+            f"[pulse] {label}: dropped {dropped} lowest-priority signal item(s) to "
+            f"fit the {budget_chars}-char budget. Instructions preserved -- raise "
+            f"PULSE_MAX_INPUT_CHARS to keep more signal.")
+    return prompt
+
+
+def _pulse_system_prompt_len(use_briefing):
+    """Chars the briefing-book system prompt will add to a request."""
+    if not use_briefing:
+        return 0
+    try:
+        briefing = load_briefing_book() or ""
+    except Exception:
+        briefing = ""
+    return len(briefing) + 32 if briefing else 0
+
+
 def _pulse_call_claude_json(prompt_text, model=None, use_briefing=True, label="pass"):
     """Call Claude and parse JSON, retrying ONCE with an explicit output
     contract when the reply is not parseable.
@@ -1224,24 +1283,36 @@ def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end
     # Pass 4: Synthesis
     logger.info("[pulse] Pass 4/4: Synthesizing final report")
     date_range = f"{period_start.strftime('%b %d')} - {period_end.strftime('%b %d, %Y')}"
-    synthesis_prompt = (PULSE_SYNTHESIS_PROMPT
-        .replace("{date_range}", date_range)
-        .replace("{email_count}", str(len(email_data)))
-        .replace("{teams_count}", str(len(teams_data)))
-        .replace("{meetings_count}", str(len(meeting_data)))
-        .replace("{entities}", ", ".join(sorted(all_entities)) if all_entities else "none detected")
-        .replace("{meeting_links}", _pulse_build_meeting_links(meeting_data))
-        .replace("{email_json}", json.dumps(email_signals, indent=2))
-        .replace("{teams_json}", json.dumps(teams_signals, indent=2))
-        .replace("{meetings_json}", json.dumps(meeting_signals, indent=2))
-    )
-    # Append Ken's standing corrections (e.g. the Ariadne fundraising structure)
-    # as authoritative overrides so the synthesis does not repeat known mistakes.
+    # Ken's standing corrections (e.g. the Ariadne fundraising structure) are
+    # authoritative overrides. They are built into the prompt BEFORE the budget
+    # is applied -- appending them afterwards meant a large week truncated them
+    # straight back off, silently defeating the whole corrections mechanism.
+    corrections_block = ""
     try:
         import sara_corrections
-        synthesis_prompt += "\n\n" + sara_corrections.corrections_block()
+        corrections_block = "\n\n" + sara_corrections.corrections_block()
     except Exception as e:
         logger.warning(f"[pulse] Could not load standing corrections (non-fatal): {e}")
+
+    def _build_synthesis(sig):
+        return (PULSE_SYNTHESIS_PROMPT
+            .replace("{date_range}", date_range)
+            .replace("{email_count}", str(len(email_data)))
+            .replace("{teams_count}", str(len(teams_data)))
+            .replace("{meetings_count}", str(len(meeting_data)))
+            .replace("{entities}", ", ".join(sorted(all_entities)) if all_entities else "none detected")
+            .replace("{meeting_links}", _pulse_build_meeting_links(meeting_data))
+            .replace("{email_json}", json.dumps(sig["email_signals"], indent=2))
+            .replace("{teams_json}", json.dumps(sig["teams_signals"], indent=2))
+            .replace("{meetings_json}", json.dumps(sig["meeting_signals"], indent=2))
+        ) + corrections_block
+
+    synthesis_prompt = _pulse_build_within_budget(
+        _build_synthesis,
+        {"email_signals": email_signals, "teams_signals": teams_signals,
+         "meeting_signals": meeting_signals},
+        PULSE_MAX_INPUT_CHARS - _pulse_system_prompt_len(True) - 512,
+        "Pass 4")
     report = _pulse_call_claude(synthesis_prompt, model=PULSE_MODEL_SYNTHESIZE)
     logger.info("[pulse] Synthesis complete")
 
@@ -1272,10 +1343,15 @@ def _pulse_propose_briefing_updates(all_signals):
         logger.warning("[pulse] No briefing book to update")
         return []
 
-    prompt = (PULSE_BRIEFING_UPDATE_PROMPT
-        .replace("{briefing_book}", briefing)
-        .replace("{all_signals_json}", json.dumps(all_signals, indent=2))
-    )
+    def _build_briefing(sig):
+        return (PULSE_BRIEFING_UPDATE_PROMPT
+            .replace("{briefing_book}", briefing)
+            .replace("{all_signals_json}", json.dumps(sig, indent=2))
+        )
+
+    # use_briefing=False below, so the briefing book counts only once (inline).
+    prompt = _pulse_build_within_budget(
+        _build_briefing, all_signals, PULSE_MAX_INPUT_CHARS - 512, "Pass 5")
     # don't inject the briefing as a system prompt too -- it is already inline
     parsed = _pulse_call_claude_json(prompt, use_briefing=False, label="Pass 5")
     updates = parsed.get("proposed_updates") or []
@@ -3951,7 +4027,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.33.2-teams-window-json-retry", "deployed": "2026-09-02"})
+    return jsonify({"version": "2.34.0-prompt-integrity", "deployed": "2026-09-02"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4019,7 +4095,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.33.2-teams-window-json-retry", "steps": {}}
+    results = {"version": "2.34.0-prompt-integrity", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
