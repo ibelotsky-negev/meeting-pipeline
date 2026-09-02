@@ -260,6 +260,19 @@ def _pulse_graph_collect(url, headers, page_limit=1, stop_when=None):
     return items, False, None, ""
 
 
+def _pulse_msg_in_window(msg_date, start_iso, end_iso):
+    """Teams collection had only a LOWER bound, so any run whose window did not
+    end at "now" swept in everything since. Invisible on the weekly cron (where
+    end IS now) but a 2026-09-01 replay of the Aug 23-30 week pulled in two
+    extra days of traffic. Emails and Fireflies were bounded on both sides all
+    along; Teams was not."""
+    if not msg_date:
+        return True
+    if msg_date < start_iso:
+        return False
+    return not (end_iso and msg_date > end_iso)
+
+
 def _pulse_new_teams_stats():
     """Per-collection counters so a coverage gap is reportable, not invisible."""
     return {"read": 0, "refused": 0, "statuses": {}, "truncated": 0,
@@ -281,7 +294,8 @@ def _pulse_merge_teams_stats(agg, part, kind):
         agg["first_error"] = part["first_error"]
 
 
-def _pulse_fetch_channel_messages(team_id, team_name, channel, start_iso, headers):
+def _pulse_fetch_channel_messages(team_id, team_name, channel, start_iso,
+                                  headers, end_iso=None):
     """Fetch messages from a single channel. Returns (message_dicts, stats)."""
     import re
     channel_id = channel["id"]
@@ -309,7 +323,7 @@ def _pulse_fetch_channel_messages(team_id, team_name, channel, start_iso, header
                            f"ones unread (raise PULSE_MESSAGE_PAGE_LIMIT)")
         for msg in msgs:
             msg_date = msg.get("createdDateTime", "")
-            if msg_date and msg_date < start_iso:
+            if not _pulse_msg_in_window(msg_date, start_iso, end_iso):
                 continue
             if pulse_should_skip_teams_msg(msg):
                 continue
@@ -326,7 +340,7 @@ def _pulse_fetch_channel_messages(team_id, team_name, channel, start_iso, header
     return results, stats
 
 
-def _pulse_fetch_team_channels(team, start_iso, headers, pool):
+def _pulse_fetch_team_channels(team, start_iso, headers, pool, end_iso=None):
     """Fetch all channel messages for a single team. Submits channel fetches to pool."""
     team_id = team["id"]
     team_name = team.get("displayName", "")
@@ -345,13 +359,15 @@ def _pulse_fetch_team_channels(team, start_iso, headers, pool):
                            f"{PULSE_CHAT_PAGE_LIMIT} pages")
         for channel in channels:
             futures.append(pool.submit(
-                _pulse_fetch_channel_messages, team_id, team_name, channel, start_iso, headers))
+                _pulse_fetch_channel_messages, team_id, team_name, channel,
+                start_iso, headers, end_iso))
     except Exception as e:
         logger.warning(f"[pulse] Channels list failed for {team_name}: {e}")
     return futures
 
 
-def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
+def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock,
+                            end_iso=None):
     """Fetch chat messages for a single user. Returns (message_dicts, stats).
 
     A refused per-chat message read used to be a bare `continue`, so a total
@@ -434,7 +450,7 @@ def _pulse_fetch_user_chats(user, start_iso, headers, seen_chat_ids, seen_lock):
                     stats["truncated"] += 1
                 for msg in msgs:
                     msg_date = msg.get("createdDateTime", "")
-                    if msg_date and msg_date < start_iso:
+                    if not _pulse_msg_in_window(msg_date, start_iso, end_iso):
                         continue
                     if pulse_should_skip_teams_msg(msg):
                         continue
@@ -469,6 +485,7 @@ def pulse_collect_teams(start_dt, end_dt):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
     start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ") if end_dt else None
     token = get_ms_graph_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                "ConsistencyLevel": "eventual"}
@@ -496,7 +513,8 @@ def pulse_collect_teams(start_dt, end_dt):
                 logger.info(f"[pulse] Found {len(teams)} Teams via /groups")
                 # Fan out: get channels for each team, then messages for each channel
                 for team in teams:
-                    team_futures = _pulse_fetch_team_channels(team, start_iso, headers, pool)
+                    team_futures = _pulse_fetch_team_channels(
+                        team, start_iso, headers, pool, end_iso)
                     channel_futures.extend(team_futures)
             else:
                 logger.warning(f"[pulse] Groups list returned {groups_resp.status_code}: "
@@ -511,7 +529,8 @@ def pulse_collect_teams(start_dt, end_dt):
             seen_lock = threading.Lock()
             for user in users:
                 chat_futures.append(pool.submit(
-                    _pulse_fetch_user_chats, user, start_iso, headers, seen_chat_ids, seen_lock))
+                    _pulse_fetch_user_chats, user, start_iso, headers,
+                    seen_chat_ids, seen_lock, end_iso))
         except Exception as e:
             logger.warning(f"[pulse] Teams chat collection failed: {e}")
 
@@ -987,7 +1006,7 @@ def _pulse_run_chunked_pass(label, prompt_template, placeholder, blocks,
     import time
     if not blocks:
         prompt = prompt_template.replace(placeholder, empty_text)
-        return _pulse_parse_json(_pulse_call_claude(prompt, model=model))
+        return _pulse_call_claude_json(prompt, model=model, label=label)
 
     budget = _pulse_input_budget(prompt_template, placeholder)
     chunks = _pulse_pack_chunks(blocks, budget)
@@ -1013,7 +1032,9 @@ def _pulse_run_chunked_pass(label, prompt_template, placeholder, blocks,
             logger.info(f"[pulse] {label}: chunk {idx}/{len(chunks)} "
                         f"({len(chunk)} items)")
         prompt = prompt_template.replace(placeholder, "\n".join(chunk))
-        parts.append(_pulse_parse_json(_pulse_call_claude(prompt, model=model)))
+        parts.append(_pulse_call_claude_json(
+            prompt, model=model,
+            label=f"{label} chunk {idx}/{len(chunks)}" if len(chunks) > 1 else label))
 
     if len(parts) == 1:
         return parts[0]
@@ -1110,6 +1131,44 @@ def _pulse_parse_json(raw_text):
         f"[pulse] Failed to parse Claude JSON from {len(text)} chars, "
         f"returning empty signals. Raw head: {text[:400]!r}")
     return {"green": [], "yellow": [], "red": [], "key_entities": [], "_raw": text}
+
+
+PULSE_JSON_CONTRACT = (
+    "CRITICAL OUTPUT REQUIREMENT: reply with the JSON object described above and "
+    "NOTHING ELSE. No preamble, no explanation, no markdown report, no prose "
+    "before or after. The very first character of your reply must be '{' and the "
+    "very last must be '}'. If you have nothing to report, return the object with "
+    "empty arrays."
+)
+
+
+def _pulse_call_claude_json(prompt_text, model=None, use_briefing=True, label="pass"):
+    """Call Claude and parse JSON, retrying ONCE with an explicit output
+    contract when the reply is not parseable.
+
+    On 2026-09-01 the briefing pass answered a JSON request with a 17K-char
+    markdown report, so it proposed zero updates. The 2.30.1 parser caught that
+    cleanly -- but a caught failure is still a whole pass contributing nothing,
+    and a silent zero looks exactly like 'nothing happened'."""
+    raw = _pulse_call_claude(prompt_text, model=model, use_briefing=use_briefing)
+    parsed = _pulse_parse_json(raw)
+    if "_raw" not in parsed:
+        return parsed
+
+    logger.warning(f"[pulse] {label}: reply was not JSON -- retrying once with an "
+                   f"explicit output contract")
+    if PULSE_RATE_LIMIT_SECONDS:
+        import time
+        time.sleep(PULSE_RATE_LIMIT_SECONDS)
+    retry = _pulse_call_claude(f"{prompt_text}\n\n{PULSE_JSON_CONTRACT}",
+                               model=model, use_briefing=use_briefing)
+    parsed_retry = _pulse_parse_json(retry)
+    if "_raw" not in parsed_retry:
+        logger.info(f"[pulse] {label}: retry returned valid JSON")
+        return parsed_retry
+    logger.error(f"[pulse] {label}: retry ALSO failed to return JSON -- this pass "
+                 f"contributed nothing to the report")
+    return parsed_retry
 
 
 def pulse_analyze(email_data, teams_data, meeting_data, period_start, period_end):
@@ -1217,8 +1276,8 @@ def _pulse_propose_briefing_updates(all_signals):
         .replace("{briefing_book}", briefing)
         .replace("{all_signals_json}", json.dumps(all_signals, indent=2))
     )
-    raw = _pulse_call_claude(prompt, use_briefing=False)  # don't inject briefing as system too
-    parsed = _pulse_parse_json(raw)
+    # don't inject the briefing as a system prompt too -- it is already inline
+    parsed = _pulse_call_claude_json(prompt, use_briefing=False, label="Pass 5")
     updates = parsed.get("proposed_updates") or []
     logger.info(f"[pulse] Briefing update proposals: {len(updates)} "
                 f"({sum(1 for u in updates if u.get('confidence') == 'high')} high, "
@@ -3892,7 +3951,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.33.1-followup-recipients", "deployed": "2026-09-01"})
+    return jsonify({"version": "2.33.2-teams-window-json-retry", "deployed": "2026-09-02"})
 
 
 @app.route("/config", methods=["GET"])
@@ -3960,7 +4019,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.33.1-followup-recipients", "steps": {}}
+    results = {"version": "2.33.2-teams-window-json-retry", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
