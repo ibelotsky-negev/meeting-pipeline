@@ -83,6 +83,22 @@ def test_mask_spans_is_equal_length_and_blocks_the_substring():
     assert masked.endswith("our PD program")
 
 
+def test_mask_safe_harbor_preserves_length_and_removes_the_cue():
+    prefix = "Good morning everyone. This call contains "
+    # a single cue phrase only -- "private securities litigation" is also a
+    # cue and would trigger a second, independent masked span if included
+    cue = "forward-looking statements within the meaning of applicable law."
+    suffix = " Now let's discuss our results."
+    text = prefix + cue + suffix
+    # explicit span sized to the cue only, so the mask does not run past it
+    # into the trailing sentence, keeping the assertions below meaningful
+    masked = cns_screen.mask_safe_harbor(text, span=len(cue))
+    assert len(masked) == len(text)
+    assert "forward-looking statements" not in masked
+    assert "Good morning everyone." in masked
+    assert "Now let's discuss our results." in masked
+
+
 def test_prefilter_skips_a_transcript_with_no_cns_content():
     text = ("We had a strong quarter in oncology. Our PD-L1 asset met its "
             "primary endpoint and we have significant capacity for business "
@@ -151,6 +167,29 @@ def test_msa_mds_aes_ambiguity_gates():
         "There were no treatment-related AEs or AES in the study.").standalone_hits)
     assert any(t == "AES" for t, _ in cns_screen.prefilter(
         "We will present seizure-freedom data at AES this December.").standalone_hits)
+
+
+def test_cns_gate_blocks_the_consumer_health_exclusion_phrasing():
+    """Regression guard for the CNS gate reading the wrong string. 'Consumer
+    Health' is an exclusion-list entry, so masking erases it before the gate
+    ever runs -- if the gate reads the MASKED text (the bug), it finds no cue
+    and wrongly accepts CNS. The gate must read the UNMASKED normalized text
+    instead, where 'Consumer Health' is still present to block it."""
+    text = "Our Consumer Health segment reported CNS sales growth this quarter."
+    res = cns_screen.prefilter(text)
+    assert not any(t == "CNS" for t, _ in res.domain_hits)
+
+
+def test_cns_gate_blocks_the_consumer_nutrition_phrasing():
+    text = "Our Consumer Nutrition segment reported CNS sales growth this quarter."
+    res = cns_screen.prefilter(text)
+    assert not any(t == "CNS" for t, _ in res.domain_hits)
+
+
+def test_cns_gate_accepts_ordinary_pharma_context():
+    text = "Our CNS pipeline advanced with a new Phase 2 readout in epilepsy."
+    res = cns_screen.prefilter(text)
+    assert any(t == "CNS" for t, _ in res.domain_hits)
 
 
 def test_prefilter_collects_high_signal_terms_with_offsets():

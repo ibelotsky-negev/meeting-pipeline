@@ -317,15 +317,20 @@ def _near(offset: int, others, window: int) -> bool:
     return any(abs(offset - other) <= window for other in others)
 
 
-def _gate_ok(term: str, masked: str, offset: int, parkinsons_offsets, window: int) -> bool:
-    """-> True when a gated term's match should count, per the YAML's
-    ambiguity_rules. Runs on the MASKED text, so any term also present in the
-    exclusion list (PD-1, PD-L1, PK/PD) has already been neutralized -- the
-    blocker regex below is defense in depth for the cases the mask misses,
-    notably a bare 'pharmacodynamic', which is NOT an exclusion entry."""
+def _gate_ok(term: str, cue_text: str, offset: int, parkinsons_offsets, window: int) -> bool:
+    """-> True when a gated term's match should count, per the keyword file's
+    ambiguity_rules.
+
+    `cue_text` is the normalized but UNMASKED text. Cue searching must not run
+    on the masked string: masking erases exclusion phrases so that keyword
+    TERMS cannot match inside them, but a gate needs to SEE those phrases to do
+    its job. "Consumer Health" is an exclusion entry, so reading masked text
+    made the CNS gate blind to the exact case it exists to block. Offsets are
+    interchangeable between the two strings because every masking step is
+    length-preserving."""
     lo = max(0, offset - window)
-    hi = min(len(masked), offset + window)
-    context = masked[lo:hi]
+    hi = min(len(cue_text), offset + window)
+    context = cue_text[lo:hi]
     if term == "PD":
         if _PD_BLOCKERS.search(context):
             return False
@@ -342,14 +347,19 @@ def _gate_ok(term: str, masked: str, offset: int, parkinsons_offsets, window: in
     return True
 
 
-def _collect(groups, masked, parkinsons_offsets, window):
-    """-> [(term, offset)] for every match in `groups` that survives its gate."""
+def _collect(groups, masked, cue_text, parkinsons_offsets, window):
+    """-> [(term, offset)] for every match in `groups` that survives its gate.
+
+    Term matching (`pattern.finditer`) runs on the MASKED text -- exclusion
+    phrases must stay neutralized so a term cannot match inside one. Gate cue
+    lookups run on `cue_text`, the unmasked normalized text, since a gate needs
+    to see the very phrases masking erased. See `_gate_ok`."""
     hits = []
     for term, pattern in groups:
         gated = term in _GATED_TERMS
         for match in pattern.finditer(masked):
             offset = match.start()
-            if gated and not _gate_ok(term, masked, offset, parkinsons_offsets, window):
+            if gated and not _gate_ok(term, cue_text, offset, parkinsons_offsets, window):
                 continue
             hits.append((term, offset))
     return hits
@@ -370,7 +380,7 @@ def prefilter(text: str, kw: dict = None, window: int = None) -> PrefilterResult
     `screen` is True when the DOMAIN gate opened at all. That is the skip gate:
     a transcript with no domain term never reaches the model.
     """
-    kw = kw or load_keywords()
+    kw = load_keywords() if kw is None else kw
     window = CNS_GATE_WINDOW if window is None else int(window)
 
     normalized = normalize_text(text)
@@ -381,7 +391,9 @@ def prefilter(text: str, kw: dict = None, window: int = None) -> PrefilterResult
     # term being gated here. Without this exclusion, every "PD" match would
     # satisfy its own proximity check (distance 0 to itself), which defeats
     # the ambiguity rule entirely -- "a parkinsons/synuclein term" means a
-    # DIFFERENT term than the ambiguous "PD" acronym.
+    # DIFFERENT term than the ambiguous "PD" acronym. Computed from the MASKED
+    # text on purpose: these come from term matching, and a Parkinson's term
+    # sitting inside an excluded phrase should not count.
     parkinsons_offsets = [
         m.start()
         for term, pattern in compile_group(kw, PARKINSONS_GROUP)
@@ -394,7 +406,7 @@ def prefilter(text: str, kw: dict = None, window: int = None) -> PrefilterResult
         domain_groups.extend(compile_group(kw, group))
     # A named CNS asset is inherently in-domain -- see the group-role comment.
     domain_groups.extend(compile_group(kw, ASSET_GROUP))
-    domain_hits = _collect(domain_groups, masked, parkinsons_offsets, window)
+    domain_hits = _collect(domain_groups, masked, normalized, parkinsons_offsets, window)
     domain_offsets = [offset for _, offset in domain_hits]
 
     # Generic BD language appears on nearly every earnings call and is NOISE by
@@ -403,7 +415,7 @@ def prefilter(text: str, kw: dict = None, window: int = None) -> PrefilterResult
     # flood the digest with if the gate is loose.
     bd_hits = [
         (term, offset)
-        for term, offset in _collect(compile_group(kw, BD_GROUP), masked,
+        for term, offset in _collect(compile_group(kw, BD_GROUP), masked, normalized,
                                      parkinsons_offsets, window)
         if _near(offset, domain_offsets, window)
     ]
@@ -411,10 +423,10 @@ def prefilter(text: str, kw: dict = None, window: int = None) -> PrefilterResult
     standalone_groups = []
     for group in STANDALONE_GROUPS:
         standalone_groups.extend(compile_group(kw, group))
-    standalone_hits = _collect(standalone_groups, masked, parkinsons_offsets, window)
+    standalone_hits = _collect(standalone_groups, masked, normalized, parkinsons_offsets, window)
 
     high_signal_hits = _collect(compile_group(kw, "high_signal_rare_terms"),
-                                masked, parkinsons_offsets, window)
+                                masked, normalized, parkinsons_offsets, window)
 
     return PrefilterResult(
         domain_hits=domain_hits,
