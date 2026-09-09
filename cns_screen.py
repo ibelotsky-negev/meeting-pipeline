@@ -253,3 +253,174 @@ def mask_safe_harbor(text: str, span: int = None) -> str:
         end = min(len(text), start + span)
         out = out[:start] + ("#" * (end - start)) + out[end:]
     return out
+
+
+# ======================================================================
+#  PREFILTER
+# ======================================================================
+# The keyword YAML asks for co-occurrence "within the same paragraph". FMP
+# transcripts have NO paragraphs -- format A is one unbroken 56,663-character
+# line with zero newlines, and format B's speaker turns reach 25,525 characters
+# (Roche has a single 25K turn). Treating a turn as a paragraph would let a BD
+# term co-occur with a domain term 25,000 characters away, which is not a gate.
+#
+# So co-occurrence is CHARACTER PROXIMITY: within CNS_GATE_WINDOW characters.
+# This is a deliberate, documented deviation from the YAML's wording.
+CNS_GATE_WINDOW = int(os.environ.get("CNS_GATE_WINDOW", "600"))
+
+# The YAML's `ambiguity_rules` block is human-readable PROSE, so each rule is
+# implemented explicitly below and asserted by a test. Adding a rule to the
+# YAML does NOT auto-apply it -- that needs a code change here. CLAUDE.md
+# records this.
+_PD_BLOCKERS = re.compile(r"pharmacodynamic|PK\s*/\s*PD|\bPD-?L?1\b", re.IGNORECASE)
+_NEURO_CUE = re.compile(
+    r"\b(neuro\w*|brain|CNS|central nervous|Parkinson\w*|Alzheimer\w*|epilep\w*|"
+    r"seizure|dementia|psychiatr\w*|cognitive|multiple system atrophy|ataxia)\b",
+    re.IGNORECASE)
+_EPILEPSY_CUE = re.compile(r"\b(epilep\w*|seizure|Dravet|Lennox|convulsi\w*)\b",
+                           re.IGNORECASE)
+
+# Terms whose bare match is not trusted. Each maps to a gate function below.
+_GATED_TERMS = ("PD", "MSA", "MDS", "AES", "CNS")
+
+
+class PrefilterResult:
+    """Hits from the keyword layer. Every offset indexes the NORMALIZED text,
+    which is the same length as the raw text, so offsets are interchangeable
+    with the Q&A boundary and with verification offsets."""
+
+    __slots__ = ("domain_hits", "bd_hits", "standalone_hits",
+                 "high_signal_hits", "screen", "masked")
+
+    def __init__(self, domain_hits, bd_hits, standalone_hits,
+                 high_signal_hits, screen, masked):
+        self.domain_hits = domain_hits
+        self.bd_hits = bd_hits
+        self.standalone_hits = standalone_hits
+        self.high_signal_hits = high_signal_hits
+        self.screen = screen
+        self.masked = masked
+
+    def as_summary(self) -> dict:
+        """-> a small JSON-safe dict for the status file and the digest."""
+        return {
+            "screen": self.screen,
+            "domain_terms": sorted({t for t, _ in self.domain_hits}),
+            "bd_terms": sorted({t for t, _ in self.bd_hits}),
+            "standalone_terms": sorted({t for t, _ in self.standalone_hits}),
+            "high_signal_terms": sorted({t for t, _ in self.high_signal_hits}),
+        }
+
+
+def _near(offset: int, others, window: int) -> bool:
+    """-> True when any offset in `others` is within `window` characters."""
+    return any(abs(offset - other) <= window for other in others)
+
+
+def _gate_ok(term: str, masked: str, offset: int, parkinsons_offsets, window: int) -> bool:
+    """-> True when a gated term's match should count, per the YAML's
+    ambiguity_rules. Runs on the MASKED text, so any term also present in the
+    exclusion list (PD-1, PD-L1, PK/PD) has already been neutralized -- the
+    blocker regex below is defense in depth for the cases the mask misses,
+    notably a bare 'pharmacodynamic', which is NOT an exclusion entry."""
+    lo = max(0, offset - window)
+    hi = min(len(masked), offset + window)
+    context = masked[lo:hi]
+    if term == "PD":
+        if _PD_BLOCKERS.search(context):
+            return False
+        return _near(offset, parkinsons_offsets, window)
+    if term in ("MSA", "MDS"):
+        # master services agreement / myelodysplastic syndromes
+        return bool(_NEURO_CUE.search(context))
+    if term == "AES":
+        # "adverse events, serious" unless an epilepsy context is nearby
+        return bool(_EPILEPSY_CUE.search(context))
+    if term == "CNS":
+        # consumer-nutrition segment at a few issuers
+        return not re.search(r"consumer (nutrition|health)", context, re.IGNORECASE)
+    return True
+
+
+def _collect(groups, masked, parkinsons_offsets, window):
+    """-> [(term, offset)] for every match in `groups` that survives its gate."""
+    hits = []
+    for term, pattern in groups:
+        gated = term in _GATED_TERMS
+        for match in pattern.finditer(masked):
+            offset = match.start()
+            if gated and not _gate_ok(term, masked, offset, parkinsons_offsets, window):
+                continue
+            hits.append((term, offset))
+    return hits
+
+
+def prefilter(text: str, kw: dict = None, window: int = None) -> PrefilterResult:
+    """-> PrefilterResult.
+
+    Order matters:
+      1. normalize (length-preserving)
+      2. mask the safe harbor, then the exclusion list -- both equal-length, so
+         offsets stay valid and an excluded phrase cannot yield a term hit
+      3. match the domain groups, applying the ambiguity gates
+      4. match BD terms, keeping only those with a domain term within `window`
+      5. match the standalone groups
+      6. match the high-signal rare terms for the independent recall check
+
+    `screen` is True when the DOMAIN gate opened at all. That is the skip gate:
+    a transcript with no domain term never reaches the model.
+    """
+    kw = kw or load_keywords()
+    window = CNS_GATE_WINDOW if window is None else int(window)
+
+    normalized = normalize_text(text)
+    masked = mask_safe_harbor(normalized)
+    masked = mask_spans(masked, [p for _, p in compile_group(kw, "exclusions")])
+
+    # Excludes "PD" itself: it is a member of PARKINSONS_GROUP but is the very
+    # term being gated here. Without this exclusion, every "PD" match would
+    # satisfy its own proximity check (distance 0 to itself), which defeats
+    # the ambiguity rule entirely -- "a parkinsons/synuclein term" means a
+    # DIFFERENT term than the ambiguous "PD" acronym.
+    parkinsons_offsets = [
+        m.start()
+        for term, pattern in compile_group(kw, PARKINSONS_GROUP)
+        for m in pattern.finditer(masked)
+        if term != "PD"
+    ]
+
+    domain_groups = []
+    for group in DOMAIN_GROUPS:
+        domain_groups.extend(compile_group(kw, group))
+    # A named CNS asset is inherently in-domain -- see the group-role comment.
+    domain_groups.extend(compile_group(kw, ASSET_GROUP))
+    domain_hits = _collect(domain_groups, masked, parkinsons_offsets, window)
+    domain_offsets = [offset for _, offset in domain_hits]
+
+    # Generic BD language appears on nearly every earnings call and is NOISE by
+    # itself. It counts only alongside domain vocabulary. This is the single
+    # most valuable thing the screen can find, and the single easiest thing to
+    # flood the digest with if the gate is loose.
+    bd_hits = [
+        (term, offset)
+        for term, offset in _collect(compile_group(kw, BD_GROUP), masked,
+                                     parkinsons_offsets, window)
+        if _near(offset, domain_offsets, window)
+    ]
+
+    standalone_groups = []
+    for group in STANDALONE_GROUPS:
+        standalone_groups.extend(compile_group(kw, group))
+    standalone_hits = _collect(standalone_groups, masked, parkinsons_offsets, window)
+
+    high_signal_hits = _collect(compile_group(kw, "high_signal_rare_terms"),
+                                masked, parkinsons_offsets, window)
+
+    return PrefilterResult(
+        domain_hits=domain_hits,
+        bd_hits=bd_hits,
+        standalone_hits=standalone_hits,
+        high_signal_hits=high_signal_hits,
+        screen=bool(domain_hits),
+        masked=masked,
+    )

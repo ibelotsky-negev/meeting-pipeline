@@ -1,9 +1,5 @@
 """Offline tests for the CNS screen. Fixtures under tests/fixtures/cns/ are
 trimmed excerpts of real FMP transcripts captured 2026-09-09."""
-import os
-
-import pytest
-
 import cns_screen
 
 
@@ -85,3 +81,83 @@ def test_mask_spans_is_equal_length_and_blocks_the_substring():
     assert "PD-1" not in masked
     # the real PD mention survives
     assert masked.endswith("our PD program")
+
+
+def test_prefilter_skips_a_transcript_with_no_cns_content():
+    text = ("We had a strong quarter in oncology. Our PD-L1 asset met its "
+            "primary endpoint and we have significant capacity for business "
+            "development going forward.")
+    res = cns_screen.prefilter(text)
+    assert res.screen is False, "no domain term -> must not reach the model"
+    assert res.domain_hits == []
+
+
+def test_prefilter_asset_name_alone_opens_the_domain_gate():
+    """A named CNS asset is inherently in-domain even with no other vocabulary."""
+    res = cns_screen.prefilter("Cobenfy uptake continues to exceed our plan.")
+    assert res.screen is True
+    assert any(term.lower() == "cobenfy" for term, _ in res.domain_hits)
+
+
+def test_prefilter_company_name_alone_does_not_open_the_gate():
+    """Pharma companies name each other constantly; that is not CNS evidence."""
+    res = cns_screen.prefilter("Unlike Pfizer, we did not pursue that deal.")
+    assert res.screen is False
+
+
+def test_bd_term_needs_a_domain_term_within_the_window():
+    near = ("We see real opportunity in neuroscience. We have significant "
+            "capacity for business development this year.")
+    res_near = cns_screen.prefilter(near)
+    assert res_near.bd_hits, "a BD term next to a domain term is the money signal"
+
+    far = ("We see real opportunity in neuroscience. " + ("filler text. " * 200)
+           + "We have significant capacity for business development.")
+    res_far = cns_screen.prefilter(far)
+    assert res_far.screen is True, "the domain term still opens the gate"
+    assert not res_far.bd_hits, "a BD term 2000+ chars away is not co-occurrence"
+
+
+def test_pd_requires_parkinsons_context_and_is_blocked_by_pharmacodynamics():
+    ok = "Our Parkinson's program advanced; PD patients showed less OFF time."
+    assert any(term == "PD" for term, _ in cns_screen.prefilter(ok).domain_hits)
+
+    # PD-1 is masked by the exclusion list, so it cannot yield a PD hit at all
+    onc = "Our PD-1 and PD-L1 assets in oncology performed well."
+    assert not any(term == "PD" for term, _ in cns_screen.prefilter(onc).domain_hits)
+
+    # pharmacodynamics is NOT in the exclusion list, so the ambiguity gate
+    # itself has to reject this one
+    pk = "The PK/PD profile and PD data supported dose selection."
+    assert not any(term == "PD" for term, _ in cns_screen.prefilter(pk).domain_hits)
+
+
+def test_msa_mds_aes_ambiguity_gates():
+    # MSA as a master services agreement, no neuro nearby -> rejected
+    assert not any(t == "MSA" for t, _ in
+                   cns_screen.prefilter("We signed an MSA with the supplier.").domain_hits)
+    # MSA with neuro context -> accepted
+    assert any(t == "MSA" for t, _ in cns_screen.prefilter(
+        "In multiple system atrophy, our MSA cohort enrolled fully.").domain_hits)
+    # MDS is myelodysplastic syndromes in heme-onc; it lives in
+    # conference_mentions (a standalone group), so assert there -- a
+    # domain_hits assertion would pass vacuously and test nothing.
+    assert not any(t == "MDS" for t, _ in
+                   cns_screen.prefilter("Our MDS franchise in heme-onc grew.").standalone_hits)
+    assert any(t == "MDS" for t, _ in cns_screen.prefilter(
+        "We will present Parkinson's data at MDS this year.").standalone_hits)
+    # AES needs epilepsy/seizure context
+    assert not any(t == "AES" for t, _ in cns_screen.prefilter(
+        "There were no treatment-related AEs or AES in the study.").standalone_hits)
+    assert any(t == "AES" for t, _ in cns_screen.prefilter(
+        "We will present seizure-freedom data at AES this December.").standalone_hits)
+
+
+def test_prefilter_collects_high_signal_terms_with_offsets():
+    text = "We are studying apathy in Parkinson's disease with a 5-HT2C agonist."
+    res = cns_screen.prefilter(text)
+    terms = {t.lower() for t, _ in res.high_signal_hits}
+    assert "apathy" in terms
+    assert "5-ht2c" in terms
+    for _, offset in res.high_signal_hits:
+        assert 0 <= offset < len(text)
