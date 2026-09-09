@@ -118,6 +118,38 @@ def test_discover_from_feed_does_not_early_exit_on_unsorted_rows(fake_fmp):
     assert [f["symbol"] for f in found] == ["BIIB"]
 
 
+def test_discover_from_feed_walks_past_page_zero(fake_fmp):
+    """Three scripted pages: page 0 and page 1 each carry one in-universe row
+    for a different symbol, page 2 is empty (the natural end of the feed).
+    Both symbols must be found, proving the walk continues past page 0."""
+    script, _ = fake_fmp
+    script["earning-call-transcript-latest"] = [
+        _Reply([{"symbol": "ABBV", "period": "Q2", "fiscalYear": 2026,
+                 "date": "2026-07-31"}]),
+        _Reply([{"symbol": "BIIB", "period": "Q2", "fiscalYear": 2026,
+                 "date": "2026-07-29"}]),
+        _Reply([]),
+    ]
+    found = cns_fmp.discover_from_feed({"ABBV": {}, "BIIB": {}},
+                                       "2026-07-01", "2026-09-15")
+    assert {f["symbol"] for f in found} == {"ABBV", "BIIB"}
+
+
+def test_discover_from_feed_stops_at_max_pages(fake_fmp):
+    """Same two-page script as above, but max_pages=1 must bound the walk to
+    page 0 only -- the page-1 symbol is never reached."""
+    script, _ = fake_fmp
+    script["earning-call-transcript-latest"] = [
+        _Reply([{"symbol": "ABBV", "period": "Q2", "fiscalYear": 2026,
+                 "date": "2026-07-31"}]),
+        _Reply([{"symbol": "BIIB", "period": "Q2", "fiscalYear": 2026,
+                 "date": "2026-07-29"}]),
+    ]
+    found = cns_fmp.discover_from_feed({"ABBV": {}, "BIIB": {}},
+                                       "2026-07-01", "2026-09-15", max_pages=1)
+    assert [f["symbol"] for f in found] == ["ABBV"]
+
+
 def test_discover_from_feed_dedupes_repeated_period(fake_fmp):
     script, _ = fake_fmp
     script["earning-call-transcript-latest"] = [

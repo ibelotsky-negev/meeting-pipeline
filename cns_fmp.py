@@ -23,7 +23,6 @@ Author: Negev Labs
 """
 
 import os
-import json
 import logging
 from datetime import date
 
@@ -205,6 +204,24 @@ def build_universe(force_include=None, min_market_cap: int = None) -> dict:
     return universe
 
 
+def _record_period(found: list, seen: set, symbol: str, row: dict, call_date: str) -> bool:
+    """Normalize one discovery row and append it if the period is new.
+
+    -> True when appended. Both discovery paths share this so the emitted
+    dict shape and the dedup key are defined in exactly one place."""
+    parsed = normalize_period(row)
+    if not parsed:
+        return False
+    fiscal_year, quarter = parsed
+    key = period_key(symbol, fiscal_year, quarter)
+    if key in seen:
+        return False
+    seen.add(key)
+    found.append({"symbol": symbol, "fiscal_year": fiscal_year,
+                  "quarter": quarter, "date": call_date})
+    return True
+
+
 def discover_from_feed(universe: dict, start_date: str, end_date: str,
                        max_pages: int = None) -> list:
     """-> [{symbol, fiscal_year, quarter, date}] for universe companies whose
@@ -237,16 +254,7 @@ def discover_from_feed(universe: dict, start_date: str, end_date: str,
                 continue
             if not (start_date <= call_date <= end_date):
                 continue
-            parsed = normalize_period(row)
-            if not parsed:
-                continue
-            fiscal_year, quarter = parsed
-            key = period_key(symbol, fiscal_year, quarter)
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append({"symbol": symbol, "fiscal_year": fiscal_year,
-                          "quarter": quarter, "date": call_date})
+            _record_period(found, seen, symbol, row, call_date)
     else:
         logger.warning(f"[cns] feed page limit {pages} reached -- "
                        "relying on the weekly dates sweep for the remainder")
@@ -266,16 +274,7 @@ def discover_from_dates(universe: dict, start_date: str, end_date: str) -> list:
             call_date = (row.get("date") or "")[:10]
             if not call_date or not (start_date <= call_date <= end_date):
                 continue
-            parsed = normalize_period(row)
-            if not parsed:
-                continue
-            fiscal_year, quarter = parsed
-            key = period_key(symbol, fiscal_year, quarter)
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append({"symbol": symbol, "fiscal_year": fiscal_year,
-                          "quarter": quarter, "date": call_date})
+            _record_period(found, seen, symbol, row, call_date)
     return found
 
 
