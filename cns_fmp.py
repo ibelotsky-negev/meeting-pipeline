@@ -203,3 +203,130 @@ def build_universe(force_include=None, min_market_cap: int = None) -> dict:
         }
     logger.info(f"[cns] universe built: {len(universe)} symbols")
     return universe
+
+
+def discover_from_feed(universe: dict, start_date: str, end_date: str,
+                       max_pages: int = None) -> list:
+    """-> [{symbol, fiscal_year, quarter, date}] for universe companies whose
+    call date falls in [start_date, end_date].
+
+    Cheap primary discovery: one global feed instead of 240 per-symbol calls.
+
+    Three properties are load-bearing and each one is a live observation:
+      - The feed is NOT reliably ordered (FMP FAQ: a transcript added late is
+        inserted at its call date, not at the top), so this NEVER early-exits
+        on an out-of-window row -- it reads every row of every page it pulls.
+      - The feed contains future dates (7011.T dated 2026-11-07 seen on
+        2026-09-09), so anything after today is dropped.
+      - Paging is bounded by max_pages so a peak-season day cannot run away.
+    """
+    pages = CNS_FEED_PAGES if max_pages is None else int(max_pages)
+    today = date.today().isoformat()
+    found, seen = [], set()
+    for page in range(pages):
+        rows = _rows(_fmp_get("earning-call-transcript-latest",
+                              page=page, limit=FEED_PAGE_SIZE))
+        if not rows:
+            break
+        for row in rows:
+            symbol = (row.get("symbol") or "").strip().upper()
+            if symbol not in universe:
+                continue
+            call_date = (row.get("date") or "")[:10]
+            if not call_date or call_date > today:
+                continue
+            if not (start_date <= call_date <= end_date):
+                continue
+            parsed = normalize_period(row)
+            if not parsed:
+                continue
+            fiscal_year, quarter = parsed
+            key = period_key(symbol, fiscal_year, quarter)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({"symbol": symbol, "fiscal_year": fiscal_year,
+                          "quarter": quarter, "date": call_date})
+    else:
+        logger.warning(f"[cns] feed page limit {pages} reached -- "
+                       "relying on the weekly dates sweep for the remainder")
+    return found
+
+
+def discover_from_dates(universe: dict, start_date: str, end_date: str) -> list:
+    """-> same shape as discover_from_feed, via one call per universe symbol.
+
+    The reconciliation backstop for anything the unstably-ordered feed missed.
+    About 240 calls, trivial at the Ultimate tier's 3000 requests/minute, so it
+    runs weekly rather than daily purely to keep the daily run fast."""
+    found, seen = [], set()
+    for symbol in sorted(universe):
+        rows = _rows(_fmp_get("earning-call-transcript-dates", symbol=symbol))
+        for row in rows:
+            call_date = (row.get("date") or "")[:10]
+            if not call_date or not (start_date <= call_date <= end_date):
+                continue
+            parsed = normalize_period(row)
+            if not parsed:
+                continue
+            fiscal_year, quarter = parsed
+            key = period_key(symbol, fiscal_year, quarter)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({"symbol": symbol, "fiscal_year": fiscal_year,
+                          "quarter": quarter, "date": call_date})
+    return found
+
+
+def fetch_transcript(symbol: str, fiscal_year: int, quarter: int):
+    """-> (content, call_date) on success, or (None, reason) on failure.
+
+    `year` on this endpoint means FISCAL year and matches `fiscalYear` from the
+    dates endpoint -- not the calendar year of the call.
+
+    Four distinct failure shapes, all observed live, and none of them may be
+    mistaken for a successful screen with no findings:
+      - _fmp_get returned None (HTTP error, timeout, non-JSON)
+      - bare JSON null, a dict, or a string instead of a list
+      - an empty list
+      - a well-formed row whose `content` is empty or implausibly short
+    The caller records the last case as a retryable coverage gap so the period
+    is re-fetched once FMP backfills it.
+    """
+    data = _fmp_get("earning-call-transcript",
+                    symbol=symbol, year=fiscal_year, quarter=quarter)
+    if data is None:
+        return None, "fmp_request_failed"
+    rows = _rows(data)
+    if not rows:
+        return None, "no_row_returned"
+    content = rows[0].get("content") or ""
+    call_date = (rows[0].get("date") or "")[:10]
+    if len(content) < CNS_MIN_TRANSCRIPT_CHARS:
+        return None, f"content_too_short:{len(content)}"
+    return content, call_date
+
+
+def reported_symbols(universe: dict, start_date: str, end_date: str) -> dict:
+    """-> {SYMBOL: latest call date} for universe companies that have ACTUALLY
+    reported in the window (epsActual present).
+
+    Feeds the digest's "reported but no transcript" line, which is what makes a
+    coverage gap visible instead of silent. A row with epsActual None is merely
+    scheduled and must not count as reported."""
+    rows = _rows(_fmp_get("earnings-calendar",
+                          **{"from": start_date, "to": end_date}))
+    reported = {}
+    for row in rows:
+        symbol = (row.get("symbol") or "").strip().upper()
+        if symbol not in universe:
+            continue
+        if row.get("epsActual") is None:
+            continue
+        call_date = (row.get("date") or "")[:10]
+        if not call_date:
+            continue
+        if symbol not in reported or call_date > reported[symbol]:
+            reported[symbol] = call_date
+    return reported

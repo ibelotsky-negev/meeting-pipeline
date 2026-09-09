@@ -90,3 +90,86 @@ def test_build_universe_survives_total_fmp_failure(fake_fmp):
     uni = cns_fmp.build_universe(force_include=["RHHBY"])
     assert uni == {"RHHBY": uni["RHHBY"]}
     assert uni["RHHBY"]["source"] == "roster"
+
+
+def test_discover_from_feed_drops_future_dates_and_out_of_universe(fake_fmp):
+    script, _ = fake_fmp
+    # Row 1 is the real live observation: 7011.T dated two months in the future.
+    script["earning-call-transcript-latest"] = [
+        {"symbol": "7011.T", "period": "Q2", "fiscalYear": 2025, "date": "2099-11-07"},
+        {"symbol": "FDEV.L", "period": "Q4", "fiscalYear": 2026, "date": "2026-09-09"},
+        {"symbol": "ABBV", "period": "Q2", "fiscalYear": 2026, "date": "2026-07-31"},
+    ]
+    found = cns_fmp.discover_from_feed({"ABBV": {}}, "2026-07-01", "2026-09-15", max_pages=1)
+    assert found == [{"symbol": "ABBV", "fiscal_year": 2026, "quarter": 2,
+                      "date": "2026-07-31"}]
+
+
+def test_discover_from_feed_does_not_early_exit_on_unsorted_rows(fake_fmp):
+    """FMP's FAQ: late-added transcripts are inserted by call date, not at the
+    top. An early exit on the first out-of-window row would drop the rest."""
+    script, _ = fake_fmp
+    script["earning-call-transcript-latest"] = [
+        {"symbol": "ABBV", "period": "Q1", "fiscalYear": 2020, "date": "2020-04-01"},
+        {"symbol": "BIIB", "period": "Q2", "fiscalYear": 2026, "date": "2026-07-29"},
+    ]
+    found = cns_fmp.discover_from_feed({"ABBV": {}, "BIIB": {}},
+                                       "2026-07-01", "2026-09-15", max_pages=1)
+    assert [f["symbol"] for f in found] == ["BIIB"]
+
+
+def test_discover_from_feed_dedupes_repeated_period(fake_fmp):
+    script, _ = fake_fmp
+    script["earning-call-transcript-latest"] = [
+        {"symbol": "ABBV", "period": "Q2", "fiscalYear": 2026, "date": "2026-07-31"},
+        {"symbol": "abbv", "quarter": 2, "fiscalYear": 2026, "date": "2026-07-31"},
+    ]
+    found = cns_fmp.discover_from_feed({"ABBV": {}}, "2026-07-01", "2026-09-15", max_pages=1)
+    assert len(found) == 1
+
+
+def test_fetch_transcript_success(fake_fmp):
+    script, _ = fake_fmp
+    script["earning-call-transcript"] = [
+        {"symbol": "ABBV", "period": "Q2", "year": 2026,
+         "date": "2026-07-31", "content": "x" * 50_000},
+    ]
+    content, call_date = cns_fmp.fetch_transcript("ABBV", 2026, 2)
+    assert len(content) == 50_000
+    assert call_date == "2026-07-31"
+
+
+def test_fetch_transcript_treats_empty_content_as_gap(fake_fmp):
+    """AXSM FY2026Q2, verified live: the dates endpoint lists it with
+    date 2026-08-10 and the fetch returns a well-formed row whose content is
+    zero characters. This must NOT look like 'screened, no findings'."""
+    script, _ = fake_fmp
+    script["earning-call-transcript"] = [
+        {"symbol": "AXSM", "period": "Q2", "year": 2026,
+         "date": "2026-08-10", "content": ""},
+    ]
+    content, reason = cns_fmp.fetch_transcript("AXSM", 2026, 2)
+    assert content is None
+    assert "too_short" in reason
+
+
+def test_fetch_transcript_tolerates_null_and_dict_and_empty(fake_fmp):
+    """A repeat call for AXSM returned bare JSON null, which crashed the probe
+    with len(None). Each of these must be a clean failure, not an exception."""
+    script, _ = fake_fmp
+    for payload in (None, [], {}, {"Error Message": "boom"}, "nope"):
+        script["earning-call-transcript"] = payload
+        content, reason = cns_fmp.fetch_transcript("AXSM", 2026, 2)
+        assert content is None
+        assert reason
+
+
+def test_reported_symbols_ignores_scheduled_but_unreported(fake_fmp):
+    script, _ = fake_fmp
+    script["earnings-calendar"] = [
+        {"symbol": "ABBV", "date": "2026-07-31", "epsActual": 3.1},
+        {"symbol": "BIIB", "date": "2026-09-20", "epsActual": None},
+        {"symbol": "NOPE", "date": "2026-07-15", "epsActual": 1.0},
+    ]
+    got = cns_fmp.reported_symbols({"ABBV": {}, "BIIB": {}}, "2026-07-01", "2026-09-15")
+    assert got == {"ABBV": "2026-07-31"}
