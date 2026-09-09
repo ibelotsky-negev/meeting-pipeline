@@ -2124,12 +2124,595 @@ git commit -m "feat(cns): Opus 5 screening with enforced JSON schema and fenced 
 
 ---
 
+### Task 6: Quote verification and the high-signal recall check
+
+**Files:**
+- Modify: `cns_screen.py`
+- Modify: `tests/test_cns_screen.py`
+
+**Interfaces:**
+- Consumes: `normalize_text`, `zone_of`, `PrefilterResult` from Tasks 3 and 4.
+- Produces:
+  - `canon_body(s: str) -> str` -- whitespace-collapsed, lowercased, NOT stripped
+  - `verify_findings(findings: list, raw_text: str, boundary: int | None) -> tuple[list, list]` returning `(kept, dropped)` where each dropped entry is `(finding, reason)`
+  - `unconfirmed_high_signal(prefilter_result, kept: list, raw_text: str) -> list[dict]`
+  - `CNS_MIN_QUOTE_CHARS`, `CNS_MAX_UNCONFIRMED` constants
+
+The subtle part is offset spaces. `verify_findings` searches in *canonical* space, but `boundary` is an offset into *raw* space. Collapsing whitespace shifts every offset after the first run of whitespace, so the boundary must be mapped into canonical space with `len(canon_body(raw[:boundary]))` before it can be compared against a canonical match position. Getting this wrong mislabels zones near the boundary and is invisible without a test.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_cns_screen.py`:
+
+```python
+def test_verify_findings_keeps_a_verbatim_quote():
+    raw = "Operator. Welcome. We have significant capacity for business development."
+    findings = [{"quote": "We have significant capacity for business development.",
+                 "zone": "PREPARED_REMARKS"}]
+    kept, dropped = cns_screen.verify_findings(findings, raw, None)
+    assert len(kept) == 1 and not dropped
+
+
+def test_verify_findings_drops_a_fabricated_quote():
+    """The one failure mode that would quietly poison the whole output."""
+    raw = "Operator. Welcome. Our oncology franchise grew."
+    findings = [{"quote": "We are actively hunting Parkinson's assets.",
+                 "zone": "QA"}]
+    kept, dropped = cns_screen.verify_findings(findings, raw, None)
+    assert kept == []
+    assert dropped[0][1] == "quote_not_found"
+
+
+def test_verify_findings_tolerates_smart_quotes_and_whitespace():
+    raw = "Operator. We see    real\nopportunity in Parkinson’s disease today."
+    findings = [{"quote": "We see real opportunity in Parkinson's disease today.",
+                 "zone": "QA"}]
+    kept, dropped = cns_screen.verify_findings(findings, raw, None)
+    assert len(kept) == 1, f"dropped unexpectedly: {dropped}"
+
+
+def test_verify_findings_drops_a_too_short_quote():
+    raw = "Operator. Welcome to the call. Neuroscience is a priority."
+    kept, dropped = cns_screen.verify_findings([{"quote": "the", "zone": "QA"}], raw, None)
+    assert kept == []
+    assert dropped[0][1] == "quote_too_short"
+
+
+def test_verify_findings_recomputes_zone_across_collapsed_whitespace():
+    """The boundary is a RAW offset while the match position is CANONICAL.
+    Without mapping the boundary into canonical space, a quote just after the
+    boundary is mislabelled PREPARED_REMARKS."""
+    prepared_part = "Operator. Welcome." + ("   \n   padding words here." * 40)
+    qa_part = " Analyst (X). What is your appetite for neuroscience assets?"
+    raw = prepared_part + qa_part
+    boundary = len(prepared_part)
+    findings = [
+        {"quote": "What is your appetite for neuroscience assets?",
+         "zone": "PREPARED_REMARKS"},   # model got it wrong on purpose
+        {"quote": "Operator. Welcome.", "zone": "QA"},   # also wrong on purpose
+    ]
+    kept, dropped = cns_screen.verify_findings(findings, raw, boundary)
+    assert not dropped
+    by_quote = {f["quote"]: f["zone"] for f in kept}
+    assert by_quote["What is your appetite for neuroscience assets?"] == "QA"
+    assert by_quote["Operator. Welcome."] == "PREPARED_REMARKS"
+
+
+def test_verify_findings_leaves_model_zone_when_boundary_unknown():
+    raw = "Operator. Welcome. Neuroscience remains a core therapeutic area."
+    findings = [{"quote": "Neuroscience remains a core therapeutic area.",
+                 "zone": "QA"}]
+    kept, _ = cns_screen.verify_findings(findings, raw, None)
+    assert kept[0]["zone"] == "QA", "no boundary -> do not override the model"
+
+
+def test_unconfirmed_high_signal_reports_a_model_miss():
+    """A miss on apathy or Prader-Willi is the most expensive failure this
+    screen has, so the keyword layer reports it independently of the model."""
+    raw = ("Operator. Welcome. We are studying apathy in Parkinson's disease. "
+           "Separately our oncology franchise grew twelve percent.")
+    res = cns_screen.prefilter(raw)
+    # the model reported nothing
+    missed = cns_screen.unconfirmed_high_signal(res, [], raw)
+    terms = {m["term"].lower() for m in missed}
+    assert "apathy" in terms
+    assert missed[0]["excerpt"]
+
+
+def test_unconfirmed_high_signal_stays_quiet_when_the_model_quoted_it():
+    raw = "Operator. We are studying apathy in Parkinson's disease."
+    res = cns_screen.prefilter(raw)
+    kept = [{"quote": "We are studying apathy in Parkinson's disease."}]
+    assert cns_screen.unconfirmed_high_signal(res, kept, raw) == []
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `python -m pytest tests/test_cns_screen.py -k "verify or unconfirmed" -v`
+Expected: FAIL with `AttributeError: module 'cns_screen' has no attribute 'verify_findings'`
+
+- [ ] **Step 3: Implement verification and the recall check**
+
+Append to `cns_screen.py`:
+
+```python
+# ======================================================================
+#  QUOTE VERIFICATION
+# ======================================================================
+# Ken's prompt requires every quote to be copied verbatim, and his usage notes
+# call for asserting that after each run: "This catches the one failure mode
+# that would quietly poison the output -- a plausible-sounding quote the model
+# composed rather than copied." This is that assertion, and it is
+# unconditional. A finding whose quote cannot be located is DROPPED.
+CNS_MIN_QUOTE_CHARS = int(os.environ.get("CNS_MIN_QUOTE_CHARS", "25"))
+CNS_MAX_UNCONFIRMED = int(os.environ.get("CNS_MAX_UNCONFIRMED", "12"))
+CNS_EXCERPT_CHARS = int(os.environ.get("CNS_EXCERPT_CHARS", "240"))
+
+_WHITESPACE = re.compile(r"\s+")
+
+
+def canon_body(text: str) -> str:
+    """-> normalized, whitespace-collapsed, lowercased text. NOT stripped.
+
+    Deliberately unstripped so it is PREFIX-MONOTONIC: canon_body(raw[:n]) is
+    exactly the canonical prefix of canon_body(raw). That property is what makes
+    it valid to map a raw boundary offset into canonical space with
+    len(canon_body(raw[:boundary])). A .strip() here would silently break the
+    zone recomputation for any transcript whose text starts with whitespace."""
+    return _WHITESPACE.sub(" ", normalize_text(text)).lower()
+
+
+def verify_findings(findings, raw_text: str, boundary):
+    """-> (kept, dropped). dropped entries are (finding, reason).
+
+    Matching is done in canonical space so a quote survives collapsed
+    whitespace, a folded smart apostrophe, and case drift -- differences that
+    are transcription noise, not fabrication.
+
+    `zone` is RECOMPUTED from where the quote actually sits. The model's label
+    is advisory: it cannot see character offsets, and a wrong zone changes the
+    finding's priority under Ken's rules. When there is no boundary, the model's
+    label is left alone rather than replaced with a guess."""
+    haystack = canon_body(raw_text)
+    canonical_boundary = None
+    if boundary is not None:
+        canonical_boundary = len(canon_body((raw_text or "")[:boundary]))
+
+    kept, dropped = [], []
+    for finding in findings or []:
+        needle = canon_body(finding.get("quote") or "").strip()
+        if len(needle) < CNS_MIN_QUOTE_CHARS:
+            dropped.append((finding, "quote_too_short"))
+            continue
+        index = haystack.find(needle)
+        if index < 0:
+            dropped.append((finding, "quote_not_found"))
+            continue
+        verified = dict(finding)
+        verified["_offset"] = index
+        if canonical_boundary is not None:
+            verified["zone"] = zone_of(index, canonical_boundary)
+        else:
+            verified["zone"] = finding.get("zone") or "UNKNOWN"
+        kept.append(verified)
+    if dropped:
+        logger.warning(f"[cns] dropped {len(dropped)} finding(s) failing "
+                       "verbatim-quote verification")
+    return kept, dropped
+
+
+def unconfirmed_high_signal(prefilter_result, kept, raw_text: str):
+    """-> [{term, excerpt}] for high-signal terms the model did NOT quote.
+
+    An independent recall check. The prefilter and the model can each miss
+    different things; this surfaces the case where the keyword layer saw a term
+    Ken always wants to read about (apathy, non-hallucinogenic, neuroplastogen,
+    5-HT2C, Prader-Willi, hyperphagia, Parkinson's disease psychosis) and no
+    reported finding quotes it. That is a model miss, and it is the most
+    expensive kind this screen can have."""
+    reported = " ".join(canon_body(f.get("quote") or "") for f in (kept or []))
+    normalized = normalize_text(raw_text)
+    seen, out = set(), []
+    for term, offset in (prefilter_result.high_signal_hits or []):
+        key = term.lower()
+        if key in seen:
+            continue
+        if canon_body(term).strip() and canon_body(term).strip() in reported:
+            continue
+        seen.add(key)
+        lo = max(0, offset - CNS_EXCERPT_CHARS)
+        hi = min(len(normalized), offset + CNS_EXCERPT_CHARS)
+        out.append({"term": term, "excerpt": normalized[lo:hi].strip()})
+        if len(out) >= CNS_MAX_UNCONFIRMED:
+            break
+    return out
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `python -m pytest tests/test_cns_screen.py -v`
+Expected: PASS (32 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+python -c "import ast; ast.parse(open('cns_screen.py').read()); print('OK')"
+git add cns_screen.py tests/test_cns_screen.py
+git commit -m "feat(cns): verbatim quote verification, zone recomputation, recall check"
+```
+
+---
+
+### Task 7: State -- transcript store, ledger, lock, status
+
+**Files:**
+- Modify: `cns_screen.py`
+- Modify: `tests/test_cns_screen.py`
+
+**Interfaces:**
+- Consumes: `cns_fmp.period_key`.
+- Produces:
+  - Path constants `_CNS_DATA_DIR`, `CNS_LEDGER_FILE`, `CNS_FINDINGS_FILE`, `CNS_UNIVERSE_FILE`, `CNS_LOCK_FILE`, `CNS_STATUS_FILE`, `CNS_TRANSCRIPT_DIR`
+  - `store_transcript(symbol, fiscal_year, quarter, content) -> str` (path)
+  - `read_stored_transcript(symbol, fiscal_year, quarter) -> str | None`
+  - `load_ledger() -> dict`, `save_ledger(dict) -> None` (atomic)
+  - `ledger_should_process(ledger, key) -> bool`
+  - `record_ledger(ledger, key, status, **fields) -> None`
+  - `load_findings() -> dict`, `save_findings(dict) -> None` (atomic)
+  - `load_universe_cache() -> dict | None`, `save_universe_cache(dict) -> None`
+  - `_acquire_run_lock() -> bool`, `_release_run_lock()`, `_touch_run_lock()`
+  - `write_status(dict)`, `read_status() -> dict`
+  - Ledger statuses: `"screened"`, `"no_cns_content"`, `"gap"`, `"failed"`
+
+Terminal statuses are `screened` and `no_cns_content`. `gap` and `failed` retry until `attempts` reaches `CNS_MAX_FETCH_ATTEMPTS`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_cns_screen.py`:
+
+```python
+@pytest.fixture
+def cns_state(monkeypatch, tmp_path):
+    """Redirect every CNS state path into a per-test temp dir."""
+    monkeypatch.setattr(cns_screen, "CNS_LEDGER_FILE", str(tmp_path / "ledger.json"))
+    monkeypatch.setattr(cns_screen, "CNS_FINDINGS_FILE", str(tmp_path / "findings.json"))
+    monkeypatch.setattr(cns_screen, "CNS_UNIVERSE_FILE", str(tmp_path / "universe.json"))
+    monkeypatch.setattr(cns_screen, "CNS_LOCK_FILE", str(tmp_path / "lock.json"))
+    monkeypatch.setattr(cns_screen, "CNS_STATUS_FILE", str(tmp_path / "status.json"))
+    monkeypatch.setattr(cns_screen, "CNS_TRANSCRIPT_DIR", str(tmp_path / "transcripts"))
+    return tmp_path
+
+
+def test_transcript_round_trip(cns_state):
+    path = cns_screen.store_transcript("ABBV", 2026, 2, "hello transcript")
+    assert os.path.exists(path)
+    assert cns_screen.read_stored_transcript("ABBV", 2026, 2) == "hello transcript"
+    assert cns_screen.read_stored_transcript("NOPE", 2026, 2) is None
+
+
+def test_ledger_terminal_statuses_are_not_reprocessed(cns_state):
+    ledger = {}
+    key = "ABBV:2026:Q2"
+    assert cns_screen.ledger_should_process(ledger, key) is True
+    cns_screen.record_ledger(ledger, key, "screened", findings_count=2)
+    assert cns_screen.ledger_should_process(ledger, key) is False
+    cns_screen.record_ledger(ledger, "X:2026:Q2", "no_cns_content")
+    assert cns_screen.ledger_should_process(ledger, "X:2026:Q2") is False
+
+
+def test_ledger_gap_retries_until_the_attempt_cap(cns_state, monkeypatch):
+    """AXSM FY2026Q2 returns a listed period with empty content. It must retry
+    so it is picked up once FMP backfills, but not forever."""
+    monkeypatch.setattr(cns_screen, "CNS_MAX_FETCH_ATTEMPTS", 3)
+    ledger, key = {}, "AXSM:2026:Q2"
+    for _ in range(2):
+        cns_screen.record_ledger(ledger, key, "gap", reason="content_too_short:0")
+        assert cns_screen.ledger_should_process(ledger, key) is True
+    cns_screen.record_ledger(ledger, key, "gap", reason="content_too_short:0")
+    assert ledger[key]["attempts"] == 3
+    assert cns_screen.ledger_should_process(ledger, key) is False
+
+
+def test_ledger_save_is_atomic_and_round_trips(cns_state):
+    cns_screen.save_ledger({"ABBV:2026:Q2": {"status": "screened", "attempts": 1}})
+    assert cns_screen.load_ledger()["ABBV:2026:Q2"]["status"] == "screened"
+    # no temp file left behind
+    leftovers = [f for f in os.listdir(cns_state) if f.startswith("ledger.json.")]
+    assert leftovers == []
+
+
+def test_load_ledger_on_corrupt_file_preserves_it(cns_state):
+    with open(cns_screen.CNS_LEDGER_FILE, "w", encoding="utf-8") as handle:
+        handle.write("{not json")
+    ledger = cns_screen.load_ledger()
+    assert ledger == {}
+    preserved = [f for f in os.listdir(cns_state) if "corrupt" in f]
+    assert preserved, "a corrupt ledger must be moved aside, never silently dropped"
+
+
+def test_run_lock_is_exclusive(cns_state):
+    assert cns_screen._acquire_run_lock() is True
+    assert cns_screen._acquire_run_lock() is False, "second acquire must fail"
+    cns_screen._release_run_lock()
+    assert cns_screen._acquire_run_lock() is True
+    cns_screen._release_run_lock()
+
+
+def test_status_round_trip_and_default(cns_state):
+    assert cns_screen.read_status()["status"] == "no_runs"
+    cns_screen.write_status({"status": "ok", "screened": 3})
+    assert cns_screen.read_status()["screened"] == 3
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `python -m pytest tests/test_cns_screen.py -k "transcript_round or ledger or run_lock or status_round" -v`
+Expected: FAIL with `AttributeError: module 'cns_screen' has no attribute 'CNS_LEDGER_FILE'`
+
+- [ ] **Step 3: Implement state**
+
+Append to `cns_screen.py`:
+
+```python
+# ======================================================================
+#  STATE ON /data
+# ======================================================================
+_CNS_DATA_DIR = (
+    os.environ.get("DATA_DIR")
+    or ("/data" if os.path.isdir("/data") else _HERE)
+)
+CNS_LEDGER_FILE = os.path.join(_CNS_DATA_DIR, "cns_ledger.json")
+CNS_FINDINGS_FILE = os.path.join(_CNS_DATA_DIR, "cns_findings.json")
+CNS_UNIVERSE_FILE = os.path.join(_CNS_DATA_DIR, "cns_universe.json")
+CNS_LOCK_FILE = os.path.join(_CNS_DATA_DIR, "cns_lock.json")
+CNS_STATUS_FILE = os.path.join(_CNS_DATA_DIR, "cns_status.json")
+CNS_TRANSCRIPT_DIR = os.path.join(_CNS_DATA_DIR, "cns_transcripts")
+
+CNS_LOCK_MAX_AGE = int(os.environ.get("CNS_LOCK_MAX_AGE", "7200"))
+CNS_MAX_FETCH_ATTEMPTS = int(os.environ.get("CNS_MAX_FETCH_ATTEMPTS", "4"))
+CNS_UNIVERSE_TTL_DAYS = int(os.environ.get("CNS_UNIVERSE_TTL_DAYS", "7"))
+
+# Terminal: never reprocessed. A "gap" (listed period, empty content) and a
+# "failed" (model or transport error) both RETRY, because FMP backfills content
+# hours-to-days after a call and a transient error should not lose a quarter.
+_TERMINAL_STATUSES = frozenset(("screened", "no_cns_content"))
+
+_cns_lock = _threading.Lock()
+
+
+def _atomic_write_json(path: str, payload):
+    """Write via a sibling temp file + os.replace so a crash mid-write can never
+    leave a truncated state file (followup-engine precedent)."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp = f"{path}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, default=str)
+    os.replace(temp, path)
+
+
+def _load_json_or_preserve(path: str, label: str):
+    """-> parsed dict, or {} when the file is absent.
+
+    A file that EXISTS but cannot be parsed is moved aside rather than degraded
+    to an empty document that the next save would make permanent."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (ValueError, OSError) as e:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        corrupt = f"{path}.corrupt-{stamp}"
+        try:
+            os.replace(path, corrupt)
+            logger.error(f"[cns] {label} unreadable ({e}); preserved as {corrupt}")
+        except OSError as move_error:
+            logger.error(f"[cns] {label} unreadable and could not be preserved: {move_error}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _transcript_path(symbol: str, fiscal_year: int, quarter: int) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", (symbol or "").upper())
+    return os.path.join(CNS_TRANSCRIPT_DIR, f"{safe}-{int(fiscal_year)}Q{int(quarter)}.txt")
+
+
+def store_transcript(symbol: str, fiscal_year: int, quarter: int, content: str) -> str:
+    """Persist the raw transcript and return its path.
+
+    Not incidental: verbatim quote verification, the season wrap-up and any
+    replay all read this back. A screen whose transcript was not stored cannot
+    be verified."""
+    os.makedirs(CNS_TRANSCRIPT_DIR, exist_ok=True)
+    path = _transcript_path(symbol, fiscal_year, quarter)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content or "")
+    return path
+
+
+def read_stored_transcript(symbol: str, fiscal_year: int, quarter: int):
+    try:
+        with open(_transcript_path(symbol, fiscal_year, quarter), encoding="utf-8") as handle:
+            return handle.read()
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def load_ledger() -> dict:
+    return _load_json_or_preserve(CNS_LEDGER_FILE, "ledger")
+
+
+def save_ledger(ledger: dict):
+    _atomic_write_json(CNS_LEDGER_FILE, ledger)
+
+
+def ledger_should_process(ledger: dict, key: str) -> bool:
+    """-> True when this period still needs work."""
+    entry = (ledger or {}).get(key)
+    if not entry:
+        return True
+    if entry.get("status") in _TERMINAL_STATUSES:
+        return False
+    return int(entry.get("attempts") or 0) < CNS_MAX_FETCH_ATTEMPTS
+
+
+def record_ledger(ledger: dict, key: str, status: str, **fields):
+    """Record an outcome. `attempts` only increments for NON-terminal statuses,
+    so a successful screen never consumes a retry budget."""
+    entry = dict((ledger or {}).get(key) or {})
+    entry["status"] = status
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if status not in _TERMINAL_STATUSES:
+        entry["attempts"] = int(entry.get("attempts") or 0) + 1
+    else:
+        entry.setdefault("attempts", int(entry.get("attempts") or 0))
+    entry.update(fields)
+    ledger[key] = entry
+
+
+def load_findings() -> dict:
+    return _load_json_or_preserve(CNS_FINDINGS_FILE, "findings store")
+
+
+def save_findings(findings: dict):
+    _atomic_write_json(CNS_FINDINGS_FILE, findings)
+
+
+def load_universe_cache():
+    """-> the cached universe dict, or None when absent or older than the TTL."""
+    cached = _load_json_or_preserve(CNS_UNIVERSE_FILE, "universe cache")
+    if not cached or not isinstance(cached.get("symbols"), dict):
+        return None
+    built = cached.get("built_at") or ""
+    try:
+        age_days = (datetime.now(timezone.utc)
+                    - datetime.fromisoformat(built)).days
+    except (ValueError, TypeError):
+        return None
+    if age_days > CNS_UNIVERSE_TTL_DAYS:
+        logger.info(f"[cns] universe cache is {age_days}d old -- rebuilding")
+        return None
+    return cached["symbols"]
+
+
+def save_universe_cache(symbols: dict):
+    _atomic_write_json(CNS_UNIVERSE_FILE, {
+        "built_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(symbols or {}),
+        "symbols": symbols or {},
+    })
+
+
+def _acquire_run_lock() -> bool:
+    """Atomic cross-process claim via O_CREAT|O_EXCL, mirroring the Weekly Pulse
+    and FYI Triage pattern. Stale locks past CNS_LOCK_MAX_AGE are reclaimed."""
+    try:
+        age = time.time() - os.path.getmtime(CNS_LOCK_FILE)
+        if age > CNS_LOCK_MAX_AGE:
+            logger.warning(f"[cns] removing stale run lock (age {age / 60:.0f}min)")
+            try:
+                os.remove(CNS_LOCK_FILE)
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(CNS_LOCK_FILE)) or ".", exist_ok=True)
+        fd = os.open(CNS_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, json.dumps({
+            "pid": os.getpid(),
+            "started_at": time.time(),
+            "run_id": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
+        }).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _release_run_lock():
+    try:
+        os.remove(CNS_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.error(f"[cns] failed to release run lock: {e}")
+
+
+def _touch_run_lock():
+    """Refresh the lock mtime so a long backfill is never reclaimed as orphaned
+    while it is still alive."""
+    try:
+        os.utime(CNS_LOCK_FILE, None)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"[cns] failed to refresh run lock mtime: {e}")
+
+
+_PROGRESS_LOCK = _threading.Lock()
+_CNS_PROGRESS = {"phase": "idle", "done": 0, "total": 0, "last": "",
+                 "run_id": None, "updated_at": None}
+
+
+def _set_progress(**kw):
+    with _PROGRESS_LOCK:
+        _CNS_PROGRESS.update(kw)
+        _CNS_PROGRESS["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _bump_progress(last: str):
+    with _PROGRESS_LOCK:
+        _CNS_PROGRESS["done"] = _CNS_PROGRESS.get("done", 0) + 1
+        _CNS_PROGRESS["last"] = (last or "")[:120]
+        _CNS_PROGRESS["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def write_status(status: dict):
+    try:
+        _atomic_write_json(CNS_STATUS_FILE, status)
+    except OSError as e:
+        logger.warning(f"[cns] could not write status: {e}")
+
+
+def read_status() -> dict:
+    try:
+        with open(CNS_STATUS_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        data = {"status": "no_runs",
+                "message": "No CNS screen run has completed yet."}
+    except (ValueError, OSError) as e:
+        data = {"status": "error", "error": f"could not read status: {e}"}
+    if not isinstance(data, dict):
+        data = {"status": "error", "error": "status file was not an object"}
+    with _PROGRESS_LOCK:
+        data["live_progress"] = dict(_CNS_PROGRESS)
+    data["fmp_enabled"] = cns_fmp.fmp_enabled()
+    return data
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `python -m pytest tests/test_cns_screen.py -v`
+Expected: PASS (39 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+python -c "import ast; ast.parse(open('cns_screen.py').read()); print('OK')"
+python -m ruff check cns_screen.py cns_fmp.py
+git add cns_screen.py tests/test_cns_screen.py
+git commit -m "feat(cns): transcript store, retryable ledger, atomic saves, run lock, status"
+```
+
+---
+
 The remaining tasks continue in the same shape and will be appended next:
 
 | Task | Deliverable |
 |---|---|
-| 6 | Quote verification in canonical space, zone recomputation, unconfirmed high-signal recall check |
-| 7 | State: transcript store, ledger with retryable gaps, atomic saves, run lock, status |
-| 8 | Digest render + Graph send |
+| 8 | Season windows, digest render, Graph send |
 | 9 | `run_daily` orchestration and `run_season` wrap-up |
 | 10 | `app.py` wiring (3 routes, 2 cron jobs), requirements, version bump, CLAUDE.md, deploy, Q2 2026 backfill |
