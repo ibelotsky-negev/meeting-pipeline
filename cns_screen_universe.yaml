@@ -1,11 +1,14 @@
 # CNS earnings screen -- universe overrides.
 #
 # force_include: companies the FMP industry screener does NOT return but that
-# must be screened anyway. This list is not belt-and-braces: a live probe on
-# 2026-09-09 confirmed the screener returns NONE of Roche, Otsuka, Lundbeck,
-# UCB, Eisai, Astellas or Daiichi Sankyo, because their US listings are ADRs
-# that carry no industry classification or market cap in the screener. Every
-# ticker below was verified to return a 2026-dated transcript.
+# must be screened anyway. Includes two classes: (1) ADR-listed companies whose
+# US listings carry no industry classification or market cap in the screener
+# (Roche, Lundbeck, UCB, Eisai, Daiichi Sankyo, Astellas, Ono, Shionogi are
+# missing from the FMP screener for this reason). (2) Still-trading companies
+# with sparse FMP transcript coverage (e.g., Alector: isActivelyTrading=True
+# but last transcript 2025-08-07, still sub-$1B so below the $1B screener floor).
+# Both classes need manual inclusion to remain visible. A live probe on 2026-09-09
+# confirmed coverage status.
 force_include:
   - RHHBY      # Roche -- prasinezumab, trontinemab. 60 transcripts, latest 2026-07-23
   - HLUYY      # Lundbeck -- pure-play CNS. Latest 2026-08-19
@@ -32,17 +35,24 @@ force_include:
   - SLNO       # Soleno -- VYKAT, Prader-Willi
   - AXSM       # Axsome
   - DNLI       # Denali
+  - ALEC       # Alector -- neurodegeneration (progranulin/TREM2). Still trading
+               # (isActivelyTrading=True, ~$255M) but FMP coverage is sparse:
+               # last transcript 2025-08-07. Screened anyway -- a missing
+               # transcript surfaces as a coverage gap, not silence.
 
 # entity_only: names that belong in the prompt's high-precision entity list but
-# hold NO earnings call, so they must never be fetched. Acquired or delisted,
-# with the last observed transcript date.
+# hold NO earnings call, so they must never be fetched. Membership criterion:
+# isActivelyTrading=False (acquired, delisted, private, or otherwise off the
+# market). Dates below are the last observed transcript, for context only -- the
+# criterion is trading status, NOT transcript recency. (Alector proved the
+# distinction: still trading, yet sparse FMP coverage -> moved to force_include
+# to remain visible.)
 entity_only:
   - Otsuka         # no transcripts under OTSKY or OTSKF at all
   - Cerevel        # acquired by AbbVie; last call 2023-11-01
   - Karuna         # acquired by BMS; last call 2023-11-02
   - Intra-Cellular # acquired by J&J; last call 2024-10-30
-  - Sage           # last call 2025-04-29
-  - Alector        # last call 2025-08-07
+  - Sage           # acquired/delisted; isActivelyTrading=False; last call 2025-04-29
   - Astellas       # last ADR call 2025-04-25
   - Ono            # last call 2025-08-01
   - Shionogi       # last call 2025-07-28

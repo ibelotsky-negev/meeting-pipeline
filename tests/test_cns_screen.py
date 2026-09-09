@@ -36,6 +36,13 @@ def test_load_universe_config_splits_screenable_from_entity_only():
     cfg = cns_screen.load_universe_config()
     assert "RHHBY" in cfg["force_include"]
     assert "Otsuka" in cfg["entity_only"]
-    # an acquired company must never end up in the fetch list
+    # Alector (ALEC) is the case that proved the criterion: still actively
+    # trading (isActivelyTrading=True, ~$255M) but sparse FMP coverage
+    # (last transcript 2025-08-07), so it belongs in force_include to remain
+    # visible, not in entity_only. Regression test: do not silently move it
+    # back to entity_only without re-verifying its trading status.
+    assert "ALEC" in cfg["force_include"]
+    assert not any(t.upper() == "ALEC" for t in cfg["entity_only"])
+    # an acquired company or inactive trader must never end up in the fetch list
     assert not any(t.upper() in ("CERE", "KRTX", "ITCI", "SAGE")
                    for t in cfg["force_include"])
