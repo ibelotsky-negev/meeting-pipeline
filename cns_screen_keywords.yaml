@@ -1,0 +1,449 @@
+# CNS / Rare Neuro Earnings-Call Screening Keywords
+# Scope: medium (CNS + rare neuro broadly)
+# Signals: BD/partnering intent, competitive pipeline moves, TA strategy shifts
+# Draft v0.1 — edit freely before any code is written.
+#
+# MATCHING NOTES (read before implementing):
+#   - Case-insensitive. Strip smart quotes/apostrophes first ("Parkinson’s" -> "Parkinson's").
+#   - Use word boundaries (\b) on all short/acronym terms or you will match inside other words.
+#   - Terms containing "*" below are stems: implement as a prefix match (discontinu* -> discontinued/discontinuing/discontinuation).
+#   - Earnings calls have two zones: prepared remarks and Q&A. Analyst Q&A is where BD intent
+#     actually leaks. Recommend tagging each hit with its zone; you'll want to filter later.
+#   - You chose a flat list. One caveat worth acting on: group B (BD language) is generic
+#     corporate vocabulary and will fire on every call. Even in a flat design, consider
+#     requiring a group-A (domain) term within the same paragraph before a group-B hit counts.
+#     Groups C and D are safe to fire standalone.
+
+# ---------------------------------------------------------------------------
+# GROUP A — DOMAIN GATE: is this passage even about our space?
+# ---------------------------------------------------------------------------
+domain_general:
+  - neuroscience
+  - neurology
+  - neurologic*
+  - neurodegener*          # neurodegenerative, neurodegeneration
+  - CNS                    # see exclusions: also "Consumer Nutrition & Sciences" at some cos.
+  - central nervous system
+  - neuropsychiatr*
+  - psychiatr*
+  - brain health
+  - neuroinflamm*
+  - neuroprotect*
+  - blood-brain barrier
+  - BBB
+  - intrathecal
+
+domain_parkinsons_and_synuclein:      # highest relevance to AB-300
+  - Parkinson
+  - Parkinson's disease
+  - "PD"                   # AMBIGUOUS: also pharmacodynamics. Require a nearby domain term.
+  - alpha-synuclein
+  - a-synuclein
+  - synucleinopath*
+  - levodopa
+  - L-DOPA
+  - carbidopa
+  - dopamin*               # dopamine, dopaminergic
+  - "OFF time"
+  - dyskinesia
+  - deep brain stimulation
+  - Lewy body
+  - dementia with Lewy bodies
+  - DLB
+  - multiple system atrophy
+  - MSA
+  - progressive supranuclear palsy
+  - PSP
+  - prodromal
+
+domain_neuropsych_symptoms:           # the symptom vocabulary our program lives in
+  - apathy
+  - anhedonia
+  - amotivation
+  - agitation
+  - psychosis
+  - hallucination*
+  - delusion*
+  - negative symptoms
+  - cognitive impairment
+  - "MCI"
+  - executive function
+  - impulse control
+  - sleep-wake
+  - hyperphagia                        # PWS-relevant
+  - food-seeking
+  - behavioral symptoms
+  - non-motor symptoms
+  - caregiver burden
+  - treatment-resistant depression
+  - "TRD"
+  - major depressive disorder
+  - schizophrenia
+  - bipolar
+
+domain_serotonergic_and_neuroplastogen:   # direct mechanism overlap with AB-300
+  - serotonin
+  - serotonergic
+  - 5-HT
+  - 5-HT2A
+  - 5-HT2C
+  - 2A agonist
+  - psychedelic*
+  - non-hallucinogenic
+  - psychoplastogen
+  - neuroplastogen
+  - neuroplasticity
+  - psilocybin
+  - LSD
+  - MDMA
+  - ibogaine
+  - ketamine
+  - esketamine
+  - muscarinic                         # KarXT/Cobenfy class — key CNS competitive signal
+  - xanomeline
+  - orexin
+  - trace amine
+  - "TAAR1"
+
+domain_rare_neuro:
+  - rare disease
+  - orphan drug
+  - orphan designation
+  - ultra-rare
+  - priority review voucher
+  - "PRV"
+  - natural history study
+  - Prader-Willi
+  - "PWS"                  # AMBIGUOUS in non-pharma contexts; fine on pharma calls
+  - Angelman
+  - Rett
+  - Fragile X
+  - Dravet
+  - Lennox-Gastaut
+  - tuberous sclerosis
+  - Huntington
+  - "ALS"
+  - amyotrophic lateral sclerosis
+  - spinal muscular atrophy
+  - Friedreich
+  - ataxia
+  - epilep*
+  - seizure
+  - neuromuscular
+  - Duchenne
+  - leukodystroph*
+  - lysosomal storage
+  - Alzheimer
+  - amyloid
+  - "tau"                  # short; strict word boundary required
+  - multiple sclerosis
+  - migraine
+  - narcolepsy
+
+domain_cns_modalities:
+  - antisense
+  - "ASO"
+  - "AAV"
+  - gene therapy
+  - siRNA
+  - CNS delivery
+  - brain penetrant
+  - CNS-penetrant
+  - focused ultrasound
+
+# ---------------------------------------------------------------------------
+# GROUP B — BD / PARTNERING INTENT  (gate on a Group A term in the same paragraph)
+# ---------------------------------------------------------------------------
+bd_intent:
+  - business development
+  - "BD&L"
+  - in-licens*
+  - out-licens*
+  - licensing agreement
+  - option agreement
+  - option-to-license
+  - collaboration
+  - strategic partnership
+  - strategic alliance
+  - co-development
+  - co-commercializ*
+  - joint venture
+  - external innovation
+  - externally sourced
+  - external science
+  - external opportunities
+  - tuck-in
+  - bolt-on
+  - inorganic
+  - "M&A"
+  - acquisition
+  - acquire
+  - term sheet
+  - due diligence
+  - upfront payment
+  - milestone payments
+  - royalty
+  - "opt-in"
+  - right of first refusal
+  - "ROFR"
+  - equity stake
+  - corporate venture
+  - venture arm
+  - seed investment
+  - early-stage assets
+  - preclinical assets
+  - Phase 1 assets
+  - clinical-stage assets
+  - asset-centric
+  - business development capacity
+  - balance sheet capacity
+  - capital deployment
+  - capital allocation
+  - firepower
+  - actively looking
+  - actively evaluating
+  - scouting
+  - pipeline gap
+  - fill the gap
+  - gaps in our pipeline
+  - augment the pipeline
+  - replenish the pipeline
+  - loss of exclusivity
+  - "LOE"
+  - patent cliff
+  - "2030 cliff"
+
+# ---------------------------------------------------------------------------
+# GROUP C — COMPETITIVE PIPELINE MOVES  (fire standalone; pair with Group A in review)
+# ---------------------------------------------------------------------------
+pipeline_events:
+  - topline
+  - top-line
+  - readout
+  - data readout
+  - interim analysis
+  - primary endpoint
+  - met the primary
+  - missed the primary
+  - failed to meet
+  - did not meet
+  - statistically significant
+  - futility
+  - discontinu*
+  - deprioriti*
+  - wind down
+  - wind-down
+  - terminated the program
+  - returned the rights
+  - pipeline prioritization
+  - portfolio review
+  - strategic review
+  - "IND"
+  - "CTA"
+  - first-in-human
+  - Phase 1
+  - Phase 2
+  - Phase 3
+  - Phase 2b
+  - pivotal
+  - registrational
+  - "NDA"
+  - "BLA"
+  - "sNDA"
+  - "MAA"
+  - "PDUFA"
+  - breakthrough therapy
+  - fast track
+  - "RMAT"
+  - accelerated approval
+  - complete response letter
+  - "CRL"
+  - label expansion
+  - enrollment complete
+  - fully enrolled
+  - initiated dosing
+  - dose escalation
+  - proof of concept
+  - "POC"
+  - end-of-Phase 2
+  - Type B meeting
+  - FDA feedback
+  - agency alignment
+  - novel endpoint
+  - patient-reported outcome
+  - clinical outcome assessment
+  - "COA"
+
+conference_mentions:                   # data drops that reveal competitive timing
+  - "AAN"
+  - "MDS"                              # Int'l Parkinson and Movement Disorder Society
+  - "CTAD"
+  - "AD/PD"
+  - "ACNP"
+  - "ASENT"
+  - "SfN"
+  - "AES"
+  - "ECNP"
+  - "ISCTM"
+
+# ---------------------------------------------------------------------------
+# GROUP D — THERAPEUTIC-AREA STRATEGY SHIFTS  (fire standalone)
+# ---------------------------------------------------------------------------
+ta_strategy:
+  - therapeutic area
+  - areas of focus
+  - core areas
+  - franchise
+  - neuroscience franchise
+  - neurology franchise
+  - exiting
+  - exit the
+  - stepping back from
+  - doubling down
+  - expanding into
+  - entering the
+  - new therapeutic area
+  - reprioriti*
+  - restructur*
+  - reorganiz*
+  - R&D day
+  - investor day
+  - site closure
+  - research site
+  - headcount reduction
+  - cost realignment
+  - long-term growth drivers
+  - growth pillars
+
+# ---------------------------------------------------------------------------
+# GROUP E — WATCHLIST: companies and named CNS/rare-neuro assets
+# Named-asset mentions are the highest-precision hits in the whole file.
+# ---------------------------------------------------------------------------
+watchlist_companies:
+  - AbbVie
+  - Cerevel
+  - Bristol Myers
+  - "BMS"
+  - Karuna
+  - Johnson & Johnson
+  - Janssen
+  - Intra-Cellular
+  - Eli Lilly
+  - Biogen
+  - Roche
+  - Genentech
+  - Novartis
+  - Takeda
+  - Sanofi
+  - AstraZeneca
+  - Merck
+  - Pfizer
+  - Otsuka
+  - Lundbeck
+  - Boehringer
+  - "UCB"
+  - Teva
+  - Neurocrine
+  - Acadia
+  - Alkermes                            # active BD counterparty
+  - Supernus
+  - Harmony Biosciences
+  - Soleno
+  - Ionis
+  - Alnylam
+  - Ultragenyx
+  - PTC Therapeutics
+  - Jazz
+  - Axsome
+  - Sage
+  - Denali
+  - Alector
+
+watchlist_assets:
+  - tavapadon
+  - emraclidine
+  - Cobenfy
+  - "KarXT"
+  - Caplyta
+  - lumateperone
+  - pimavanserin
+  - Nuplazid
+  - Daybue
+  - trofinetide
+  - prasinezumab
+  - trontinemab
+  - donanemab
+  - Leqembi
+  - lecanemab
+  - oveporexton
+  - seltorexant
+  - "VYKAT"
+  - diazoxide choline
+  - carbetocin
+  - pitolisant
+  - valbenazine
+  - Ingrezza
+  - Austedo
+  - tolebrutinib
+  - buntanetap
+  - solengepras
+  - bemdaneprocel
+  - prasinezumab
+
+# ---------------------------------------------------------------------------
+# EXCLUSIONS — strings that create false positives; suppress or de-weight
+# ---------------------------------------------------------------------------
+exclusions:
+  - neural network                      # AI/ML talk, not neuroscience
+  - machine learning
+  - central lab
+  - central fill
+  - nervous about                       # analyst filler; blocks a naive "nerv" stem
+  - partner of choice                   # boilerplate
+  - partnering with payers
+  - payer partnership
+  - channel partner
+  - distribution partner
+  - manufacturing partner
+  - academic partnership                # usually not licensable BD signal
+  - "PD-1"                              # oncology; must not match Parkinson's "PD"
+  - "PD-L1"
+  - PK/PD                               # pharmacodynamics, not Parkinson's
+  - Consumer Health
+  - forward-looking statements          # safe-harbor boilerplate block; skip this section entirely
+
+# ---------------------------------------------------------------------------
+# KNOWN AMBIGUITIES to resolve in code
+# ---------------------------------------------------------------------------
+ambiguity_rules:
+  - term: "PD"
+    rule: count only if a parkinsons/synuclein term appears within the same paragraph AND
+          the paragraph does not contain "PK/PD", "PD-1", "PD-L1", or "pharmacodynamic".
+  - term: "CNS"
+    rule: safe on pharma calls; block if the company reports a "Consumer Nutrition" segment.
+  - term: "tau"
+    rule: strict \btau\b — otherwise matches "taught", "tautology", ticker fragments.
+  - term: "MDS"
+    rule: also myelodysplastic syndromes (heme-onc). Require a neuro term in the paragraph.
+  - term: "MSA"
+    rule: also "master services agreement". Require a neuro term in the paragraph.
+  - term: "AES"
+    rule: also "adverse events, serious". Require an epilepsy/seizure term in the paragraph.
+  - term: "ALS"
+    rule: fine as \bALS\b; block "ALSO"/"ALS0" via boundary.
+
+# ---------------------------------------------------------------------------
+# LOW-YIELD BUT HIGH-VALUE — rarely said on earnings calls; when said, always read
+# Keep these separate so you can route them to an immediate alert rather than a digest.
+# ---------------------------------------------------------------------------
+high_signal_rare_terms:
+  - apathy
+  - non-hallucinogenic
+  - neuroplastogen
+  - 5-HT2C
+  - Prader-Willi
+  - hyperphagia
+  - Parkinson's disease psychosis
+  - neuropsychiatric symptoms of
+  - caregiver burden
+  - non-motor symptoms

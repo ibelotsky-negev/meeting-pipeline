@@ -1,0 +1,49 @@
+# CNS earnings screen -- universe overrides.
+#
+# force_include: companies the FMP industry screener does NOT return but that
+# must be screened anyway. This list is not belt-and-braces: a live probe on
+# 2026-09-09 confirmed the screener returns NONE of Roche, Otsuka, Lundbeck,
+# UCB, Eisai, Astellas or Daiichi Sankyo, because their US listings are ADRs
+# that carry no industry classification or market cap in the screener. Every
+# ticker below was verified to return a 2026-dated transcript.
+force_include:
+  - RHHBY      # Roche -- prasinezumab, trontinemab. 60 transcripts, latest 2026-07-23
+  - HLUYY      # Lundbeck -- pure-play CNS. Latest 2026-08-19
+  - UCBJY      # UCB -- epilepsy franchise. Latest 2026-07-30
+  - ESALY      # Eisai -- Leqembi. Latest 2026-08-03
+  - DSNKY      # Daiichi Sankyo. Latest 2026-01-30
+  - NVO        # Novo Nordisk
+  - GSK
+  - IPSEY      # Ipsen
+  - MKKGY      # Merck KGaA
+  - BAYRY      # Bayer
+  - SMMNY      # Sumitomo Pharma
+  - NVS        # Novartis
+  - TAK        # Takeda
+  - SNY        # Sanofi
+  - AZN        # AstraZeneca
+  - TEVA
+  - BIIB       # Biogen
+  - NBIX       # Neurocrine
+  - ACAD       # Acadia -- pimavanserin/Nuplazid, Daybue
+  - ALKS       # Alkermes -- active BD counterparty
+  - SUPN       # Supernus
+  - HRMY       # Harmony Biosciences
+  - SLNO       # Soleno -- VYKAT, Prader-Willi
+  - AXSM       # Axsome
+  - DNLI       # Denali
+
+# entity_only: names that belong in the prompt's high-precision entity list but
+# hold NO earnings call, so they must never be fetched. Acquired or delisted,
+# with the last observed transcript date.
+entity_only:
+  - Otsuka         # no transcripts under OTSKY or OTSKF at all
+  - Cerevel        # acquired by AbbVie; last call 2023-11-01
+  - Karuna         # acquired by BMS; last call 2023-11-02
+  - Intra-Cellular # acquired by J&J; last call 2024-10-30
+  - Sage           # last call 2025-04-29
+  - Alector        # last call 2025-08-07
+  - Astellas       # last ADR call 2025-04-25
+  - Ono            # last call 2025-08-01
+  - Shionogi       # last call 2025-07-28
+  - Boehringer     # private, holds no earnings call
