@@ -152,3 +152,54 @@ def period_key(symbol: str, fiscal_year: int, quarter: int) -> str:
     the same call discovered via the dates sweep collide instead of double-
     screening."""
     return f"{(symbol or '').strip().upper()}:{int(fiscal_year)}:Q{int(quarter)}"
+
+
+def build_universe(force_include=None, min_market_cap: int = None) -> dict:
+    """-> {SYMBOL: {name, industry, market_cap, exchange, country, source}}
+
+    Two sources, unioned:
+      1. The three industry screens above the market-cap floor, US exchanges
+         only (see US_EXCHANGES for why that filter is a dedup, not a policy).
+      2. An explicit force-include roster. This is NOT belt-and-braces -- the
+         screener genuinely returns none of Roche, Otsuka, Lundbeck, UCB, Eisai,
+         Astellas or Daiichi Sankyo, so a screener-only universe silently omits
+         the most CNS-relevant foreign majors. Verified live 2026-09-09.
+
+    Screener metadata wins over a roster stub for a symbol in both.
+    """
+    floor = CNS_MIN_MARKET_CAP if min_market_cap is None else int(min_market_cap)
+    universe = {}
+    for industry in INDUSTRIES:
+        rows = _rows(_fmp_get(
+            "company-screener",
+            industry=industry,
+            marketCapMoreThan=floor,
+            isActivelyTrading="true",
+            limit=SCREENER_LIMIT,
+        ))
+        if not rows:
+            logger.warning(f"[cns] screener returned nothing for industry {industry!r}")
+        for row in rows:
+            symbol = (row.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            if (row.get("exchangeShortName") or "") not in US_EXCHANGES:
+                continue
+            universe[symbol] = {
+                "name": row.get("companyName") or symbol,
+                "industry": industry,
+                "market_cap": row.get("marketCap"),
+                "exchange": row.get("exchangeShortName"),
+                "country": row.get("country"),
+                "source": "screener",
+            }
+    for symbol in (force_include or []):
+        symbol = (symbol or "").strip().upper()
+        if not symbol or symbol in universe:
+            continue
+        universe[symbol] = {
+            "name": symbol, "industry": None, "market_cap": None,
+            "exchange": None, "country": None, "source": "roster",
+        }
+    logger.info(f"[cns] universe built: {len(universe)} symbols")
+    return universe

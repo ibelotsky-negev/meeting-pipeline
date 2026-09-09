@@ -27,3 +27,66 @@ def test_period_key_is_stable_and_uppercase():
     a = cns_fmp.normalize_period({"year": 2026, "period": "Q2"})
     b = cns_fmp.normalize_period({"fiscalYear": 2026, "quarter": 2})
     assert cns_fmp.period_key("ABBV", *a) == cns_fmp.period_key("ABBV", *b)
+
+
+import pytest
+
+
+@pytest.fixture
+def fake_fmp(monkeypatch):
+    """Route every _fmp_get through a recorded script. Keyed by path; the value
+    is a list consumed in call order so paging can be simulated."""
+    calls = []
+    script = {}
+
+    def _fake(path, **params):
+        calls.append((path, dict(params)))
+        queue = script.get(path)
+        if queue is None:
+            return None
+        if isinstance(queue, list) and queue and isinstance(queue[0], _Reply):
+            return queue.pop(0).payload if queue else None
+        return queue
+
+    monkeypatch.setattr(cns_fmp, "_fmp_get", _fake)
+    monkeypatch.setenv("FMP_API_KEY", "test-fmp-key")
+    return script, calls
+
+
+class _Reply:
+    def __init__(self, payload):
+        self.payload = payload
+
+
+def test_build_universe_filters_non_us_cross_listings(fake_fmp):
+    script, _ = fake_fmp
+    script["company-screener"] = [
+        {"symbol": "LLY", "companyName": "Eli Lilly and Company",
+         "exchangeShortName": "NYSE", "marketCap": 1_065_000_000_000, "country": "US"},
+        {"symbol": "LLY.TO", "companyName": "Eli Lilly and Company",
+         "exchangeShortName": "TSX", "marketCap": 1_396_000_000_000, "country": "CA"},
+    ]
+    uni = cns_fmp.build_universe()
+    assert "LLY" in uni
+    assert "LLY.TO" not in uni, "TSX cross-listing would double-screen one call"
+
+
+def test_build_universe_unions_force_include_roster(fake_fmp):
+    script, _ = fake_fmp
+    script["company-screener"] = [
+        {"symbol": "BIIB", "companyName": "Biogen Inc.",
+         "exchangeShortName": "NASDAQ", "marketCap": 20_000_000_000, "country": "US"},
+    ]
+    # Roche is absent from the industry screener entirely -- verified live.
+    uni = cns_fmp.build_universe(force_include=["RHHBY", "biib"])
+    assert uni["RHHBY"]["source"] == "roster"
+    assert uni["BIIB"]["source"] == "screener", "roster must not clobber screener metadata"
+    assert len(uni) == 2, "force-include is a union, not an append"
+
+
+def test_build_universe_survives_total_fmp_failure(fake_fmp):
+    script, _ = fake_fmp
+    script["company-screener"] = None  # _fmp_get returned None
+    uni = cns_fmp.build_universe(force_include=["RHHBY"])
+    assert uni == {"RHHBY": uni["RHHBY"]}
+    assert uni["RHHBY"]["source"] == "roster"
