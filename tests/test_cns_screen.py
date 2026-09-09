@@ -1,5 +1,7 @@
 """Offline tests for the CNS screen. Fixtures under tests/fixtures/cns/ are
 trimmed excerpts of real FMP transcripts captured 2026-09-09."""
+import os
+
 import cns_screen
 
 
@@ -200,3 +202,66 @@ def test_prefilter_collects_high_signal_terms_with_offsets():
     assert "5-ht2c" in terms
     for _, offset in res.high_signal_hits:
         assert 0 <= offset < len(text)
+
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "cns")
+
+
+def _fixture(name: str) -> str:
+    with open(os.path.join(FIXTURES, name), encoding="utf-8") as handle:
+        return handle.read()
+
+
+def test_boundary_rejects_the_opening_boilerplate_trap_format_a():
+    """AbbVie's ONLY 'question-and-answer' is at char 176 of 56663, inside the
+    operator's opening. An unbanded search would label the entire call as Q&A."""
+    text = _fixture("format_a_abbv.txt")
+    boundary, via = cns_screen.find_qa_boundary(text)
+    assert boundary is not None
+    fraction = boundary / len(text)
+    assert 0.15 <= fraction <= 0.85
+    # the real handoff, not the trap
+    assert text.lower().find("question-and-answer") < boundary
+    assert "neuroscience assets" in text[boundary:], "analyst question must land in QA"
+
+
+def test_boundary_rejects_both_traps_format_b():
+    """Biogen has 'question-and-answer' at 354 AND 'Q&A' at 1606, both inside
+    prepared remarks."""
+    text = _fixture("format_b_biib.txt")
+    boundary, via = cns_screen.find_qa_boundary(text)
+    assert boundary is not None
+    assert text.find("Chris Schott: Thanks.") > boundary
+    assert text.find("Welcome to Biogen") < boundary
+
+
+def test_boundary_handles_roche_spacing_and_open_the_qa_phrasing():
+    text = _fixture("format_b_roche.txt")
+    boundary, via = cns_screen.find_qa_boundary(text)
+    assert boundary is not None
+    assert text.find("Graham Glyn Parry") > boundary
+
+
+def test_boundary_returns_none_rather_than_guessing():
+    """Roche's real transcript matched none of the patterns before the list was
+    extended. Admitting there is no boundary beats inventing one, because zone
+    feeds the prompt's priority rules."""
+    boundary, via = cns_screen.find_qa_boundary(_fixture("no_boundary.txt"))
+    assert boundary is None
+    assert via is None
+
+
+def test_zone_of_maps_offsets_and_degrades_to_unknown():
+    assert cns_screen.zone_of(10, 100) == "PREPARED_REMARKS"
+    assert cns_screen.zone_of(100, 100) == "QA"
+    assert cns_screen.zone_of(500, 100) == "QA"
+    assert cns_screen.zone_of(10, None) == "UNKNOWN"
+
+
+def test_prepare_transcript_wires_boundary_and_prefilter_together():
+    prepared = cns_screen.prepare_transcript(_fixture("format_a_abbv.txt"))
+    assert prepared.boundary is not None
+    assert prepared.prefilter.screen is True
+    assert prepared.prefilter.bd_hits, "BD language sits next to neuroscience here"
+    assert len(prepared.text) == len(_fixture("format_a_abbv.txt")), \
+        "normalization must preserve length so the boundary offset stays valid"

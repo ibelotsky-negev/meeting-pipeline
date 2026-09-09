@@ -436,3 +436,111 @@ def prefilter(text: str, kw: dict = None, window: int = None) -> PrefilterResult
         screen=bool(domain_hits),
         masked=masked,
     )
+
+
+# ======================================================================
+#  Q&A ZONE DETECTION
+# ======================================================================
+# Ken's prompt weights an unscripted Q&A answer about BD appetite ABOVE the same
+# sentiment in prepared remarks, so the zone label is load-bearing for priority.
+#
+# The naive approach -- split on "Question-and-Answer Session" -- corrupts every
+# transcript, because BOTH formats put that phrase in the operator's OPENING
+# boilerplate. Verified live: AbbVie's only occurrence is char 176 of 56,663
+# (0.3%); Biogen has one at 354 (0.6%) and "Q&A" at 1,606 (2.7%).
+#
+# So: search an ordered pattern list, keep only candidates inside a POSITION
+# BAND, and take the earliest survivor. The band is what rejects the traps.
+# Validated against twelve real transcripts; boundaries landed between 23.4%
+# and 59.6% and were confirmed correct by eye in all eleven that matched.
+HANDOFF_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    # format A labels every analyst turn, so the first one IS the boundary
+    r"Analyst \(",
+    r"\[Operator Instructions\]",
+    r"first questions?\s+(?:comes?|is|are|would\s+go|will\s+go|goes)\b[^.]{0,20}(?:from|to)\b",
+    r"(?:take|go\s+to)\s+(?:the|our)\s+first\s+question",
+    r"our\s+first\s+question",
+    r"open\s+(?:the\s+call|us\s+up|it\s+up|the\s+line|the\s+floor)[^.]{0,30}question",
+    # Roche: "we'll open the Q&A session"
+    r"open\s+(?:up\s+)?(?:the\s+|our\s+)?Q\s?&\s?A",
+    # Neurocrine: "let's jump into Q&A"; AstraZeneca/Pfizer: "move to the Q&A"
+    r"(?:jump|move|turn|get)\s+(?:in)?to\s+(?:the\s+)?Q\s?&\s?A",
+    r"(?:begin|start)\s+the\s+question[-\s]and[-\s]answer",
+    r"we\s+will\s+now\s+(?:begin|move|open|take)[^.]{0,40}question",
+    r"ready\s+(?:to|for)[^.]{0,20}question",
+))
+
+
+def _zone_band():
+    """-> (lo, hi) fractions. CNS_ZONE_BAND is 'lo,hi'."""
+    raw = os.environ.get("CNS_ZONE_BAND", "0.15,0.85")
+    try:
+        lo_s, hi_s = raw.split(",")
+        lo, hi = float(lo_s), float(hi_s)
+        if 0.0 <= lo < hi <= 1.0:
+            return lo, hi
+    except (ValueError, AttributeError):
+        pass
+    logger.warning(f"[cns] CNS_ZONE_BAND {raw!r} unusable -- using 0.15,0.85")
+    return 0.15, 0.85
+
+
+def find_qa_boundary(text: str, band=None):
+    """-> (offset, pattern_source) for the start of Q&A, or (None, None).
+
+    Only candidates whose position falls inside the band count; the earliest
+    survivor wins. Returning None is a legitimate, expected outcome -- guessing
+    a boundary is worse than admitting there is not one, because a wrong
+    boundary mislabels the zone of every finding in the transcript."""
+    text = text or ""
+    if not text:
+        return None, None
+    lo_fraction, hi_fraction = band or _zone_band()
+    lo = int(len(text) * lo_fraction)
+    hi = int(len(text) * hi_fraction)
+    best, best_via = None, None
+    for pattern in HANDOFF_PATTERNS:
+        for match in pattern.finditer(text):
+            offset = match.start()
+            if offset < lo or offset > hi:
+                continue
+            if best is None or offset < best:
+                best, best_via = offset, pattern.pattern
+            break  # earliest in-band match for THIS pattern is enough
+    if best is None:
+        logger.info("[cns] no in-band Q&A handoff found -- zone UNKNOWN")
+    return best, best_via
+
+
+def zone_of(offset: int, boundary) -> str:
+    """-> 'PREPARED_REMARKS' | 'QA' | 'UNKNOWN'."""
+    if boundary is None:
+        return "UNKNOWN"
+    return "QA" if offset >= boundary else "PREPARED_REMARKS"
+
+
+class PreparedTranscript:
+    """A transcript ready to screen. `text` is normalized and the SAME LENGTH as
+    the raw input, so `boundary` is a valid offset into either."""
+
+    __slots__ = ("text", "boundary", "boundary_via", "prefilter")
+
+    def __init__(self, text, boundary, boundary_via, prefilter_result):
+        self.text = text
+        self.boundary = boundary
+        self.boundary_via = boundary_via
+        self.prefilter = prefilter_result
+
+    @property
+    def zone_known(self) -> bool:
+        return self.boundary is not None
+
+
+def prepare_transcript(raw: str, kw: dict = None) -> PreparedTranscript:
+    """-> PreparedTranscript. Normalizes, locates the Q&A boundary, and runs the
+    keyword prefilter. Does no network and no model call, so it is the whole
+    decision surface for 'should this transcript cost us a model call'."""
+    normalized = normalize_text(raw)
+    boundary, via = find_qa_boundary(normalized)
+    result = prefilter(normalized, kw=kw)
+    return PreparedTranscript(normalized, boundary, via, result)
