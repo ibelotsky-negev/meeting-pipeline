@@ -158,3 +158,98 @@ def load_universe_config(path: str = None) -> dict:
                             for s in (data.get("entity_only") or []) if str(s).strip()],
         }
     return _universe_config_cache[path]
+
+
+# ======================================================================
+#  TEXT NORMALIZATION
+# ======================================================================
+# EVERY replacement below is length-preserving on purpose. The prefilter's hit
+# offsets, the Q&A boundary offset and quote verification all index the same
+# normalized string, so a normalizer that changed length would silently
+# misalign zone labels. The one multi-char case (an ellipsis) is deliberately
+# NOT folded for that reason.
+_CHAR_FOLD = {
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u2032": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u2033": '"',
+    "\u2013": "-", "\u2014": "-", "\u2212": "-", "\u2011": "-",
+    "\u00a0": " ", "\u2007": " ", "\u202f": " ", "\u200b": " ",
+}
+_FOLD_TABLE = str.maketrans(_CHAR_FOLD)
+
+
+def normalize_text(text: str) -> str:
+    """-> text with smart quotes, dashes and exotic spaces folded to ASCII.
+
+    LENGTH-PRESERVING. See _CHAR_FOLD."""
+    return (text or "").translate(_FOLD_TABLE)
+
+
+def term_pattern(term: str) -> re.Pattern:
+    """-> a compiled, case-insensitive, word-boundaried pattern for one YAML term.
+
+    Per the keyword file's own matching notes:
+      - case-insensitive
+      - \\b on every term, which is what stops ALS matching inside "also" and
+        tau inside "taught"
+      - a trailing '*' is a prefix stem (discontinu* -> discontinued/-ation)
+    Interior whitespace becomes \\s+ so a multi-word term still matches when the
+    phrase straddles a newline, which happens in the newline-delimited format.
+    """
+    term = normalize_text(term).strip()
+    is_stem = term.endswith("*")
+    if is_stem:
+        term = term[:-1].strip()
+    body = r"\s+".join(re.escape(part) for part in term.split())
+    suffix = r"\w*" if is_stem else r"\b"
+    return re.compile(r"\b" + body + suffix, re.IGNORECASE)
+
+
+def compile_group(kw: dict, group: str):
+    """-> [(term, pattern)] for one YAML group. Non-string entries are skipped
+    so a malformed line degrades one term, not the whole group."""
+    out = []
+    for entry in (kw.get(group) or []):
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        out.append((entry.strip(), term_pattern(entry)))
+    return out
+
+
+def mask_spans(text: str, patterns) -> str:
+    """-> text with every match of every pattern replaced by '#' of EQUAL length.
+
+    Equal length is the whole point: it neutralizes a phrase for term matching
+    while keeping every downstream character offset valid.
+
+    This is how the exclusion list does its work. Masking 'PD-1' means the 'PD'
+    term regex can never match inside it, which is a stronger guarantee than
+    checking for a blocker after the fact."""
+    masked = text or ""
+    for pattern in patterns:
+        masked = pattern.sub(lambda m: "#" * len(m.group(0)), masked)
+    return masked
+
+
+_SAFE_HARBOR_CUE = re.compile(
+    r"forward[-\s]looking statements?|safe harbor|private securities litigation",
+    re.IGNORECASE)
+CNS_SAFE_HARBOR_SPAN = int(os.environ.get("CNS_SAFE_HARBOR_SPAN", "4000"))
+
+
+def mask_safe_harbor(text: str, span: int = None) -> str:
+    """-> text with each safe-harbor disclaimer masked, EQUAL LENGTH.
+
+    Ken's prompt says to ignore the safe-harbor section; masking enforces it
+    mechanically for the KEYWORD layer rather than trusting an instruction.
+
+    Bounded to `span` characters from each cue because the disclaimer has no
+    reliable end marker. Frequently a no-op -- AbbVie's transcript contains zero
+    occurrences of 'forward-looking' -- so this must never be load-bearing."""
+    span = CNS_SAFE_HARBOR_SPAN if span is None else int(span)
+    text = text or ""
+    out = text
+    for match in _SAFE_HARBOR_CUE.finditer(text):
+        start = match.start()
+        end = min(len(text), start + span)
+        out = out[:start] + ("#" * (end - start)) + out[end:]
+    return out

@@ -46,3 +46,42 @@ def test_load_universe_config_splits_screenable_from_entity_only():
     # an acquired company or inactive trader must never end up in the fetch list
     assert not any(t.upper() in ("CERE", "KRTX", "ITCI", "SAGE")
                    for t in cfg["force_include"])
+
+
+def test_normalize_text_preserves_length():
+    """Offsets from the prefilter, the zone boundary and quote verification all
+    index the same string, so normalization must never change its length."""
+    raw = "Parkinson\u2019s disease \u2014 the \u201cnon-motor\u201d symptoms\u00a0here"
+    out = cns_screen.normalize_text(raw)
+    assert len(out) == len(raw)
+    assert "Parkinson's disease" in out
+    assert '"non-motor"' in out
+
+
+def test_term_pattern_word_boundaries_and_stems():
+    # strict boundary on a short acronym: ALS must not match inside "also"
+    als = cns_screen.term_pattern("ALS")
+    assert als.search("diagnosed with ALS last year")
+    assert not als.search("we also expect growth")
+    # tau must not match "taught"
+    tau = cns_screen.term_pattern("tau")
+    assert tau.search("tau pathology")
+    assert not tau.search("he taught us")
+    # a trailing * is a prefix stem
+    disc = cns_screen.term_pattern("discontinu*")
+    assert disc.search("we discontinued the program")
+    assert disc.search("the discontinuation was announced")
+    # a multi-word term matches across a line break, because format B is
+    # newline-delimited and a phrase can straddle a turn boundary
+    bbb = cns_screen.term_pattern("blood-brain barrier")
+    assert bbb.search("crosses the blood-brain\nbarrier reliably")
+
+
+def test_mask_spans_is_equal_length_and_blocks_the_substring():
+    text = "Our PD-1 asset and our PD program"
+    patterns = [cns_screen.term_pattern("PD-1")]
+    masked = cns_screen.mask_spans(text, patterns)
+    assert len(masked) == len(text)
+    assert "PD-1" not in masked
+    # the real PD mention survives
+    assert masked.endswith("our PD program")
