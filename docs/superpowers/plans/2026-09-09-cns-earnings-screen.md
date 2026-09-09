@@ -2709,10 +2709,1430 @@ git commit -m "feat(cns): transcript store, retryable ledger, atomic saves, run 
 
 ---
 
-The remaining tasks continue in the same shape and will be appended next:
+### Task 8: Season windows, digest rendering, email send
 
-| Task | Deliverable |
-|---|---|
-| 8 | Season windows, digest render, Graph send |
-| 9 | `run_daily` orchestration and `run_season` wrap-up |
-| 10 | `app.py` wiring (3 routes, 2 cron jobs), requirements, version bump, CLAUDE.md, deploy, Q2 2026 backfill |
+**Files:**
+- Modify: `cns_screen.py`
+- Modify: `tests/test_cns_screen.py`
+
+**Interfaces:**
+- Consumes: state helpers from Task 7.
+- Produces:
+  - `SEASONS` tuple, `season_for_date(d: date) -> tuple[str, str, str] | None` returning `(label, start_iso, end_iso)`
+  - `season_window(label: str) -> tuple[str, str]` parsing `"Q2-2026"`
+  - `render_digest_html(context: dict) -> str`
+  - `send_digest(subject: str, html: str, recipients=None) -> bool`
+  - `CNS_RECIPIENTS`
+
+Season labels use the FISCAL quarter being reported, but the window is on CALL DATE. `Q4-2026` means "the Q4/annual reporting season that runs Jan 1 to Mar 15 of 2026", which carries FY2025 Q4 calls. That asymmetry is deliberate and is why the spec fixes windows to call date.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_cns_screen.py`:
+
+```python
+from datetime import date as _date
+
+
+def test_season_for_date_covers_all_four_windows():
+    assert cns_screen.season_for_date(_date(2026, 2, 10))[0] == "Q4-2026"
+    assert cns_screen.season_for_date(_date(2026, 5, 1))[0] == "Q1-2026"
+    assert cns_screen.season_for_date(_date(2026, 7, 31))[0] == "Q2-2026"
+    assert cns_screen.season_for_date(_date(2026, 11, 5))[0] == "Q3-2026"
+
+
+def test_season_for_date_returns_none_between_seasons():
+    """Late September is outside every window; a call there belongs to no season
+    and must not be silently swept into the wrong one."""
+    assert cns_screen.season_for_date(_date(2026, 9, 25)) is None
+    assert cns_screen.season_for_date(_date(2026, 3, 25)) is None
+
+
+def test_season_window_q2_2026_matches_the_spec():
+    start, end = cns_screen.season_window("Q2-2026")
+    assert (start, end) == ("2026-07-01", "2026-09-15")
+
+
+def test_season_window_rejects_a_bad_label():
+    with pytest.raises(ValueError):
+        cns_screen.season_window("nonsense")
+
+
+def test_axsom_fiscal_q4_call_in_february_lands_in_the_q4_season():
+    """AXSM's FY2025 Q4 call happened 2026-02-23. Season is decided by the CALL
+    DATE, so it belongs to the Q4-2026 reporting season, not to a 2025 window."""
+    label, start, end = cns_screen.season_for_date(_date(2026, 2, 23))
+    assert label == "Q4-2026"
+    assert start <= "2026-02-23" <= end
+
+
+def test_render_digest_html_orders_by_priority_and_shows_silence():
+    context = {
+        "window": "2026-09-08 to 2026-09-09",
+        "findings_by_company": [
+            {"company": "AbbVie", "symbol": "ABBV", "period": "Q2 2026",
+             "call_date": "2026-07-31", "overall_take": "Neuro BD appetite.",
+             "findings": [
+                 {"signal": "BD_INTENT", "priority": "MEDIUM", "zone": "QA",
+                  "speaker": None, "quote": "Adjacent neuro commentary here.",
+                  "why_it_matters": "Context.", "entities": []},
+                 {"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+                  "speaker": "Roopal Thakkar",
+                  "quote": "Significant capacity for BD in neuroscience.",
+                  "why_it_matters": "Names neuro as the target.",
+                  "entities": ["AbbVie"]},
+             ]},
+        ],
+        "nothing_relevant": ["PFE", "MRK"],
+        "reported_no_transcript": [{"symbol": "SNY", "date": "2026-09-05"}],
+        "unconfirmed": [{"term": "apathy", "excerpt": "...apathy in PD..."}],
+        "dropped_quotes": 1,
+        "screened": 3,
+        "cap_hit": False,
+        "dry_run": False,
+    }
+    html = cns_screen.render_digest_html(context)
+    assert html.index("Significant capacity") < html.index("Adjacent neuro"), \
+        "HIGH must render before MEDIUM"
+    assert "PFE" in html and "MRK" in html, "silence must be visible"
+    assert "SNY" in html, "coverage gap must be visible"
+    assert "apathy" in html
+    assert "1" in html and "verification" in html.lower()
+
+
+def test_render_digest_html_handles_a_completely_empty_run():
+    html = cns_screen.render_digest_html({
+        "window": "2026-09-09 to 2026-09-09", "findings_by_company": [],
+        "nothing_relevant": [], "reported_no_transcript": [],
+        "unconfirmed": [], "dropped_quotes": 0, "screened": 0,
+        "cap_hit": False, "dry_run": True,
+    })
+    assert "DRY RUN" in html
+    assert html.strip().startswith("<div")
+
+
+def test_render_digest_html_escapes_transcript_text():
+    """Quotes come from counterparty text and land in HTML."""
+    html = cns_screen.render_digest_html({
+        "window": "w", "findings_by_company": [
+            {"company": "X", "symbol": "X", "period": "Q2 2026",
+             "call_date": "2026-07-31", "overall_take": "",
+             "findings": [{"signal": "BD_INTENT", "priority": "HIGH",
+                           "zone": "QA", "speaker": None,
+                           "quote": "<script>alert(1)</script>",
+                           "why_it_matters": "", "entities": []}]}],
+        "nothing_relevant": [], "reported_no_transcript": [], "unconfirmed": [],
+        "dropped_quotes": 0, "screened": 1, "cap_hit": False, "dry_run": False,
+    })
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `python -m pytest tests/test_cns_screen.py -k "season or render_digest" -v`
+Expected: FAIL with `AttributeError: module 'cns_screen' has no attribute 'season_for_date'`
+
+- [ ] **Step 3: Implement seasons, rendering and send**
+
+Append to `cns_screen.py`:
+
+```python
+# ======================================================================
+#  SEASONS
+# ======================================================================
+# Windows are on CALL DATE, never on the fiscal label, because fiscal labels do
+# not align across companies: Takeda's FY2026 Q1 call and AbbVie's FY2026 Q2
+# call both happened in late July 2026, and Axsome's FY2025 Q4 call happened on
+# 2026-02-23. The label names the reporting season; the window selects it.
+SEASONS = (
+    ("Q4", (1, 1), (3, 15)),    # the Q4/annual season, carrying prior-FY Q4 calls
+    ("Q1", (4, 1), (6, 15)),
+    ("Q2", (7, 1), (9, 15)),
+    ("Q3", (10, 1), (12, 15)),
+)
+
+
+def season_for_date(day):
+    """-> (label, start_iso, end_iso) for the reporting season containing `day`,
+    or None when the date falls between seasons.
+
+    Returning None matters: a call on 2026-09-25 belongs to no season, and
+    sweeping it into the nearest one would misattribute it."""
+    for quarter, (start_month, start_day), (end_month, end_day) in SEASONS:
+        start = date(day.year, start_month, start_day)
+        end = date(day.year, end_month, end_day)
+        if start <= day <= end:
+            return f"{quarter}-{day.year}", start.isoformat(), end.isoformat()
+    return None
+
+
+def season_window(label: str):
+    """-> (start_iso, end_iso) for a label like 'Q2-2026'."""
+    match = re.fullmatch(r"\s*(Q[1-4])\s*-\s*(\d{4})\s*", label or "", re.IGNORECASE)
+    if not match:
+        raise ValueError(f"season label {label!r} must look like 'Q2-2026'")
+    quarter = match.group(1).upper()
+    year = int(match.group(2))
+    for candidate, (start_month, start_day), (end_month, end_day) in SEASONS:
+        if candidate == quarter:
+            return (date(year, start_month, start_day).isoformat(),
+                    date(year, end_month, end_day).isoformat())
+    raise ValueError(f"season label {label!r} names no known season")
+
+
+# ======================================================================
+#  DIGEST
+# ======================================================================
+CNS_RECIPIENTS = [
+    r.strip() for r in os.environ.get(
+        "CNS_RECIPIENTS", "bk@negevlabs.com,dan@negevlabs.com").split(",")
+    if r.strip()
+]
+
+_PRIORITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+_PRIORITY_COLOR = {"HIGH": "#9b2c2c", "MEDIUM": "#975a16", "LOW": "#4a5568"}
+
+
+def _esc(value) -> str:
+    """Escape for HTML. Quotes and speaker names are counterparty-authored text
+    landing in an email body, so this is not optional."""
+    return (str("" if value is None else value)
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def render_digest_html(context: dict) -> str:
+    """-> the digest body.
+
+    Section order is deliberate and mirrors the spec: findings by priority, then
+    the companies that produced NOTHING (silence has to be visible or an empty
+    digest is indistinguishable from a broken pipeline), then coverage gaps,
+    then the independent keyword recall check, then the verification drop count.
+    """
+    parts = ['<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,'
+             'sans-serif;font-size:14px;color:#1a202c;max-width:820px;">']
+    if context.get("dry_run"):
+        parts.append('<p style="background:#fefcbf;padding:6px 10px;'
+                     'border-radius:4px;"><strong>DRY RUN</strong> -- nothing '
+                     'was recorded and no state was written.</p>')
+    parts.append(f'<p style="color:#4a5568;">Window {_esc(context.get("window"))} '
+                 f'&middot; {int(context.get("screened") or 0)} transcript(s) screened</p>')
+    if context.get("cap_hit"):
+        parts.append('<p style="color:#9b2c2c;"><strong>Per-run cap reached.</strong> '
+                     'Remaining transcripts will be picked up on the next run.</p>')
+
+    companies = context.get("findings_by_company") or []
+    if companies:
+        for entry in companies:
+            findings = sorted(
+                entry.get("findings") or [],
+                key=lambda f: _PRIORITY_ORDER.get((f.get("priority") or "").upper(), 3))
+            if not findings:
+                continue
+            parts.append(
+                f'<h3 style="margin:18px 0 4px;">{_esc(entry.get("company"))} '
+                f'<span style="color:#718096;font-weight:normal;">'
+                f'({_esc(entry.get("symbol"))}) &middot; {_esc(entry.get("period"))} '
+                f'&middot; {_esc(entry.get("call_date"))}</span></h3>')
+            if entry.get("overall_take"):
+                parts.append(f'<p style="color:#2d3748;margin:2px 0 8px;">'
+                             f'<em>{_esc(entry["overall_take"])}</em></p>')
+            for finding in findings:
+                priority = (finding.get("priority") or "").upper()
+                color = _PRIORITY_COLOR.get(priority, "#4a5568")
+                speaker = finding.get("speaker") or "unattributed"
+                parts.append(
+                    f'<div style="border-left:3px solid {color};padding:2px 0 2px 10px;'
+                    'margin:8px 0;">'
+                    f'<div style="font-size:12px;color:{color};font-weight:600;">'
+                    f'{_esc(priority)} &middot; {_esc(finding.get("signal"))} '
+                    f'&middot; {_esc(finding.get("zone"))} &middot; {_esc(speaker)}</div>'
+                    f'<blockquote style="margin:4px 0;color:#1a202c;">'
+                    f'&ldquo;{_esc(finding.get("quote"))}&rdquo;</blockquote>'
+                    f'<div style="color:#4a5568;">{_esc(finding.get("why_it_matters"))}</div>'
+                    '</div>')
+    else:
+        parts.append('<p style="color:#718096;">No findings met the bar in this window.</p>')
+
+    nothing = context.get("nothing_relevant") or []
+    if nothing:
+        parts.append('<h4 style="margin:18px 0 4px;">Screened, nothing relevant</h4>'
+                     f'<p style="color:#718096;">{_esc(", ".join(nothing))}</p>')
+
+    gaps = context.get("reported_no_transcript") or []
+    if gaps:
+        rows = ", ".join(f'{_esc(g.get("symbol"))} ({_esc(g.get("date"))})' for g in gaps)
+        parts.append('<h4 style="margin:18px 0 4px;">Reported, transcript not available</h4>'
+                     f'<p style="color:#975a16;">{rows}</p>')
+
+    unconfirmed = context.get("unconfirmed") or []
+    if unconfirmed:
+        parts.append('<h4 style="margin:18px 0 4px;">High-signal keyword hits the '
+                     'model did not report</h4>')
+        for item in unconfirmed:
+            parts.append(f'<div style="margin:6px 0;"><strong>{_esc(item.get("term"))}</strong>'
+                         f'<div style="color:#4a5568;">...{_esc(item.get("excerpt"))}...</div></div>')
+
+    dropped = int(context.get("dropped_quotes") or 0)
+    if dropped:
+        parts.append(f'<p style="color:#9b2c2c;margin-top:16px;">{dropped} finding(s) '
+                     'dropped for failing verbatim-quote verification.</p>')
+
+    parts.append('<hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0 8px;">'
+                 '<p style="color:#a0aec0;font-size:12px;">Sara &middot; CNS earnings screen'
+                 '</p></div>')
+    return "".join(parts)
+
+
+def send_digest(subject: str, html: str, recipients=None) -> bool:
+    """-> True when the mail was handed to Graph.
+
+    Uses the same app-only send path as the rest of Sara. Never raises: a mail
+    failure must not lose a run whose ledger is already written."""
+    sender = os.environ.get("BOT_SENDER_EMAIL", "")
+    if not sender:
+        logger.warning("[cns] BOT_SENDER_EMAIL not set -- digest not emailed")
+        return False
+    to = recipients or CNS_RECIPIENTS
+    if not to:
+        logger.warning("[cns] no CNS_RECIPIENTS configured -- digest not emailed")
+        return False
+    try:
+        import email_pipeline_sync as eps
+        eps.graph_post(
+            f"{eps.MS_GRAPH_BASE}/users/{sender}/sendMail",
+            {"message": {
+                "subject": subject,
+                "body": {"contentType": "HTML", "content": html},
+                "toRecipients": [{"emailAddress": {"address": r}} for r in to],
+            }, "saveToSentItems": False})
+    except Exception as e:
+        logger.error(f"[cns] digest send failed: {e}", exc_info=True)
+        return False
+    logger.info(f"[cns] digest emailed to {', '.join(to)}")
+    return True
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `python -m pytest tests/test_cns_screen.py -v`
+Expected: PASS (48 tests)
+
+- [ ] **Step 5: Commit**
+
+```bash
+python -c "import ast; ast.parse(open('cns_screen.py').read()); print('OK')"
+git add cns_screen.py tests/test_cns_screen.py
+git commit -m "feat(cns): season windows on call date, digest rendering, Graph send"
+```
+
+---
+
+### Task 9: Orchestration -- `run_daily` and `run_season`
+
+**Files:**
+- Modify: `cns_screen.py`
+- Modify: `tests/test_cns_screen.py`
+
+**Interfaces:**
+- Consumes: everything from Tasks 1 through 8.
+- Produces:
+  - `resolve_universe(force_refresh: bool = False) -> dict`
+  - `process_one(item: dict, universe: dict, ledger: dict, findings_store: dict, dry_run: bool) -> dict` returning a per-transcript outcome record
+  - `run_daily(dry_run=None, days=None, limit=None, backlog=False, force=False, send_email=True, reconcile=None) -> dict`
+  - `run_season(label=None, start=None, end=None, dry_run=False, send_email=True) -> dict`
+  - `main()` CLI
+  - `CNS_MAX_TRANSCRIPTS_PER_RUN`, `CNS_LOOKBACK_DAYS`, `CNS_SEASON_MODEL`, `CNS_TRANSCRIPT_GRACE_DAYS`, `CNS_RECONCILE_WEEKDAY`
+
+- [ ] **Step 1: Write the failing tests for `process_one`**
+
+Append to `tests/test_cns_screen.py`:
+
+```python
+def test_process_one_records_no_cns_content_without_calling_the_model(cns_state, monkeypatch):
+    """The skip gate. An oncology-only call must cost zero model spend."""
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: ("Operator. Our PD-L1 oncology asset grew. "
+                                         + "filler. " * 400, "2026-07-31"))
+
+    def _boom(*a, **k):
+        raise AssertionError("model must not be called for a no-CNS transcript")
+
+    monkeypatch.setattr(cns_screen, "screen_transcript", _boom)
+    ledger, store = {}, {}
+    item = {"symbol": "XYZ", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    outcome = cns_screen.process_one(item, {"XYZ": {"name": "Xyz"}}, ledger, store, False)
+    assert outcome["status"] == "no_cns_content"
+    assert ledger["XYZ:2026:Q2"]["status"] == "no_cns_content"
+
+
+def test_process_one_records_a_retryable_gap_on_empty_content(cns_state, monkeypatch):
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: (None, "content_too_short:0"))
+    ledger, store = {}, {}
+    item = {"symbol": "AXSM", "fiscal_year": 2026, "quarter": 2, "date": "2026-08-10"}
+    outcome = cns_screen.process_one(item, {"AXSM": {}}, ledger, store, False)
+    assert outcome["status"] == "gap"
+    assert cns_screen.ledger_should_process(ledger, "AXSM:2026:Q2") is True
+
+
+def test_process_one_verifies_quotes_and_persists_only_verified(cns_state, monkeypatch):
+    body = ("Operator. Welcome. " + "filler words here. " * 200
+            + "We have significant capacity for business development, "
+              "particularly in neuroscience. " + "more filler. " * 200)
+    monkeypatch.setattr(cns_fmp, "fetch_transcript", lambda *a, **k: (body, "2026-07-31"))
+    monkeypatch.setattr(cns_screen, "screen_transcript", lambda *a, **k: {
+        "company": "AbbVie", "period": "Q2 2026", "relevant": True,
+        "overall_take": "Neuro BD appetite.",
+        "findings": [
+            {"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+             "speaker": "X",
+             "quote": "We have significant capacity for business development, "
+                      "particularly in neuroscience.",
+             "why_it_matters": "y", "entities": []},
+            {"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+             "speaker": "X", "quote": "We are buying a Parkinson's company tomorrow.",
+             "why_it_matters": "fabricated", "entities": []},
+        ]})
+    ledger, store = {}, {}
+    item = {"symbol": "ABBV", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    outcome = cns_screen.process_one(item, {"ABBV": {"name": "AbbVie"}},
+                                     ledger, store, False)
+    assert outcome["status"] == "screened"
+    assert outcome["dropped"] == 1
+    assert len(store["ABBV:2026:Q2"]["findings"]) == 1
+
+
+def test_process_one_dry_run_writes_no_state(cns_state, monkeypatch):
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: ("Operator. Neuroscience. " + "f. " * 900,
+                                         "2026-07-31"))
+    monkeypatch.setattr(cns_screen, "screen_transcript", lambda *a, **k: {
+        "company": "X", "period": "Q2 2026", "relevant": False,
+        "overall_take": "nothing", "findings": []})
+    ledger, store = {}, {}
+    item = {"symbol": "ABBV", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    cns_screen.process_one(item, {"ABBV": {}}, ledger, store, True)
+    assert ledger == {}, "dry run must not mark anything processed"
+    assert store == {}
+
+
+def test_process_one_failed_model_call_is_retryable(cns_state, monkeypatch):
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: ("Operator. Neuroscience. " + "f. " * 900,
+                                         "2026-07-31"))
+
+    def _fail(*a, **k):
+        raise cns_screen.CnsScreenError("model refused the request")
+
+    monkeypatch.setattr(cns_screen, "screen_transcript", _fail)
+    ledger, store = {}, {}
+    item = {"symbol": "ABBV", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    outcome = cns_screen.process_one(item, {"ABBV": {}}, ledger, store, False)
+    assert outcome["status"] == "failed"
+    assert cns_screen.ledger_should_process(ledger, "ABBV:2026:Q2") is True
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `python -m pytest tests/test_cns_screen.py -k process_one -v`
+Expected: FAIL with `AttributeError: module 'cns_screen' has no attribute 'process_one'`
+
+- [ ] **Step 3: Implement `resolve_universe` and `process_one`**
+
+Append to `cns_screen.py`:
+
+```python
+# ======================================================================
+#  ORCHESTRATION
+# ======================================================================
+CNS_LOOKBACK_DAYS = int(os.environ.get("CNS_LOOKBACK_DAYS", "3"))
+CNS_MAX_TRANSCRIPTS_PER_RUN = int(os.environ.get("CNS_MAX_TRANSCRIPTS_PER_RUN", "60"))
+CNS_TRANSCRIPT_GRACE_DAYS = int(os.environ.get("CNS_TRANSCRIPT_GRACE_DAYS", "3"))
+CNS_RECONCILE_WEEKDAY = int(os.environ.get("CNS_RECONCILE_WEEKDAY", "6"))
+CNS_SEASON_MODEL = os.environ.get("CNS_SEASON_MODEL", "claude-opus-5")
+CNS_SEASON_MAX_TOKENS = int(os.environ.get("CNS_SEASON_MAX_TOKENS", "32000"))
+
+
+def resolve_universe(force_refresh: bool = False) -> dict:
+    """-> the screening universe, from cache when fresh.
+
+    The force-include roster is applied on EVERY resolve, including cache hits,
+    so editing cns_screen_universe.yaml takes effect on the next run without
+    waiting out the universe TTL."""
+    config = load_universe_config()
+    roster = config["force_include"]
+    if not force_refresh:
+        cached = load_universe_cache()
+        if cached is not None:
+            for symbol in roster:
+                cached.setdefault(symbol, {
+                    "name": symbol, "industry": None, "market_cap": None,
+                    "exchange": None, "country": None, "source": "roster"})
+            return cached
+    universe = cns_fmp.build_universe(force_include=roster)
+    if universe:
+        save_universe_cache(universe)
+    return universe
+
+
+def process_one(item: dict, universe: dict, ledger: dict,
+                findings_store: dict, dry_run: bool) -> dict:
+    """Fetch, prepare, screen, verify and persist ONE transcript.
+
+    -> an outcome record for the digest and status file. Never raises: a single
+    company's failure must not abort a 240-company run.
+
+    Ledger writes happen HERE, per transcript, not at the end of the run. A
+    restart or crash mid-run therefore cannot re-email a finding that was
+    already delivered."""
+    symbol = item["symbol"]
+    fiscal_year, quarter = item["fiscal_year"], item["quarter"]
+    key = cns_fmp.period_key(symbol, fiscal_year, quarter)
+    company = (universe.get(symbol) or {}).get("name") or symbol
+    period_label = f"Q{quarter} FY{fiscal_year}"
+    outcome = {"key": key, "symbol": symbol, "company": company,
+               "period": period_label, "call_date": item.get("date"),
+               "status": "failed", "dropped": 0, "findings": 0, "reason": None}
+
+    content, meta = cns_fmp.fetch_transcript(symbol, fiscal_year, quarter)
+    if content is None:
+        # A listed period whose content is empty is a COVERAGE GAP, not a screen
+        # with no findings. It must stay retryable so it is picked up once FMP
+        # backfills -- AXSM FY2026Q2 was exactly this case.
+        outcome["status"] = "gap"
+        outcome["reason"] = meta
+        if not dry_run:
+            record_ledger(ledger, key, "gap", reason=meta, date=item.get("date"))
+        return outcome
+
+    call_date = meta or item.get("date") or ""
+    if not dry_run:
+        store_transcript(symbol, fiscal_year, quarter, content)
+
+    prepared = prepare_transcript(content)
+    if not prepared.prefilter.screen:
+        outcome["status"] = "no_cns_content"
+        if not dry_run:
+            record_ledger(ledger, key, "no_cns_content", date=call_date)
+        return outcome
+
+    try:
+        result = screen_transcript(prepared, company, period_label, call_date)
+    except CnsScreenError as e:
+        logger.warning(f"[cns] {key} screening failed: {e}")
+        outcome["status"] = "failed"
+        outcome["reason"] = str(e)
+        if not dry_run:
+            record_ledger(ledger, key, "failed", reason=str(e), date=call_date)
+        return outcome
+    except Exception as e:
+        logger.error(f"[cns] {key} unexpected screening error: {e}", exc_info=True)
+        outcome["status"] = "failed"
+        outcome["reason"] = f"unexpected: {e}"
+        if not dry_run:
+            record_ledger(ledger, key, "failed", reason=str(e), date=call_date)
+        return outcome
+
+    kept, dropped = verify_findings(result.get("findings") or [],
+                                    prepared.text, prepared.boundary)
+    unconfirmed = unconfirmed_high_signal(prepared.prefilter, kept, prepared.text)
+
+    outcome.update({
+        "status": "screened",
+        "dropped": len(dropped),
+        "findings": len(kept),
+        "relevant": bool(result.get("relevant")) and bool(kept),
+        "overall_take": result.get("overall_take") or "",
+        "verified_findings": kept,
+        "unconfirmed": unconfirmed,
+        "zone_known": prepared.zone_known,
+        "prefilter": prepared.prefilter.as_summary(),
+    })
+    if not dry_run:
+        if kept:
+            findings_store[key] = {
+                "symbol": symbol, "company": company, "period": period_label,
+                "call_date": call_date,
+                "overall_take": result.get("overall_take") or "",
+                "findings": kept,
+                "screened_at": datetime.now(timezone.utc).isoformat(),
+            }
+        record_ledger(ledger, key, "screened", date=call_date,
+                      findings_count=len(kept), dropped=len(dropped))
+    return outcome
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+Run: `python -m pytest tests/test_cns_screen.py -k process_one -v`
+Expected: PASS (5 tests)
+
+- [ ] **Step 5: Write the failing tests for `run_daily` and `run_season`**
+
+Append to `tests/test_cns_screen.py`:
+
+```python
+def test_run_daily_skips_when_a_run_is_already_in_progress(cns_state):
+    assert cns_screen._acquire_run_lock() is True
+    try:
+        result = cns_screen.run_daily(dry_run=True, send_email=False)
+        assert result["status"] == "skipped"
+    finally:
+        cns_screen._release_run_lock()
+
+
+def test_run_daily_disabled_without_an_fmp_key(cns_state, monkeypatch):
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+    result = cns_screen.run_daily(dry_run=True, send_email=False)
+    assert result["status"] == "disabled"
+
+
+def test_run_daily_honours_the_per_run_cap(cns_state, monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    monkeypatch.setattr(cns_screen, "CNS_MAX_TRANSCRIPTS_PER_RUN", 2)
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {f"S{i}": {"name": f"S{i}"} for i in range(5)})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [
+        {"symbol": f"S{i}", "fiscal_year": 2026, "quarter": 2,
+         "date": "2026-07-31"} for i in range(5)])
+    monkeypatch.setattr(cns_fmp, "reported_symbols", lambda *a, **k: {})
+    seen = []
+
+    def _fake_process(item, *a, **k):
+        seen.append(item["symbol"])
+        return {"key": item["symbol"], "symbol": item["symbol"], "status": "no_cns_content",
+                "company": item["symbol"], "period": "Q2 FY2026",
+                "call_date": "2026-07-31", "dropped": 0, "findings": 0}
+
+    monkeypatch.setattr(cns_screen, "process_one", _fake_process)
+    result = cns_screen.run_daily(dry_run=True, send_email=False)
+    assert len(seen) == 2
+    assert result["cap_hit"] is True
+
+
+def test_run_daily_reports_reported_but_missing_beyond_the_grace_period(cns_state, monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {"SNY": {"name": "Sanofi"}})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [])
+    monkeypatch.setattr(cns_fmp, "reported_symbols",
+                        lambda *a, **k: {"SNY": "2026-01-29"})
+    result = cns_screen.run_daily(dry_run=True, send_email=False)
+    assert any(g["symbol"] == "SNY" for g in result["reported_no_transcript"])
+
+
+def test_run_season_reads_stored_findings_and_never_rescreens(cns_state, monkeypatch):
+    cns_screen.save_findings({"ABBV:2026:Q2": {
+        "symbol": "ABBV", "company": "AbbVie", "period": "Q2 FY2026",
+        "call_date": "2026-07-31", "overall_take": "Neuro BD appetite.",
+        "findings": [{"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+                      "speaker": "X", "quote": "q" * 40,
+                      "why_it_matters": "y", "entities": []}]}})
+
+    def _boom(*a, **k):
+        raise AssertionError("a season wrap-up must never re-screen")
+
+    monkeypatch.setattr(cns_screen, "process_one", _boom)
+    monkeypatch.setattr(cns_screen, "_season_narrative",
+                        lambda *a, **k: "<p>Narrative.</p>")
+    result = cns_screen.run_season(label="Q2-2026", dry_run=True, send_email=False)
+    assert result["status"] == "ok"
+    assert result["companies"] == 1
+    # the ledger is untouched, so the wrap-up is safe to re-run for comparison
+    assert cns_screen.load_ledger() == {}
+
+
+def test_run_season_excludes_calls_outside_the_window(cns_state, monkeypatch):
+    cns_screen.save_findings({
+        "A:2026:Q2": {"symbol": "A", "company": "A", "period": "Q2 FY2026",
+                      "call_date": "2026-07-31", "overall_take": "",
+                      "findings": [{"quote": "q" * 40, "priority": "HIGH"}]},
+        "B:2026:Q1": {"symbol": "B", "company": "B", "period": "Q1 FY2026",
+                      "call_date": "2026-05-01", "overall_take": "",
+                      "findings": [{"quote": "q" * 40, "priority": "HIGH"}]},
+    })
+    monkeypatch.setattr(cns_screen, "_season_narrative", lambda *a, **k: "n")
+    result = cns_screen.run_season(label="Q2-2026", dry_run=True, send_email=False)
+    assert result["companies"] == 1
+```
+
+- [ ] **Step 6: Run to verify failure**
+
+Run: `python -m pytest tests/test_cns_screen.py -k "run_daily or run_season" -v`
+Expected: FAIL with `AttributeError: module 'cns_screen' has no attribute 'run_daily'`
+
+- [ ] **Step 7: Implement `run_daily`, `run_season` and the CLI**
+
+Append to `cns_screen.py`:
+
+```python
+def _window_dates(days: int):
+    """-> (start_iso, end_iso) for a trailing window ending today."""
+    end = date.today()
+    start = date.fromordinal(end.toordinal() - max(0, int(days)))
+    return start.isoformat(), end.isoformat()
+
+
+def _run_daily_inner(dry_run: bool, days, limit, backlog: bool,
+                     send_email: bool, reconcile) -> dict:
+    universe = resolve_universe()
+    if not universe:
+        write_status({"status": "error", "error": "universe resolved empty",
+                      "finished_at": datetime.now(timezone.utc).isoformat()})
+        return {"status": "error", "error": "universe resolved empty"}
+
+    lookback = CNS_LOOKBACK_DAYS if days is None else int(days)
+    start_iso, end_iso = _window_dates(lookback)
+    _set_progress(phase="discovery", done=0, total=0)
+
+    discovered = cns_fmp.discover_from_feed(universe, start_iso, end_iso)
+    if reconcile is None:
+        reconcile = date.today().weekday() == CNS_RECONCILE_WEEKDAY
+    if reconcile:
+        logger.info("[cns] running the weekly per-symbol reconciliation sweep")
+        seen = {cns_fmp.period_key(d["symbol"], d["fiscal_year"], d["quarter"])
+                for d in discovered}
+        for extra in cns_fmp.discover_from_dates(universe, start_iso, end_iso):
+            key = cns_fmp.period_key(extra["symbol"], extra["fiscal_year"], extra["quarter"])
+            if key not in seen:
+                seen.add(key)
+                discovered.append(extra)
+
+    ledger = load_ledger()
+    findings_store = load_findings()
+    pending = [
+        item for item in discovered
+        if backlog or ledger_should_process(
+            ledger, cns_fmp.period_key(item["symbol"], item["fiscal_year"], item["quarter"]))
+    ]
+    pending.sort(key=lambda item: (item.get("date") or "", item["symbol"]))
+
+    cap = CNS_MAX_TRANSCRIPTS_PER_RUN if limit is None else int(limit)
+    cap_hit = len(pending) > cap
+    if cap_hit:
+        logger.warning(f"[cns] {len(pending)} transcripts pending, capping at {cap} "
+                       "-- the remainder is picked up on the next run")
+        pending = pending[:cap]
+
+    _set_progress(phase="screening", done=0, total=len(pending))
+    outcomes = []
+    for item in pending:
+        outcomes.append(process_one(item, universe, ledger, findings_store, dry_run))
+        _bump_progress(f"{item['symbol']} Q{item['quarter']} FY{item['fiscal_year']}")
+        if not dry_run:
+            # Persist after EACH transcript so a crash cannot re-email a
+            # finding that already went out.
+            save_ledger(ledger)
+            save_findings(findings_store)
+        _touch_run_lock()
+
+    reported = cns_fmp.reported_symbols(universe, start_iso, end_iso)
+    grace_cutoff = date.fromordinal(
+        date.today().toordinal() - CNS_TRANSCRIPT_GRACE_DAYS).isoformat()
+    have = {o["symbol"] for o in outcomes if o["status"] in ("screened", "no_cns_content")}
+    gaps = [
+        {"symbol": symbol, "date": call_date}
+        for symbol, call_date in sorted(reported.items())
+        if call_date <= grace_cutoff and symbol not in have
+        and not any(
+            (ledger.get(k) or {}).get("status") in _TERMINAL_STATUSES
+            for k in ledger if k.startswith(f"{symbol}:"))
+    ]
+
+    with_findings = [o for o in outcomes if o.get("verified_findings")]
+    context = {
+        "window": f"{start_iso} to {end_iso}",
+        "screened": sum(1 for o in outcomes if o["status"] == "screened"),
+        "findings_by_company": [{
+            "company": o["company"], "symbol": o["symbol"], "period": o["period"],
+            "call_date": o["call_date"], "overall_take": o.get("overall_take") or "",
+            "findings": o["verified_findings"],
+        } for o in with_findings],
+        "nothing_relevant": sorted(
+            o["symbol"] for o in outcomes
+            if o["status"] in ("screened", "no_cns_content") and not o.get("verified_findings")),
+        "reported_no_transcript": gaps,
+        "unconfirmed": [u for o in outcomes for u in (o.get("unconfirmed") or [])],
+        "dropped_quotes": sum(int(o.get("dropped") or 0) for o in outcomes),
+        "cap_hit": cap_hit,
+        "dry_run": dry_run,
+    }
+
+    emailed = False
+    if send_email and outcomes:
+        high = sum(1 for o in with_findings for f in o["verified_findings"]
+                   if (f.get("priority") or "").upper() == "HIGH")
+        prefix = "[DRY] " if dry_run else ""
+        subject = (f"{prefix}CNS earnings screen -- {len(with_findings)} compan"
+                   f"{'y' if len(with_findings) == 1 else 'ies'} with findings"
+                   + (f", {high} HIGH" if high else ""))
+        emailed = send_digest(subject, render_digest_html(context))
+    elif send_email:
+        logger.info("[cns] no new transcripts in the window -- no digest sent")
+
+    status = {
+        "status": "ok",
+        "dry_run": dry_run,
+        "window": context["window"],
+        "universe_size": len(universe),
+        "discovered": len(discovered),
+        "processed": len(outcomes),
+        "screened": context["screened"],
+        "with_findings": len(with_findings),
+        "dropped_quotes": context["dropped_quotes"],
+        "cap_hit": cap_hit,
+        "reconciled": bool(reconcile),
+        "emailed": emailed,
+        "reported_no_transcript": gaps,
+        "decisions": [{k: o.get(k) for k in
+                       ("symbol", "period", "status", "findings", "dropped",
+                        "reason", "zone_known")} for o in outcomes],
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_status(status)
+    _set_progress(phase="idle")
+    return status
+
+
+def run_daily(dry_run=None, days=None, limit=None, backlog=False, force=False,
+              send_email=True, reconcile=None) -> dict:
+    """Public entry for the daily scan. Acquires both locks, runs, releases.
+
+    dry_run defaults to TRUE when no FMP key is present and FALSE otherwise; the
+    caller can force either. A dry run writes NO state at all."""
+    if not cns_fmp.fmp_enabled():
+        logger.warning("[cns] FMP_API_KEY not set -- CNS screen disabled")
+        return {"status": "disabled", "reason": "FMP_API_KEY not set"}
+    if dry_run is None:
+        dry_run = False
+    if force:
+        logger.warning("[cns] force=1 -- clearing any existing run lock")
+        _release_run_lock()
+    if not _acquire_run_lock():
+        logger.warning("[cns] skipping -- another run is in progress (cross-process)")
+        return {"status": "skipped", "reason": "run already in progress"}
+    if not _cns_lock.acquire(blocking=False):
+        logger.warning("[cns] skipping -- another run is in progress (in-process)")
+        _release_run_lock()
+        return {"status": "skipped", "reason": "run already in progress"}
+    stop = _threading.Event()
+
+    def _heartbeat():
+        while not stop.wait(max(60, CNS_LOCK_MAX_AGE // 4)):
+            _touch_run_lock()
+
+    beat = _threading.Thread(target=_heartbeat, daemon=True)
+    beat.start()
+    try:
+        return _run_daily_inner(dry_run, days, limit, backlog, send_email, reconcile)
+    except Exception as e:
+        import traceback as _tb
+        trace = _tb.format_exc()
+        logger.error(f"[cns] run failed: {trace}")
+        write_status({"status": "error", "error": str(e), "traceback": trace,
+                      "finished_at": datetime.now(timezone.utc).isoformat()})
+        raise
+    finally:
+        stop.set()
+        beat.join(timeout=2)
+        _cns_lock.release()
+        _release_run_lock()
+
+
+_SEASON_PROMPT = """You are writing the quarterly CNS competitive-intelligence
+wrap-up for a CNS-focused biotech venture studio. Its lead program is a
+non-hallucinogenic 5-HT2A/2C agonist for apathy in Parkinson's disease; it also
+works on serotonergic mechanisms in Prader-Willi syndrome.
+
+Below are the verified findings from every large-pharma earnings call screened
+this season. Every quote was checked verbatim against its transcript.
+
+Write the wrap-up in HTML fragments (h3, p, ul, li only -- no html/head/body
+tags, no styling). Cover, in this order:
+1. BD appetite across pharma: who signalled hunger for external CNS assets, how
+   explicitly, and in prepared remarks or under analyst pressure.
+2. Competitor pipeline moves by area: Parkinson's and synucleinopathies,
+   neuropsychiatry, rare neuro, and the serotonergic and muscarinic mechanisms.
+3. Therapeutic-area posture: who is building a neuroscience franchise and who is
+   stepping back.
+4. Watchlist companies one by one, briefly, and only where there is something to
+   say.
+5. The read-through for this studio: what to act on, and what to watch.
+
+Ground every claim in the findings given. Do not speculate beyond them, and do
+not invent quotes. Where the season was quiet on a topic, say so plainly."""
+
+
+def _season_narrative(payload: str, label: str, model: str = None) -> str:
+    """-> the HTML narrative for the season wrap-up.
+
+    Streamed because the output is long. Separate from the per-transcript
+    screener: this one reasons over merged findings and must see all of them at
+    once, so it is deliberately not chunked."""
+    client = _anthropic_client()
+    with client.messages.stream(
+        model=model or CNS_SEASON_MODEL,
+        max_tokens=CNS_SEASON_MAX_TOKENS,
+        system=_SEASON_PROMPT,
+        messages=[{"role": "user",
+                   "content": f"Season: {label}\n\nVerified findings as JSON:\n{payload}"}],
+    ) as stream:
+        response = stream.get_final_message()
+    if getattr(response, "stop_reason", None) == "refusal":
+        raise CnsScreenError("season narrative refused (stop_reason=refusal)")
+    return _response_text(response)
+
+
+def run_season(label=None, start=None, end=None, dry_run=False,
+               send_email=True) -> dict:
+    """Build and email the season wrap-up from STORED findings.
+
+    Reads only. It never re-screens and never touches the ledger, so it is safe
+    to re-run for comparison -- the same property the pulse replay has."""
+    if label:
+        start_iso, end_iso = season_window(label)
+    elif start and end:
+        start_iso, end_iso, label = start, end, f"{start} to {end}"
+    else:
+        current = season_for_date(date.today())
+        if not current:
+            return {"status": "skipped",
+                    "reason": f"{date.today().isoformat()} falls between seasons"}
+        label, start_iso, end_iso = current
+
+    store = load_findings()
+    in_window = {
+        key: entry for key, entry in store.items()
+        if start_iso <= (entry.get("call_date") or "") <= end_iso
+    }
+    if not in_window:
+        logger.info(f"[cns] no stored findings in {label} ({start_iso}..{end_iso})")
+        return {"status": "empty", "season": label, "companies": 0}
+
+    payload = json.dumps(
+        sorted(in_window.values(), key=lambda e: e.get("symbol") or ""),
+        indent=1, default=str)
+    try:
+        narrative = _season_narrative(payload, label)
+    except Exception as e:
+        logger.error(f"[cns] season narrative failed: {e}", exc_info=True)
+        return {"status": "error", "season": label, "error": str(e)}
+
+    total_findings = sum(len(e.get("findings") or []) for e in in_window.values())
+    html = (
+        '<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;'
+        'font-size:14px;color:#1a202c;max-width:820px;">'
+        f'<p style="color:#4a5568;">{_esc(label)} &middot; call dates '
+        f'{_esc(start_iso)} to {_esc(end_iso)} &middot; {len(in_window)} companies '
+        f'&middot; {total_findings} verified findings</p>'
+        + narrative
+        + '<hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0 8px;">'
+        '<p style="color:#a0aec0;font-size:12px;">Sara &middot; CNS earnings screen'
+        '</p></div>')
+
+    emailed = False
+    if send_email:
+        prefix = "[DRY] " if dry_run else ""
+        emailed = send_digest(f"{prefix}CNS Earnings Season Wrap: {label}", html)
+    return {"status": "ok", "season": label, "window": f"{start_iso}..{end_iso}",
+            "companies": len(in_window), "findings": total_findings,
+            "emailed": emailed, "dry_run": dry_run}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="CNS earnings screen (Sara module)")
+    parser.add_argument("--days", type=int, default=None, help="lookback window in days")
+    parser.add_argument("--limit", type=int, default=None, help="cap transcripts this run")
+    parser.add_argument("--live", action="store_true", help="write state and send mail")
+    parser.add_argument("--backlog", action="store_true",
+                        help="reprocess everything in the window, ignoring the ledger")
+    parser.add_argument("--force", action="store_true", help="clear an orphaned run lock")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="force the per-symbol reconciliation sweep")
+    parser.add_argument("--season", default=None, help="season label, e.g. Q2-2026")
+    parser.add_argument("--no-email", action="store_true", help="never send mail")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+    if args.season:
+        result = run_season(label=args.season, dry_run=not args.live,
+                            send_email=not args.no_email)
+    else:
+        result = run_daily(dry_run=not args.live, days=args.days, limit=args.limit,
+                           backlog=args.backlog, force=args.force,
+                           send_email=not args.no_email,
+                           reconcile=True if args.reconcile else None)
+    print(json.dumps(result, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 8: Run the full suite**
+
+Run: `python -m pytest tests/test_cns_screen.py tests/test_cns_fmp.py -v`
+Expected: PASS (60 tests)
+
+- [ ] **Step 9: Verify syntax, lint and commit**
+
+```bash
+python -c "import ast; ast.parse(open('cns_screen.py').read()); print('OK')"
+python -m ruff check cns_screen.py cns_fmp.py
+git add cns_screen.py tests/test_cns_screen.py
+git commit -m "feat(cns): daily orchestration and season wrap-up"
+```
+
+---
+
+### Task 10: Wire into `app.py`, document, deploy, backfill
+
+**Files:**
+- Modify: `app.py` (routes near line 3720, cron near line 5060 and 5160, version at 4030 and 4098)
+- Modify: `requirements.txt`
+- Modify: `CLAUDE.md`
+- Modify: `tests/test_cns_screen.py`
+
+**Interfaces:**
+- Consumes: `cns_screen.run_daily`, `cns_screen.run_season`, `cns_screen.read_status`.
+- Produces: routes `/cns/run`, `/cns/season`, `/cns/status`; scheduler jobs `cns_screen_daily`, `cns_screen_season`.
+
+- [ ] **Step 1: Update `requirements.txt`**
+
+```bash
+python - <<'PY'
+p = "requirements.txt"
+s = open(p, encoding="utf-8").read()
+# output_config.format (structured outputs) needs a modern SDK; 0.116.0 is the
+# version verified against ZEA's working structured-output call.
+s = s.replace("anthropic>=0.43.0", "anthropic>=0.116.0")
+if "PyYAML" not in s:
+    s = s.rstrip("\n") + "\nPyYAML==6.0.2\n"
+open(p, "w", encoding="utf-8", newline="").write(s)
+print(s)
+PY
+```
+
+Confirm the output shows `anthropic>=0.116.0` and a `PyYAML==6.0.2` line.
+
+- [ ] **Step 2: Write the failing route tests**
+
+Append to `tests/test_cns_screen.py`:
+
+```python
+def test_cns_status_route(flask_client, monkeypatch):
+    import app as app_module
+    monkeypatch.setattr(cns_screen, "read_status",
+                        lambda: {"status": "ok", "screened": 4})
+    resp = flask_client.get("/cns/status")
+    assert resp.status_code == 200
+    assert resp.get_json()["screened"] == 4
+
+
+def test_cns_run_route_sync_returns_the_result(flask_client, monkeypatch):
+    monkeypatch.setattr(cns_screen, "run_daily",
+                        lambda **kw: {"status": "ok", "processed": 2, "kw": sorted(kw)})
+    resp = flask_client.get("/cns/run?sync=1&dry_run=1")
+    assert resp.status_code == 200
+    assert resp.get_json()["processed"] == 2
+
+
+def test_cns_run_route_409s_while_a_trigger_is_held(flask_client):
+    import app as app_module
+    assert app_module._cns_trigger_lock.acquire(blocking=False)
+    try:
+        assert flask_client.get("/cns/run").status_code == 409
+    finally:
+        app_module._cns_trigger_lock.release()
+
+
+def test_cns_run_route_reports_a_sync_failure(flask_client, monkeypatch):
+    def _boom(**kw):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(cns_screen, "run_daily", _boom)
+    resp = flask_client.get("/cns/run?sync=1")
+    assert resp.status_code == 500
+    assert "kaboom" in resp.get_json()["error"]
+
+
+def test_cns_season_route_passes_the_label(flask_client, monkeypatch):
+    seen = {}
+
+    def _season(**kw):
+        seen.update(kw)
+        return {"status": "ok", "season": kw.get("label")}
+
+    monkeypatch.setattr(cns_screen, "run_season", _season)
+    resp = flask_client.get("/cns/season?sync=1&season=Q2-2026&dry_run=1")
+    assert resp.status_code == 200
+    assert seen["label"] == "Q2-2026"
+    assert seen["dry_run"] is True
+
+
+def test_cns_scheduler_jobs_are_registered_with_the_right_triggers():
+    """The season job must fire on the 15th of the four reporting months, in the
+    same timezone the module computes its windows in."""
+    import app as app_module
+    source = open("app.py", encoding="utf-8").read()
+    assert 'id="cns_screen_daily"' in source
+    assert 'id="cns_screen_season"' in source
+    assert 'month="3,6,9,12"' in source
+    assert source.count('timezone="Asia/Jerusalem"') >= 4
+```
+
+- [ ] **Step 3: Run to verify failure**
+
+Run: `python -m pytest tests/test_cns_screen.py -k "cns_status_route or cns_run_route or cns_season_route or scheduler_jobs" -v`
+Expected: FAIL with 404s and `AttributeError: module 'app' has no attribute '_cns_trigger_lock'`
+
+- [ ] **Step 4: Add the routes to `app.py`, preserving CRLF**
+
+Insert immediately after the `/fyi/status` handler (which ends at line 3719 with `return jsonify(fyi_triage.read_status())`) and before `_xte_trigger_lock = _threading.Lock()`.
+
+```bash
+python - <<'PY'
+import io
+path = "app.py"
+with open(path, "rb") as handle:
+    data = handle.read()
+
+anchor = b"_xte_trigger_lock = _threading.Lock()\r\n"
+assert data.count(anchor) == 1, f"anchor found {data.count(anchor)} times"
+
+block = '''# ======================================================================
+#  CNS EARNINGS SCREEN -- CNS / rare-neuro competitive intelligence
+#  Spec: docs/superpowers/specs/2026-09-09-cns-earnings-screen-design.md
+#  Modules imported lazily; disabled entirely when FMP_API_KEY is unset.
+#  ONE trigger lock gates both routes AND both cron jobs, because the daily
+#  scan and the season wrap-up share cns_ledger.json / cns_findings.json.
+# ======================================================================
+
+_cns_trigger_lock = _threading.Lock()
+
+
+@app.route("/cns/run", methods=["GET", "POST"])
+def cns_run():
+    """Manually trigger the CNS earnings screen (cns_screen module).
+    ?dry_run=1  -- classify and render but write no state and send no mail.
+    ?days=N     -- lookback window in days (default CNS_LOOKBACK_DAYS, 3).
+    ?limit=N    -- cap transcripts this run (default CNS_MAX_TRANSCRIPTS_PER_RUN).
+    ?backlog=1  -- reprocess everything in the window, ignoring the ledger.
+    ?force=1    -- clear an orphaned run lock first (operator override).
+    ?reconcile=1 -- force the per-symbol reconciliation sweep.
+    ?sync=true  -- run inline and return the result/traceback as JSON."""
+    import traceback as _cns_tb
+    days = request.args.get("days", type=int)
+    limit = request.args.get("limit", type=int)
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    backlog = request.args.get("backlog", "").lower() in ("true", "1", "yes")
+    force = request.args.get("force", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
+    reconcile = True if request.args.get("reconcile", "").lower() in ("true", "1", "yes") else None
+    if not _cns_trigger_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import cns_screen
+            return jsonify(cns_screen.run_daily(
+                dry_run=dry_run, days=days, limit=limit, backlog=backlog,
+                force=force, reconcile=reconcile))
+        except Exception as e:
+            logger.error(f"[cns] Sync run failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _cns_tb.format_exc()}), 500
+        finally:
+            _cns_trigger_lock.release()
+
+    def _run():
+        try:
+            import cns_screen
+            cns_screen.run_daily(dry_run=dry_run, days=days, limit=limit,
+                                 backlog=backlog, force=force, reconcile=reconcile)
+            logger.info("[cns] Manual run complete")
+        except Exception as e:
+            logger.error(f"[cns] Manual run failed: {e}", exc_info=True)
+        finally:
+            _cns_trigger_lock.release()
+
+    logger.info(f"[cns] Trigger: days={days} limit={limit} dry_run={dry_run} "
+                f"backlog={backlog} -- launching background thread")
+    thread = _threading.Thread(target=_run, daemon=True)
+    try:
+        thread.start()
+    except Exception as e:
+        _cns_trigger_lock.release()
+        logger.error(f"[cns] Failed to start run thread: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": f"could not start run: {e}"}), 500
+    return jsonify({"status": "started", "days": days, "limit": limit,
+                    "dry_run": dry_run, "backlog": backlog})
+
+
+@app.route("/cns/season", methods=["GET", "POST"])
+def cns_season():
+    """Build the CNS earnings season wrap-up from STORED findings.
+    ?season=Q2-2026 -- season label; absent uses the season containing today.
+    ?start=&end=    -- explicit call-date window instead of a label.
+    ?dry_run=1      -- subject prefixed [DRY]; the wrap-up never mutates state.
+    ?sync=true      -- run inline and return the result as JSON."""
+    import traceback as _cns_tb
+    label = request.args.get("season")
+    start = request.args.get("start")
+    end = request.args.get("end")
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
+    if not _cns_trigger_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import cns_screen
+            return jsonify(cns_screen.run_season(
+                label=label, start=start, end=end, dry_run=dry_run))
+        except Exception as e:
+            logger.error(f"[cns] Season run failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _cns_tb.format_exc()}), 500
+        finally:
+            _cns_trigger_lock.release()
+
+    def _run():
+        try:
+            import cns_screen
+            cns_screen.run_season(label=label, start=start, end=end, dry_run=dry_run)
+            logger.info("[cns] Season wrap-up complete")
+        except Exception as e:
+            logger.error(f"[cns] Season wrap-up failed: {e}", exc_info=True)
+        finally:
+            _cns_trigger_lock.release()
+
+    thread = _threading.Thread(target=_run, daemon=True)
+    try:
+        thread.start()
+    except Exception as e:
+        _cns_trigger_lock.release()
+        return jsonify({"status": "error", "error": f"could not start run: {e}"}), 500
+    return jsonify({"status": "started", "season": label, "dry_run": dry_run})
+
+
+@app.route("/cns/status", methods=["GET"])
+def cns_status():
+    """Last CNS screen run outcome: per-company decisions, dropped-quote count,
+    coverage gaps, live heartbeat, and whether FMP is configured."""
+    import cns_screen
+    return jsonify(cns_screen.read_status())
+
+
+'''
+block_crlf = block.replace("\\n", "\\r\\n").encode()
+data = data.replace(anchor, block_crlf + anchor, 1)
+with open(path, "wb") as handle:
+    handle.write(data)
+print("inserted", len(block_crlf), "bytes")
+PY
+python -c "import ast; ast.parse(open('app.py',encoding='utf-8').read()); print('AST OK')"
+git diff --stat app.py
+```
+
+`git diff --stat app.py` must show roughly 140 insertions and 0 deletions. If it shows a full-file rewrite, the CRLF conversion failed -- `git checkout app.py` and retry.
+
+- [ ] **Step 5: Add the two cron job functions**
+
+Insert after `fyi_daily_run` (ends line 5058 with `logger.error(f"[fyi] Failed: {e}", exc_info=True)`) and before `def x_transcribe_email_run():`, using the same binary-CRLF technique with anchor `b"def x_transcribe_email_run():\r\n"`:
+
+```python
+def cns_daily_run():
+    """Scheduled daily CNS earnings screen (cns_screen module).
+
+    No-ops when FMP_API_KEY is unset. Shares _cns_trigger_lock with the manual
+    routes and with the season job so no two of them can touch the shared
+    ledger at once."""
+    if not _cns_trigger_lock.acquire(blocking=False):
+        logger.warning("[cns] Skipped scheduled run -- already running")
+        return
+    try:
+        import cns_screen
+        result = cns_screen.run_daily()
+        logger.info(f"[cns] Daily screen complete: {result.get('status')} "
+                    f"processed={result.get('processed')}")
+    except Exception as e:
+        logger.error(f"[cns] Daily screen failed: {e}", exc_info=True)
+    finally:
+        _cns_trigger_lock.release()
+
+
+def cns_season_run():
+    """Scheduled CNS earnings season wrap-up (15 Mar / Jun / Sep / Dec).
+
+    Reads stored findings only -- it never re-screens and never mutates the
+    ledger, so a re-run is safe."""
+    if not _cns_trigger_lock.acquire(blocking=False):
+        logger.warning("[cns] Skipped scheduled season wrap-up -- already running")
+        return
+    try:
+        import cns_screen
+        result = cns_screen.run_season()
+        logger.info(f"[cns] Season wrap-up complete: {result.get('status')} "
+                    f"season={result.get('season')}")
+    except Exception as e:
+        logger.error(f"[cns] Season wrap-up failed: {e}", exc_info=True)
+    finally:
+        _cns_trigger_lock.release()
+```
+
+- [ ] **Step 6: Register both jobs in the scheduler**
+
+Insert into the `add_job` block, after the `fyi_triage_daily` registration (ends line 5159) and before the X-transcribe comment, with anchor `b"    # X-transcribe-email: scan Sara's mailbox every 15min"`:
+
+```python
+    # CNS earnings screen: daily 07:00 Asia/Jerusalem. tz-aware cron so DST is
+    # handled automatically. No-ops when FMP_API_KEY is unset, so it is safe to
+    # register unconditionally.
+    _scheduler.add_job(
+        cns_daily_run,
+        trigger="cron",
+        hour=7,
+        minute=0,
+        timezone="Asia/Jerusalem",
+        id="cns_screen_daily",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    # Season wrap-up on the 15th of March, June, September and December -- the
+    # closing day of each reporting season's call-date window (see SEASONS in
+    # cns_screen.py). Same timezone the module computes its windows in.
+    _scheduler.add_job(
+        cns_season_run,
+        trigger="cron",
+        month="3,6,9,12",
+        day=15,
+        hour=8,
+        minute=0,
+        timezone="Asia/Jerusalem",
+        id="cns_screen_season",
+        replace_existing=True,
+        misfire_grace_time=7200,
+    )
+```
+
+- [ ] **Step 7: Bump the version string in both places**
+
+```bash
+python - <<'PY'
+path = "app.py"
+with open(path, "rb") as handle:
+    data = handle.read()
+old, new = b'"2.34.0-prompt-integrity"', b'"2.35.0-cns-earnings-screen"'
+count = data.count(old)
+assert count == 2, f"expected 2 version literals, found {count}"
+data = data.replace(old, new)
+data = data.replace(b'"deployed": "2026-09-02"', b'"deployed": "2026-09-09"', 1)
+with open(path, "wb") as handle:
+    handle.write(data)
+print("bumped both version literals")
+PY
+python -c "import ast; ast.parse(open('app.py',encoding='utf-8').read()); print('AST OK')"
+grep -c "2.35.0-cns-earnings-screen" app.py
+```
+
+Expected: `AST OK` then `2`.
+
+- [ ] **Step 8: Run the whole suite**
+
+Run: `python -m pytest tests/ -q`
+Expected: every test passes, including the pre-existing suite. If an existing test broke, the insertion damaged `app.py` -- inspect `git diff app.py` rather than editing the test.
+
+- [ ] **Step 9: Update CLAUDE.md, preserving CRLF**
+
+Add a module section after the followup-engine section, an Architecture Notes bullet, env vars, the three endpoints in the Key Endpoints table, and these Common Failure Modes rows:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Every CNS finding is labelled `QA`, or every one `PREPARED_REMARKS` | Zone detection matched the operator's OPENING boilerplate. BOTH transcript formats say "question-and-answer" and "Q&A" in the opening: AbbVie's only occurrence is char 176 of 56,663 (0.3%), Biogen's at 354 and 1,606 | By design the detector only accepts candidates inside `CNS_ZONE_BAND` (0.15-0.85 of the document). If this recurs, a new handoff phrasing is needed in `HANDOFF_PATTERNS` -- add it, do not widen the band |
+| A CNS transcript logs `zone UNKNOWN` | No handoff phrase landed in the position band. Roche's real transcript matched nothing until "open the Q&A" was added | Expected and honest. The model's own zone label stands. Add the phrasing to `HANDOFF_PATTERNS` with a fixture if it is a common format |
+| A company is listed as `reported, transcript not available` for days | FMP publishes about 4 hours after a call, but a listed period can return EMPTY content (AXSM FY2026Q2: dates endpoint lists 2026-08-10, fetch returns a well-formed row with 0 chars) or bare JSON `null` | Expected while FMP backfills. The period stays retryable until `CNS_MAX_FETCH_ATTEMPTS`. It is NOT recorded as screened, so nothing is lost |
+| Roche, Otsuka, Lundbeck, UCB, Eisai or Astellas missing from the screen | The FMP industry screener returns NONE of them -- their US listings are ADRs with no industry classification or market cap. Verified live 2026-09-09 | They come in via `force_include` in `cns_screen_universe.yaml`. Otsuka has no transcripts under any ticker and is `entity_only` on purpose |
+| A generic BD passage with no neuro content shows up as a finding | The BD gate needs a domain term within `CNS_GATE_WINDOW` (600) characters. The keyword YAML says "same paragraph", but FMP transcripts have NO paragraphs (format A is one 56K-char line; format B turns reach 25K chars), so proximity replaces it | Lower `CNS_GATE_WINDOW`. Do not switch to speaker turns as the unit -- a 25K-char turn is not a gate |
+| A new `ambiguity_rules` entry in the keyword YAML has no effect | That YAML block is human-readable PROSE. Each rule is implemented explicitly in `_gate_ok` and asserted by a test | Add the rule to `_gate_ok` and a test alongside the YAML edit |
+| The same call is screened twice | Two endpoints reported its period in different shapes and the ledger key diverged | All three shapes must go through `cns_fmp.normalize_period` -> `period_key`. Never build a key by hand |
+| CNS screen never runs, no errors | `FMP_API_KEY` unset. The module disables itself by design rather than crashing the scheduler | Set `FMP_API_KEY` on Railway. `/cns/status` reports `fmp_enabled` |
+
+- [ ] **Step 10: Commit and deploy**
+
+```bash
+python -c "import ast; ast.parse(open('app.py',encoding='utf-8').read()); print('OK')"
+python -m pytest tests/ -q
+ts=$(date +%Y%m%d%H%M%S)
+echo -n "$ts" > CACHEBUST
+git add app.py requirements.txt CLAUDE.md CACHEBUST cns_screen.py cns_fmp.py \
+        cns_screen_keywords.yaml cns_screen_prompt.md cns_screen_universe.yaml \
+        tests/test_cns_screen.py tests/test_cns_fmp.py tests/fixtures/cns
+git commit -m "deploy: 2.35.0-cns-earnings-screen [$ts]"
+git diff --cached --stat
+git push
+```
+
+`git diff --cached --stat` must NOT show `app.py` as a full-file rewrite. Then poll until live, exiting on the target version and capped at 12 iterations:
+
+```bash
+for i in $(seq 1 12); do
+  sleep 20
+  v=$(curl -s https://meeting-pipeline-production.up.railway.app/version)
+  echo "$i: $v"
+  case "$v" in *2.35.0-cns-earnings-screen*) echo "LIVE"; break;; esac
+done
+```
+
+- [ ] **Step 11: Set `FMP_API_KEY` on Railway**
+
+Ken must add it; the key is in his FMP dashboard and currently exists only in `~/zirmania-office/.worktrees/phase5-zea/.env`.
+
+```bash
+railway link -p refreshing-gratitude
+railway variables -s meeting-pipeline --set "FMP_API_KEY=<key>"
+railway variables -s meeting-pipeline --json | python -c "import json,sys; print('FMP_API_KEY' in json.load(sys.stdin))"
+```
+
+Expected: `True`. Do not echo the value.
+
+- [ ] **Step 12: Dry-run against the live universe**
+
+```bash
+curl -s "https://meeting-pipeline-production.up.railway.app/cns/run?sync=1&dry_run=1&days=7&limit=3" | python -m json.tool
+```
+
+Check: `universe_size` is roughly 240, `status` is `ok`, and `decisions` shows real symbols. Then read `/cns/status` and confirm `fmp_enabled` is true.
+
+- [ ] **Step 13: Q2 2026 backfill and the season wrap-up**
+
+The window is the whole Q2 season, so run it in bounded batches and repeat until `processed` is 0.
+
+```bash
+for batch in 1 2 3 4 5 6; do
+  echo "--- batch $batch"
+  curl -s "https://meeting-pipeline-production.up.railway.app/cns/run?sync=1&days=75&limit=50" \
+    | python -c "import json,sys; d=json.load(sys.stdin); print(d.get('status'), 'processed', d.get('processed'), 'with_findings', d.get('with_findings'), 'dropped', d.get('dropped_quotes'))"
+done
+curl -s "https://meeting-pipeline-production.up.railway.app/cns/season?sync=1&season=Q2-2026" | python -m json.tool
+```
+
+This is also the calibration pass Ken's prompt asks for. Review the first digest with him against these questions, and record the answers in `CLAUDE.md` rather than changing code reflexively:
+
+1. Did anything obviously irrelevant get a HIGH? If so, tighten the priority rules in `cns_screen_prompt.md`, not the code.
+2. Did the `unconfirmed` section catch a real miss? If so, add the passage to the prompt as a worked example before touching the vocabulary lists, exactly as the prompt's usage notes prescribe.
+3. Was `dropped_quotes` above zero? A nonzero count is the verification layer working. A large count means the model is composing rather than copying, which is a prompt problem.
+
+---
+
+## Self-Review
+
+**Spec coverage.** Every spec section maps to a task: the FMP facts and gotchas to Task 1; the data files to Task 2; proximity gating to Task 3; zone detection to Task 4; the Claude usage section to Task 5; verification and the recall check to Task 6; the state-file list and safety properties to Task 7; seasons, the digest contents list and cost to Task 8; the daily flow and season wrap-up to Task 9; configuration, endpoints, cron and the first run to Task 10. The out-of-scope items stay out.
+
+**Placeholders.** None. Every code step carries the actual code; every command carries its expected output; the two `app.py` insertions name their exact byte anchors and assert the anchor count before writing.
+
+**Type consistency.** `period_key` is the single ledger-key producer, used identically in Tasks 1, 7 and 9. Discovery dicts use `{symbol, fiscal_year, quarter, date}` everywhere. `verify_findings` returns `(kept, dropped)` in Task 6 and is consumed with that shape in Task 9. `fetch_transcript` returns `(content, call_date_or_reason)` in Task 1 and is unpacked that way in Task 9. `prefilter` returns `PrefilterResult` in Task 3, consumed by `prepare_transcript` in Task 4 and `unconfirmed_high_signal` in Task 6. `render_digest_html` takes exactly the context dict `_run_daily_inner` builds.
+
+**Known limitation, deliberate.** The keyword YAML's `ambiguity_rules` block is prose, so `_gate_ok` implements each rule in code. Adding a rule to the YAML does not auto-apply it. This is recorded in the module docstring, in `_gate_ok`'s comment, and as a CLAUDE.md failure-mode row.
