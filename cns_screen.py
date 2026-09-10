@@ -1447,8 +1447,18 @@ def _run_daily_inner(dry_run: bool, days, limit, backlog: bool,
         {"symbol": symbol, "date": call_date}
         for symbol, call_date in sorted(reported.items())
         if call_date <= grace_cutoff and symbol not in have
+        # A terminal ledger entry only covers THIS call if its own recorded
+        # date is on or after the reported call date -- an old terminal
+        # period (e.g. last quarter's screen) must never suppress a newer
+        # call that has no transcript yet. A dateless entry tells us nothing
+        # about which call it covers, so it suppresses nothing (defensive).
+        # Erring toward reporting is deliberate: a false gap is one harmless
+        # line in an email, a false suppression is a silently missing
+        # transcript -- the exact failure this section exists to catch.
         and not any(
             (ledger.get(k) or {}).get("status") in _TERMINAL_STATUSES
+            and (ledger.get(k) or {}).get("date")
+            and (ledger.get(k) or {}).get("date") >= call_date
             for k in ledger if k.startswith(f"{symbol}:"))
     ]
 

@@ -861,6 +861,40 @@ def test_run_daily_reports_reported_but_missing_beyond_the_grace_period(cns_stat
     assert any(g["symbol"] == "SNY" for g in result["reported_no_transcript"])
 
 
+def test_run_daily_reports_a_new_quarter_gap_despite_an_old_terminal_period(cns_state, monkeypatch):
+    """Regression guard: a symbol screened successfully in an EARLIER quarter
+    must not suppress a genuinely missing LATER quarter forever. Ledger holds
+    ABBV:2026:Q1 screened on 2026-05-01; the newly reported call is 2026-07-31
+    with no transcript -- that must surface as a gap."""
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    ledger = {}
+    cns_screen.record_ledger(ledger, "ABBV:2026:Q1", "screened", date="2026-05-01")
+    cns_screen.save_ledger(ledger)
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {"ABBV": {"name": "AbbVie"}})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [])
+    monkeypatch.setattr(cns_fmp, "reported_symbols",
+                        lambda *a, **k: {"ABBV": "2026-07-31"})
+    result = cns_screen.run_daily(dry_run=True, send_email=False)
+    assert any(g["symbol"] == "ABBV" for g in result["reported_no_transcript"])
+
+
+def test_run_daily_suppresses_a_gap_covered_by_a_same_or_later_terminal_period(cns_state, monkeypatch):
+    """A terminal ledger entry dated ON or AFTER the reported call date DOES
+    cover that call, so it must still suppress the gap."""
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    ledger = {}
+    cns_screen.record_ledger(ledger, "ABBV:2026:Q2", "screened", date="2026-07-31")
+    cns_screen.save_ledger(ledger)
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {"ABBV": {"name": "AbbVie"}})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [])
+    monkeypatch.setattr(cns_fmp, "reported_symbols",
+                        lambda *a, **k: {"ABBV": "2026-07-31"})
+    result = cns_screen.run_daily(dry_run=True, send_email=False)
+    assert not any(g["symbol"] == "ABBV" for g in result["reported_no_transcript"])
+
+
 def test_run_season_reads_stored_findings_and_never_rescreens(cns_state, monkeypatch):
     cns_screen.save_findings({"ABBV:2026:Q2": {
         "symbol": "ABBV", "company": "AbbVie", "period": "Q2 FY2026",
