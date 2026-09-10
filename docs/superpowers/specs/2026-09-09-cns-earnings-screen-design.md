@@ -251,10 +251,7 @@ In order:
    configuration with grace >= lookback. Discovery drives fetches and stays
    narrow; the calendar read is one cheap call and stays wide.
 5. **Screened with errors** -- per-transcript `failed`, `gap` and `truncated`
-   outcomes, with the reason. A failure is in neither the findings list nor the
-   nothing-relevant line, so without this section the only way it reached a
-   reader was the coverage-gap list above, which would mislabel it "transcript
-   not available" when the transcript was available and the SCREEN failed.
+   outcomes, with the reason. Outcomes here are: failed (screen error), gap (no transcript), or truncated (too long). A `failed` or `truncated` outcome is not in findings or nothing-relevant, so this section is the only path to the reader. A `gap` outcome can appear in both sections (calendar-driven and non-terminal), which is acceptable -- both statements are true, and this section adds the specific failure reason. The overlap is rare because a discovered gap usually has a call date within the grace period.
 6. **Unconfirmed high-signal keyword hits** -- paragraphs matching the YAML's
    `high_signal_rare_terms` that the model did NOT report. A model miss on
    apathy, Prader-Willi, or 5-HT2C is the single most expensive failure this
@@ -278,7 +275,7 @@ season job shares the single `_cns_trigger_lock` with the daily 07:00 scan
 peak-season run of up to `CNS_MAX_TRANSCRIPTS_PER_RUN` Opus transcripts can
 still be running at 08:00. A season job that finds the lock held logs "already
 running" and never retries, so a collision would lose that quarter's wrap-up
-outright. Running on the 16th makes the collision impossible.
+outright. Running on the 16th makes the collision much less likely, because mid-month has few earnings calls and a small pending queue -- but the daily job runs that morning too and shares the lock, so a long run can still cause the wrap-up to skip.
 
 One Opus 5 call reads every stored finding in the window and writes a narrative:
 BD appetite across pharma, pipeline moves by area, TA-posture shifts, watchlist

@@ -5218,7 +5218,7 @@ def cns_season_run():
     daily run of up to CNS_MAX_TRANSCRIPTS_PER_RUN Opus transcripts can still be
     running at 08:00. On a collision this job logs "already running" and NEVER
     retries, which would lose that quarter's wrap-up outright -- running the day
-    after the window closes makes that collision impossible."""
+    after the window closes makes the collision much less likely, because the 16th is mid-month with a small pending queue -- but the daily job runs that morning too and shares the lock, so a long run can still cause the wrap-up to skip."""
     if not _cns_trigger_lock.acquire(blocking=False):
         logger.warning("[cns] Skipped scheduled season wrap-up -- already running")
         return
