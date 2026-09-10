@@ -484,3 +484,76 @@ def test_unconfirmed_high_signal_stays_quiet_when_the_model_quoted_it():
     res = cns_screen.prefilter(raw)
     kept = [{"quote": "We are studying apathy in Parkinson's disease."}]
     assert cns_screen.unconfirmed_high_signal(res, kept, raw) == []
+
+
+@pytest.fixture
+def cns_state(monkeypatch, tmp_path):
+    """Redirect every CNS state path into a per-test temp dir."""
+    monkeypatch.setattr(cns_screen, "CNS_LEDGER_FILE", str(tmp_path / "ledger.json"))
+    monkeypatch.setattr(cns_screen, "CNS_FINDINGS_FILE", str(tmp_path / "findings.json"))
+    monkeypatch.setattr(cns_screen, "CNS_UNIVERSE_FILE", str(tmp_path / "universe.json"))
+    monkeypatch.setattr(cns_screen, "CNS_LOCK_FILE", str(tmp_path / "lock.json"))
+    monkeypatch.setattr(cns_screen, "CNS_STATUS_FILE", str(tmp_path / "status.json"))
+    monkeypatch.setattr(cns_screen, "CNS_TRANSCRIPT_DIR", str(tmp_path / "transcripts"))
+    return tmp_path
+
+
+def test_transcript_round_trip(cns_state):
+    path = cns_screen.store_transcript("ABBV", 2026, 2, "hello transcript")
+    assert os.path.exists(path)
+    assert cns_screen.read_stored_transcript("ABBV", 2026, 2) == "hello transcript"
+    assert cns_screen.read_stored_transcript("NOPE", 2026, 2) is None
+
+
+def test_ledger_terminal_statuses_are_not_reprocessed(cns_state):
+    ledger = {}
+    key = "ABBV:2026:Q2"
+    assert cns_screen.ledger_should_process(ledger, key) is True
+    cns_screen.record_ledger(ledger, key, "screened", findings_count=2)
+    assert cns_screen.ledger_should_process(ledger, key) is False
+    cns_screen.record_ledger(ledger, "X:2026:Q2", "no_cns_content")
+    assert cns_screen.ledger_should_process(ledger, "X:2026:Q2") is False
+
+
+def test_ledger_gap_retries_until_the_attempt_cap(cns_state, monkeypatch):
+    """AXSM FY2026Q2 returns a listed period with empty content. It must retry
+    so it is picked up once FMP backfills, but not forever."""
+    monkeypatch.setattr(cns_screen, "CNS_MAX_FETCH_ATTEMPTS", 3)
+    ledger, key = {}, "AXSM:2026:Q2"
+    for _ in range(2):
+        cns_screen.record_ledger(ledger, key, "gap", reason="content_too_short:0")
+        assert cns_screen.ledger_should_process(ledger, key) is True
+    cns_screen.record_ledger(ledger, key, "gap", reason="content_too_short:0")
+    assert ledger[key]["attempts"] == 3
+    assert cns_screen.ledger_should_process(ledger, key) is False
+
+
+def test_ledger_save_is_atomic_and_round_trips(cns_state):
+    cns_screen.save_ledger({"ABBV:2026:Q2": {"status": "screened", "attempts": 1}})
+    assert cns_screen.load_ledger()["ABBV:2026:Q2"]["status"] == "screened"
+    # no temp file left behind
+    leftovers = [f for f in os.listdir(cns_state) if f.startswith("ledger.json.")]
+    assert leftovers == []
+
+
+def test_load_ledger_on_corrupt_file_preserves_it(cns_state):
+    with open(cns_screen.CNS_LEDGER_FILE, "w", encoding="utf-8") as handle:
+        handle.write("{not json")
+    ledger = cns_screen.load_ledger()
+    assert ledger == {}
+    preserved = [f for f in os.listdir(cns_state) if "corrupt" in f]
+    assert preserved, "a corrupt ledger must be moved aside, never silently dropped"
+
+
+def test_run_lock_is_exclusive(cns_state):
+    assert cns_screen._acquire_run_lock() is True
+    assert cns_screen._acquire_run_lock() is False, "second acquire must fail"
+    cns_screen._release_run_lock()
+    assert cns_screen._acquire_run_lock() is True
+    cns_screen._release_run_lock()
+
+
+def test_status_round_trip_and_default(cns_state):
+    assert cns_screen.read_status()["status"] == "no_runs"
+    cns_screen.write_status({"status": "ok", "screened": 3})
+    assert cns_screen.read_status()["screened"] == 3

@@ -826,3 +826,242 @@ def unconfirmed_high_signal(prefilter_result, kept, raw_text: str):
         if len(out) >= CNS_MAX_UNCONFIRMED:
             break
     return out
+
+
+# ======================================================================
+#  STATE ON /data
+# ======================================================================
+_CNS_DATA_DIR = (
+    os.environ.get("DATA_DIR")
+    or ("/data" if os.path.isdir("/data") else _HERE)
+)
+CNS_LEDGER_FILE = os.path.join(_CNS_DATA_DIR, "cns_ledger.json")
+CNS_FINDINGS_FILE = os.path.join(_CNS_DATA_DIR, "cns_findings.json")
+CNS_UNIVERSE_FILE = os.path.join(_CNS_DATA_DIR, "cns_universe.json")
+CNS_LOCK_FILE = os.path.join(_CNS_DATA_DIR, "cns_lock.json")
+CNS_STATUS_FILE = os.path.join(_CNS_DATA_DIR, "cns_status.json")
+CNS_TRANSCRIPT_DIR = os.path.join(_CNS_DATA_DIR, "cns_transcripts")
+
+CNS_LOCK_MAX_AGE = int(os.environ.get("CNS_LOCK_MAX_AGE", "7200"))
+CNS_MAX_FETCH_ATTEMPTS = int(os.environ.get("CNS_MAX_FETCH_ATTEMPTS", "4"))
+CNS_UNIVERSE_TTL_DAYS = int(os.environ.get("CNS_UNIVERSE_TTL_DAYS", "7"))
+
+# Terminal: never reprocessed. A "gap" (listed period, empty content) and a
+# "failed" (model or transport error) both RETRY, because FMP backfills content
+# hours-to-days after a call and a transient error should not lose a quarter.
+_TERMINAL_STATUSES = frozenset(("screened", "no_cns_content"))
+
+_cns_lock = _threading.Lock()
+
+
+def _atomic_write_json(path: str, payload):
+    """Write via a sibling temp file + os.replace so a crash mid-write can never
+    leave a truncated state file (followup-engine precedent)."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp = f"{path}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, default=str)
+    os.replace(temp, path)
+
+
+def _load_json_or_preserve(path: str, label: str):
+    """-> parsed dict, or {} when the file is absent.
+
+    A file that EXISTS but cannot be parsed is moved aside rather than degraded
+    to an empty document that the next save would make permanent."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (ValueError, OSError) as e:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        corrupt = f"{path}.corrupt-{stamp}"
+        try:
+            os.replace(path, corrupt)
+            logger.error(f"[cns] {label} unreadable ({e}); preserved as {corrupt}")
+        except OSError as move_error:
+            logger.error(f"[cns] {label} unreadable and could not be preserved: {move_error}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _transcript_path(symbol: str, fiscal_year: int, quarter: int) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", (symbol or "").upper())
+    return os.path.join(CNS_TRANSCRIPT_DIR, f"{safe}-{int(fiscal_year)}Q{int(quarter)}.txt")
+
+
+def store_transcript(symbol: str, fiscal_year: int, quarter: int, content: str) -> str:
+    """Persist the raw transcript and return its path.
+
+    Not incidental: verbatim quote verification, the season wrap-up and any
+    replay all read this back. A screen whose transcript was not stored cannot
+    be verified."""
+    os.makedirs(CNS_TRANSCRIPT_DIR, exist_ok=True)
+    path = _transcript_path(symbol, fiscal_year, quarter)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content or "")
+    return path
+
+
+def read_stored_transcript(symbol: str, fiscal_year: int, quarter: int):
+    try:
+        with open(_transcript_path(symbol, fiscal_year, quarter), encoding="utf-8") as handle:
+            return handle.read()
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def load_ledger() -> dict:
+    return _load_json_or_preserve(CNS_LEDGER_FILE, "ledger")
+
+
+def save_ledger(ledger: dict):
+    _atomic_write_json(CNS_LEDGER_FILE, ledger)
+
+
+def ledger_should_process(ledger: dict, key: str) -> bool:
+    """-> True when this period still needs work."""
+    entry = (ledger or {}).get(key)
+    if not entry:
+        return True
+    if entry.get("status") in _TERMINAL_STATUSES:
+        return False
+    return int(entry.get("attempts") or 0) < CNS_MAX_FETCH_ATTEMPTS
+
+
+def record_ledger(ledger: dict, key: str, status: str, **fields):
+    """Record an outcome. `attempts` only increments for NON-terminal statuses,
+    so a successful screen never consumes a retry budget."""
+    entry = dict((ledger or {}).get(key) or {})
+    entry["status"] = status
+    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if status not in _TERMINAL_STATUSES:
+        entry["attempts"] = int(entry.get("attempts") or 0) + 1
+    else:
+        entry.setdefault("attempts", int(entry.get("attempts") or 0))
+    entry.update(fields)
+    ledger[key] = entry
+
+
+def load_findings() -> dict:
+    return _load_json_or_preserve(CNS_FINDINGS_FILE, "findings store")
+
+
+def save_findings(findings: dict):
+    _atomic_write_json(CNS_FINDINGS_FILE, findings)
+
+
+def load_universe_cache():
+    """-> the cached universe dict, or None when absent or older than the TTL."""
+    cached = _load_json_or_preserve(CNS_UNIVERSE_FILE, "universe cache")
+    if not cached or not isinstance(cached.get("symbols"), dict):
+        return None
+    built = cached.get("built_at") or ""
+    try:
+        age_days = (datetime.now(timezone.utc)
+                    - datetime.fromisoformat(built)).days
+    except (ValueError, TypeError):
+        return None
+    if age_days > CNS_UNIVERSE_TTL_DAYS:
+        logger.info(f"[cns] universe cache is {age_days}d old -- rebuilding")
+        return None
+    return cached["symbols"]
+
+
+def save_universe_cache(symbols: dict):
+    _atomic_write_json(CNS_UNIVERSE_FILE, {
+        "built_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(symbols or {}),
+        "symbols": symbols or {},
+    })
+
+
+def _acquire_run_lock() -> bool:
+    """Atomic cross-process claim via O_CREAT|O_EXCL, mirroring the Weekly Pulse
+    and FYI Triage pattern. Stale locks past CNS_LOCK_MAX_AGE are reclaimed."""
+    try:
+        age = time.time() - os.path.getmtime(CNS_LOCK_FILE)
+        if age > CNS_LOCK_MAX_AGE:
+            logger.warning(f"[cns] removing stale run lock (age {age / 60:.0f}min)")
+            try:
+                os.remove(CNS_LOCK_FILE)
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(CNS_LOCK_FILE)) or ".", exist_ok=True)
+        fd = os.open(CNS_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, json.dumps({
+            "pid": os.getpid(),
+            "started_at": time.time(),
+            "run_id": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"),
+        }).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _release_run_lock():
+    try:
+        os.remove(CNS_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.error(f"[cns] failed to release run lock: {e}")
+
+
+def _touch_run_lock():
+    """Refresh the lock mtime so a long backfill is never reclaimed as orphaned
+    while it is still alive."""
+    try:
+        os.utime(CNS_LOCK_FILE, None)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"[cns] failed to refresh run lock mtime: {e}")
+
+
+_PROGRESS_LOCK = _threading.Lock()
+_CNS_PROGRESS = {"phase": "idle", "done": 0, "total": 0, "last": "",
+                 "run_id": None, "updated_at": None}
+
+
+def _set_progress(**kw):
+    with _PROGRESS_LOCK:
+        _CNS_PROGRESS.update(kw)
+        _CNS_PROGRESS["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _bump_progress(last: str):
+    with _PROGRESS_LOCK:
+        _CNS_PROGRESS["done"] = _CNS_PROGRESS.get("done", 0) + 1
+        _CNS_PROGRESS["last"] = (last or "")[:120]
+        _CNS_PROGRESS["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def write_status(status: dict):
+    try:
+        _atomic_write_json(CNS_STATUS_FILE, status)
+    except OSError as e:
+        logger.warning(f"[cns] could not write status: {e}")
+
+
+def read_status() -> dict:
+    try:
+        with open(CNS_STATUS_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        data = {"status": "no_runs",
+                "message": "No CNS screen run has completed yet."}
+    except (ValueError, OSError) as e:
+        data = {"status": "error", "error": f"could not read status: {e}"}
+    if not isinstance(data, dict):
+        data = {"status": "error", "error": "status file was not an object"}
+    with _PROGRESS_LOCK:
+        data["live_progress"] = dict(_CNS_PROGRESS)
+    data["fmp_enabled"] = cns_fmp.fmp_enabled()
+    return data
