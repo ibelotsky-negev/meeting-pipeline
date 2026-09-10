@@ -1074,3 +1074,179 @@ def read_status() -> dict:
         data["live_progress"] = dict(_CNS_PROGRESS)
     data["fmp_enabled"] = cns_fmp.fmp_enabled()
     return data
+
+
+# ======================================================================
+#  SEASONS
+# ======================================================================
+# Windows are on CALL DATE, never on the fiscal label, because fiscal labels do
+# not align across companies: Takeda's FY2026 Q1 call and AbbVie's FY2026 Q2
+# call both happened in late July 2026, and Axsome's FY2025 Q4 call happened on
+# 2026-02-23. The label names the reporting season; the window selects it.
+SEASONS = (
+    ("Q4", (1, 1), (3, 15)),    # the Q4/annual season, carrying prior-FY Q4 calls
+    ("Q1", (4, 1), (6, 15)),
+    ("Q2", (7, 1), (9, 15)),
+    ("Q3", (10, 1), (12, 15)),
+)
+
+
+def season_for_date(day):
+    """-> (label, start_iso, end_iso) for the reporting season containing `day`,
+    or None when the date falls between seasons.
+
+    Returning None matters: a call on 2026-09-25 belongs to no season, and
+    sweeping it into the nearest one would misattribute it."""
+    for quarter, (start_month, start_day), (end_month, end_day) in SEASONS:
+        start = date(day.year, start_month, start_day)
+        end = date(day.year, end_month, end_day)
+        if start <= day <= end:
+            return f"{quarter}-{day.year}", start.isoformat(), end.isoformat()
+    return None
+
+
+def season_window(label: str):
+    """-> (start_iso, end_iso) for a label like 'Q2-2026'."""
+    match = re.fullmatch(r"\s*(Q[1-4])\s*-\s*(\d{4})\s*", label or "", re.IGNORECASE)
+    if not match:
+        raise ValueError(f"season label {label!r} must look like 'Q2-2026'")
+    quarter = match.group(1).upper()
+    year = int(match.group(2))
+    for candidate, (start_month, start_day), (end_month, end_day) in SEASONS:
+        if candidate == quarter:
+            return (date(year, start_month, start_day).isoformat(),
+                    date(year, end_month, end_day).isoformat())
+    raise ValueError(f"season label {label!r} names no known season")
+
+
+# ======================================================================
+#  DIGEST
+# ======================================================================
+CNS_RECIPIENTS = [
+    r.strip() for r in os.environ.get(
+        "CNS_RECIPIENTS", "bk@negevlabs.com,dan@negevlabs.com").split(",")
+    if r.strip()
+]
+
+_PRIORITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+_PRIORITY_COLOR = {"HIGH": "#9b2c2c", "MEDIUM": "#975a16", "LOW": "#4a5568"}
+
+
+def _esc(value) -> str:
+    """Escape for HTML. Quotes and speaker names are counterparty-authored text
+    landing in an email body, so this is not optional."""
+    return (str("" if value is None else value)
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def render_digest_html(context: dict) -> str:
+    """-> the digest body.
+
+    Section order is deliberate and mirrors the spec: findings by priority, then
+    the companies that produced NOTHING (silence has to be visible or an empty
+    digest is indistinguishable from a broken pipeline), then coverage gaps,
+    then the independent keyword recall check, then the verification drop count.
+    """
+    parts = ['<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,'
+             'sans-serif;font-size:14px;color:#1a202c;max-width:820px;">']
+    if context.get("dry_run"):
+        parts.append('<p style="background:#fefcbf;padding:6px 10px;'
+                     'border-radius:4px;"><strong>DRY RUN</strong> -- nothing '
+                     'was recorded and no state was written.</p>')
+    parts.append(f'<p style="color:#4a5568;">Window {_esc(context.get("window"))} '
+                 f'&middot; {int(context.get("screened") or 0)} transcript(s) screened</p>')
+    if context.get("cap_hit"):
+        parts.append('<p style="color:#9b2c2c;"><strong>Per-run cap reached.</strong> '
+                     'Remaining transcripts will be picked up on the next run.</p>')
+
+    companies = context.get("findings_by_company") or []
+    if companies:
+        for entry in companies:
+            findings = sorted(
+                entry.get("findings") or [],
+                key=lambda f: _PRIORITY_ORDER.get((f.get("priority") or "").upper(), 3))
+            if not findings:
+                continue
+            parts.append(
+                f'<h3 style="margin:18px 0 4px;">{_esc(entry.get("company"))} '
+                f'<span style="color:#718096;font-weight:normal;">'
+                f'({_esc(entry.get("symbol"))}) &middot; {_esc(entry.get("period"))} '
+                f'&middot; {_esc(entry.get("call_date"))}</span></h3>')
+            if entry.get("overall_take"):
+                parts.append(f'<p style="color:#2d3748;margin:2px 0 8px;">'
+                             f'<em>{_esc(entry["overall_take"])}</em></p>')
+            for finding in findings:
+                priority = (finding.get("priority") or "").upper()
+                color = _PRIORITY_COLOR.get(priority, "#4a5568")
+                speaker = finding.get("speaker") or "unattributed"
+                parts.append(
+                    f'<div style="border-left:3px solid {color};padding:2px 0 2px 10px;'
+                    'margin:8px 0;">'
+                    f'<div style="font-size:12px;color:{color};font-weight:600;">'
+                    f'{_esc(priority)} &middot; {_esc(finding.get("signal"))} '
+                    f'&middot; {_esc(finding.get("zone"))} &middot; {_esc(speaker)}</div>'
+                    f'<blockquote style="margin:4px 0;color:#1a202c;">'
+                    f'&ldquo;{_esc(finding.get("quote"))}&rdquo;</blockquote>'
+                    f'<div style="color:#4a5568;">{_esc(finding.get("why_it_matters"))}</div>'
+                    '</div>')
+    else:
+        parts.append('<p style="color:#718096;">No findings met the bar in this window.</p>')
+
+    nothing = context.get("nothing_relevant") or []
+    if nothing:
+        parts.append('<h4 style="margin:18px 0 4px;">Screened, nothing relevant</h4>'
+                     f'<p style="color:#718096;">{_esc(", ".join(nothing))}</p>')
+
+    gaps = context.get("reported_no_transcript") or []
+    if gaps:
+        rows = ", ".join(f'{_esc(g.get("symbol"))} ({_esc(g.get("date"))})' for g in gaps)
+        parts.append('<h4 style="margin:18px 0 4px;">Reported, transcript not available</h4>'
+                     f'<p style="color:#975a16;">{rows}</p>')
+
+    unconfirmed = context.get("unconfirmed") or []
+    if unconfirmed:
+        parts.append('<h4 style="margin:18px 0 4px;">High-signal keyword hits the '
+                     'model did not report</h4>')
+        for item in unconfirmed:
+            parts.append(f'<div style="margin:6px 0;"><strong>{_esc(item.get("term"))}</strong>'
+                         f'<div style="color:#4a5568;">...{_esc(item.get("excerpt"))}...</div></div>')
+
+    dropped = int(context.get("dropped_quotes") or 0)
+    if dropped:
+        parts.append(f'<p style="color:#9b2c2c;margin-top:16px;">{dropped} finding(s) '
+                     'dropped for failing verbatim-quote verification.</p>')
+
+    parts.append('<hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0 8px;">'
+                 '<p style="color:#a0aec0;font-size:12px;">Sara &middot; CNS earnings screen'
+                 '</p></div>')
+    return "".join(parts)
+
+
+def send_digest(subject: str, html: str, recipients=None) -> bool:
+    """-> True when the mail was handed to Graph.
+
+    Uses the same app-only send path as the rest of Sara. Never raises: a mail
+    failure must not lose a run whose ledger is already written."""
+    sender = os.environ.get("BOT_SENDER_EMAIL", "")
+    if not sender:
+        logger.warning("[cns] BOT_SENDER_EMAIL not set -- digest not emailed")
+        return False
+    to = recipients or CNS_RECIPIENTS
+    if not to:
+        logger.warning("[cns] no CNS_RECIPIENTS configured -- digest not emailed")
+        return False
+    try:
+        import email_pipeline_sync as eps
+        eps.graph_post(
+            f"{eps.MS_GRAPH_BASE}/users/{sender}/sendMail",
+            {"message": {
+                "subject": subject,
+                "body": {"contentType": "HTML", "content": html},
+                "toRecipients": [{"emailAddress": {"address": r}} for r in to],
+            }, "saveToSentItems": False})
+    except Exception as e:
+        logger.error(f"[cns] digest send failed: {e}", exc_info=True)
+        return False
+    logger.info(f"[cns] digest emailed to {', '.join(to)}")
+    return True

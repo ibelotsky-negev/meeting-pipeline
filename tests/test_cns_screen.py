@@ -591,3 +591,100 @@ def test_record_ledger_rejects_caller_supplied_attempts_reset(cns_state, monkeyp
     assert cns_screen.ledger_should_process(ledger, key) is False, (
         "with attempts==3 and cap==3, the period must not retry"
     )
+
+
+from datetime import date as _date
+
+
+def test_season_for_date_covers_all_four_windows():
+    assert cns_screen.season_for_date(_date(2026, 2, 10))[0] == "Q4-2026"
+    assert cns_screen.season_for_date(_date(2026, 5, 1))[0] == "Q1-2026"
+    assert cns_screen.season_for_date(_date(2026, 7, 31))[0] == "Q2-2026"
+    assert cns_screen.season_for_date(_date(2026, 11, 5))[0] == "Q3-2026"
+
+
+def test_season_for_date_returns_none_between_seasons():
+    """Late September is outside every window; a call there belongs to no season
+    and must not be silently swept into the wrong one."""
+    assert cns_screen.season_for_date(_date(2026, 9, 25)) is None
+    assert cns_screen.season_for_date(_date(2026, 3, 25)) is None
+
+
+def test_season_window_q2_2026_matches_the_spec():
+    start, end = cns_screen.season_window("Q2-2026")
+    assert (start, end) == ("2026-07-01", "2026-09-15")
+
+
+def test_season_window_rejects_a_bad_label():
+    with pytest.raises(ValueError):
+        cns_screen.season_window("nonsense")
+
+
+def test_axsom_fiscal_q4_call_in_february_lands_in_the_q4_season():
+    """AXSM's FY2025 Q4 call happened 2026-02-23. Season is decided by the CALL
+    DATE, so it belongs to the Q4-2026 reporting season, not to a 2025 window."""
+    label, start, end = cns_screen.season_for_date(_date(2026, 2, 23))
+    assert label == "Q4-2026"
+    assert start <= "2026-02-23" <= end
+
+
+def test_render_digest_html_orders_by_priority_and_shows_silence():
+    context = {
+        "window": "2026-09-08 to 2026-09-09",
+        "findings_by_company": [
+            {"company": "AbbVie", "symbol": "ABBV", "period": "Q2 2026",
+             "call_date": "2026-07-31", "overall_take": "Neuro BD appetite.",
+             "findings": [
+                 {"signal": "BD_INTENT", "priority": "MEDIUM", "zone": "QA",
+                  "speaker": None, "quote": "Adjacent neuro commentary here.",
+                  "why_it_matters": "Context.", "entities": []},
+                 {"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+                  "speaker": "Roopal Thakkar",
+                  "quote": "Significant capacity for BD in neuroscience.",
+                  "why_it_matters": "Names neuro as the target.",
+                  "entities": ["AbbVie"]},
+             ]},
+        ],
+        "nothing_relevant": ["PFE", "MRK"],
+        "reported_no_transcript": [{"symbol": "SNY", "date": "2026-09-05"}],
+        "unconfirmed": [{"term": "apathy", "excerpt": "...apathy in PD..."}],
+        "dropped_quotes": 1,
+        "screened": 3,
+        "cap_hit": False,
+        "dry_run": False,
+    }
+    html = cns_screen.render_digest_html(context)
+    assert html.index("Significant capacity") < html.index("Adjacent neuro"), \
+        "HIGH must render before MEDIUM"
+    assert "PFE" in html and "MRK" in html, "silence must be visible"
+    assert "SNY" in html, "coverage gap must be visible"
+    assert "apathy" in html
+    assert "1" in html and "verification" in html.lower()
+
+
+def test_render_digest_html_handles_a_completely_empty_run():
+    html = cns_screen.render_digest_html({
+        "window": "2026-09-09 to 2026-09-09", "findings_by_company": [],
+        "nothing_relevant": [], "reported_no_transcript": [],
+        "unconfirmed": [], "dropped_quotes": 0, "screened": 0,
+        "cap_hit": False, "dry_run": True,
+    })
+    assert "DRY RUN" in html
+    assert html.strip().startswith("<div")
+
+
+def test_render_digest_html_escapes_transcript_text():
+    """Quotes come from counterparty text and land in HTML."""
+    html = cns_screen.render_digest_html({
+        "window": "w", "findings_by_company": [
+            {"company": "X", "symbol": "X", "period": "Q2 2026",
+             "call_date": "2026-07-31", "overall_take": "",
+             "findings": [{"signal": "BD_INTENT", "priority": "HIGH",
+                           "zone": "QA", "speaker": None,
+                           "quote": "<script>alert(1)</script>",
+                           "why_it_matters": "", "entities": []}]}],
+        "nothing_relevant": [], "reported_no_transcript": [], "unconfirmed": [],
+        "dropped_quotes": 0, "screened": 1, "cap_hit": False, "dry_run": False,
+    })
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
