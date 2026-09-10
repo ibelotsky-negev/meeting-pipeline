@@ -928,3 +928,79 @@ def test_run_season_excludes_calls_outside_the_window(cns_state, monkeypatch):
     monkeypatch.setattr(cns_screen, "_season_narrative", lambda *a, **k: "n")
     result = cns_screen.run_season(label="Q2-2026", dry_run=True, send_email=False)
     assert result["companies"] == 1
+
+
+def test_findings_saved_before_ledger_survives_a_crash(cns_state, monkeypatch):
+    """The save-order guard (Task 9 review finding 1). _run_daily_inner persists
+    both stores after each transcript; if save_ledger ran first and the process
+    died between the two writes, the ledger would already mark the period
+    terminal (never retried) while the verified finding was never flushed to
+    the findings store -- gone permanently. Proof: monkeypatch save_ledger to
+    raise a simulated crash right where the real write would happen, drive one
+    successful screen through run_daily, and assert the ON-DISK findings store
+    already contains the period's entry -- which is only possible if
+    save_findings ran BEFORE save_ledger raised.
+
+    Against the pre-fix code (save_ledger first) this fails: save_ledger raises
+    before save_findings is ever called, so the findings store never touches
+    disk and the assertion below finds nothing."""
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {"ABBV": {"name": "AbbVie"}})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [
+        {"symbol": "ABBV", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}])
+    monkeypatch.setattr(cns_fmp, "reported_symbols", lambda *a, **k: {})
+    body = ("Operator. Welcome. " + "filler words here. " * 200
+            + "We have significant capacity for business development, "
+              "particularly in neuroscience. " + "more filler. " * 200)
+    monkeypatch.setattr(cns_fmp, "fetch_transcript", lambda *a, **k: (body, "2026-07-31"))
+    monkeypatch.setattr(cns_screen, "screen_transcript", lambda *a, **k: {
+        "company": "AbbVie", "period": "Q2 2026", "relevant": True,
+        "overall_take": "Neuro BD appetite.",
+        "findings": [
+            {"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+             "speaker": "X",
+             "quote": "We have significant capacity for business development, "
+                      "particularly in neuroscience.",
+             "why_it_matters": "y", "entities": []},
+        ]})
+
+    def _boom_save_ledger(*a, **k):
+        raise RuntimeError("simulated crash after findings write")
+
+    monkeypatch.setattr(cns_screen, "save_ledger", _boom_save_ledger)
+
+    with pytest.raises(RuntimeError):
+        cns_screen.run_daily(dry_run=False, send_email=False)
+
+    on_disk = cns_screen.load_findings()
+    assert "ABBV:2026:Q2" in on_disk, (
+        "save_findings must run BEFORE save_ledger so a crash between the two "
+        "writes can only ever cause a harmless re-screen, never a lost finding"
+    )
+
+
+def test_process_one_survives_a_store_transcript_failure(cns_state, monkeypatch):
+    """The unguarded store_transcript call (Task 9 review finding 2).
+    process_one's contract is "never raises: a single company's failure must
+    not abort a 240-company run" -- but store_transcript does real file I/O
+    (os.makedirs + open().write) outside any try/except. A disk-full or
+    transient permission error there must be caught exactly like a
+    screen/verify failure, not propagate out of process_one and abort the
+    whole run.
+
+    Against the pre-fix code this fails: the OSError escapes process_one
+    uncaught."""
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: ("Operator. Neuroscience. " + "f. " * 900,
+                                         "2026-07-31"))
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cns_screen, "store_transcript", _boom)
+    ledger, store = {}, {}
+    item = {"symbol": "ABBV", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    outcome = cns_screen.process_one(item, {"ABBV": {}}, ledger, store, False)
+    assert outcome["status"] == "failed"
+    assert cns_screen.ledger_should_process(ledger, "ABBV:2026:Q2") is True

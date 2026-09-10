@@ -1316,42 +1316,52 @@ def process_one(item: dict, universe: dict, ledger: dict,
         return outcome
 
     call_date = meta or item.get("date") or ""
-    if not dry_run:
-        store_transcript(symbol, fiscal_year, quarter, content)
 
-    prepared = prepare_transcript(content)
-    if not prepared.prefilter.screen:
-        outcome["status"] = "no_cns_content"
-        if not dry_run:
-            record_ledger(ledger, key, "no_cns_content", date=call_date)
-        return outcome
-
-    # Screening AND verification are both guarded by the SAME try/except.
-    # process_one's contract is "never raises" (a single company's failure
-    # must not abort a 240-company run); verify_findings/unconfirmed_high_signal
-    # can themselves raise (e.g. on a malformed finding dict from the model),
-    # and an exception there is exactly as fatal to the run as one from
-    # screen_transcript. Keeping them in one guarded region is what makes the
-    # "never raises" promise actually true.
+    # Store, prepare, screen and verify are ALL guarded by the SAME try/except.
+    # process_one's contract is "never raises" (a single company's failure must
+    # not abort a 240-company run). store_transcript does real file I/O
+    # (os.makedirs + open().write) with no guard of its own -- a disk-full
+    # condition or a transient permission error on the volume raises OSError,
+    # which is exactly as fatal to the run as a screen_transcript failure would
+    # be, so it must live inside this same guarded region rather than escape
+    # process_one. prepare_transcript and verify_findings/unconfirmed_high_signal
+    # can also raise (e.g. a malformed finding dict from the model). The gap
+    # check above stays OUTSIDE this try -- fetch_transcript returning None is
+    # normal control flow, not an exception. `stage` is set before each call so
+    # a failure's log line and recorded reason name which one actually failed.
+    stage = "store_transcript"
     try:
+        if not dry_run:
+            store_transcript(symbol, fiscal_year, quarter, content)
+
+        stage = "prepare_transcript"
+        prepared = prepare_transcript(content)
+        if not prepared.prefilter.screen:
+            outcome["status"] = "no_cns_content"
+            if not dry_run:
+                record_ledger(ledger, key, "no_cns_content", date=call_date)
+            return outcome
+
+        stage = "screen_transcript"
         result = screen_transcript(prepared, company, period_label, call_date)
+        stage = "verify_findings"
         kept, dropped = verify_findings(result.get("findings") or [],
                                         prepared.text, prepared.boundary)
         unconfirmed = unconfirmed_high_signal(prepared.prefilter, kept, prepared.text)
     except CnsScreenError as e:
-        logger.warning(f"[cns] {key} screening failed: {e}")
+        logger.warning(f"[cns] {key} {stage} failed: {e}")
         outcome["status"] = "failed"
-        outcome["reason"] = str(e)
+        outcome["reason"] = f"{stage}: {e}"
         if not dry_run:
-            record_ledger(ledger, key, "failed", reason=str(e), date=call_date)
+            record_ledger(ledger, key, "failed", reason=f"{stage}: {e}", date=call_date)
         return outcome
     except Exception as e:
-        logger.error(f"[cns] {key} unexpected screening/verification error: {e}",
-                     exc_info=True)
+        logger.error(f"[cns] {key} unexpected {stage} error: {e}", exc_info=True)
         outcome["status"] = "failed"
-        outcome["reason"] = f"unexpected: {e}"
+        outcome["reason"] = f"unexpected in {stage}: {e}"
         if not dry_run:
-            record_ledger(ledger, key, "failed", reason=str(e), date=call_date)
+            record_ledger(ledger, key, "failed", reason=f"unexpected in {stage}: {e}",
+                          date=call_date)
         return outcome
 
     outcome.update({
@@ -1435,8 +1445,15 @@ def _run_daily_inner(dry_run: bool, days, limit, backlog: bool,
         if not dry_run:
             # Persist after EACH transcript so a crash cannot re-email a
             # finding that already went out.
-            save_ledger(ledger)
+            #
+            # ORDER MATTERS. Findings are written FIRST. The ledger is what
+            # makes a period terminal and never-retried, so if it landed first
+            # and the process died before the findings write, the finding would
+            # be lost permanently -- the ledger would say done while the store
+            # held nothing. The reverse order can only ever cause a re-screen,
+            # which is safe and cheap.
             save_findings(findings_store)
+            save_ledger(ledger)
         _touch_run_lock()
 
     reported = cns_fmp.reported_symbols(universe, start_iso, end_iso)
@@ -1521,8 +1538,10 @@ def run_daily(dry_run=None, days=None, limit=None, backlog=False, force=False,
               send_email=True, reconcile=None) -> dict:
     """Public entry for the daily scan. Acquires both locks, runs, releases.
 
-    dry_run defaults to TRUE when no FMP key is present and FALSE otherwise; the
-    caller can force either. A dry run writes NO state at all."""
+    With no FMP key configured the run is refused outright ({"status":
+    "disabled", ...}) before dry_run is ever considered. Otherwise dry_run
+    defaults to FALSE; the caller can force either. A dry run writes NO state
+    at all."""
     if not cns_fmp.fmp_enabled():
         logger.warning("[cns] FMP_API_KEY not set -- CNS screen disabled")
         return {"status": "disabled", "reason": "FMP_API_KEY not set"}
