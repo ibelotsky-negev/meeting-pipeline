@@ -1245,8 +1245,8 @@ def send_digest(subject: str, html: str, recipients=None) -> bool:
                 "body": {"contentType": "HTML", "content": html},
                 "toRecipients": [{"emailAddress": {"address": r}} for r in to],
             }, "saveToSentItems": False})
+        logger.info(f"[cns] digest emailed to {', '.join(str(r) for r in to)}")
+        return True
     except Exception as e:
         logger.error(f"[cns] digest send failed: {e}", exc_info=True)
         return False
-    logger.info(f"[cns] digest emailed to {', '.join(to)}")
-    return True

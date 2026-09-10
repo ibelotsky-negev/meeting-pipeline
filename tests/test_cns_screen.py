@@ -688,3 +688,39 @@ def test_render_digest_html_escapes_transcript_text():
     })
     assert "<script>" not in html
     assert "&lt;script&gt;" in html
+
+
+def test_send_digest_never_raises_on_success_path():
+    """send_digest must return bool and never raise on the success path.
+
+    The logger.info line must be defensive against non-string recipients,
+    since side effects (Graph send) happen before logging. A raise after
+    a successful send is the worst failure mode."""
+    import email_pipeline_sync as eps
+
+    # Track whether graph_post was called
+    calls = []
+    def mock_graph_post(*args, **kwargs):
+        calls.append(("graph_post", args, kwargs))
+        return {}
+
+    monkeypatch = pytest.importorskip("_pytest.monkeypatch").MonkeyPatch()
+    monkeypatch.setenv("BOT_SENDER_EMAIL", "sara@test.example.com")
+    monkeypatch.setattr(eps, "graph_post", mock_graph_post)
+
+    # Call with a recipient list containing a non-string element (None).
+    # This will raise TypeError on the logger.info line if not defended.
+    result = cns_screen.send_digest(
+        "test subject",
+        "<p>test body</p>",
+        recipients=["a@b.com", None]
+    )
+
+    # Must return True (send succeeded) and must not raise
+    assert result is True, "send_digest should return True on successful Graph send"
+
+    # Must have actually called graph_post (proves send happened before logging)
+    assert len(calls) == 1, "graph_post should have been called exactly once"
+    assert calls[0][0] == "graph_post"
+
+    monkeypatch.undo()
