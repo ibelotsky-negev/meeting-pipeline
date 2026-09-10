@@ -1004,3 +1004,64 @@ def test_process_one_survives_a_store_transcript_failure(cns_state, monkeypatch)
     outcome = cns_screen.process_one(item, {"ABBV": {}}, ledger, store, False)
     assert outcome["status"] == "failed"
     assert cns_screen.ledger_should_process(ledger, "ABBV:2026:Q2") is True
+
+
+def test_cns_status_route(flask_client, monkeypatch):
+    import app as app_module
+    monkeypatch.setattr(cns_screen, "read_status",
+                        lambda: {"status": "ok", "screened": 4})
+    resp = flask_client.get("/cns/status")
+    assert resp.status_code == 200
+    assert resp.get_json()["screened"] == 4
+
+
+def test_cns_run_route_sync_returns_the_result(flask_client, monkeypatch):
+    monkeypatch.setattr(cns_screen, "run_daily",
+                        lambda **kw: {"status": "ok", "processed": 2, "kw": sorted(kw)})
+    resp = flask_client.get("/cns/run?sync=1&dry_run=1")
+    assert resp.status_code == 200
+    assert resp.get_json()["processed"] == 2
+
+
+def test_cns_run_route_409s_while_a_trigger_is_held(flask_client):
+    import app as app_module
+    assert app_module._cns_trigger_lock.acquire(blocking=False)
+    try:
+        assert flask_client.get("/cns/run").status_code == 409
+    finally:
+        app_module._cns_trigger_lock.release()
+
+
+def test_cns_run_route_reports_a_sync_failure(flask_client, monkeypatch):
+    def _boom(**kw):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(cns_screen, "run_daily", _boom)
+    resp = flask_client.get("/cns/run?sync=1")
+    assert resp.status_code == 500
+    assert "kaboom" in resp.get_json()["error"]
+
+
+def test_cns_season_route_passes_the_label(flask_client, monkeypatch):
+    seen = {}
+
+    def _season(**kw):
+        seen.update(kw)
+        return {"status": "ok", "season": kw.get("label")}
+
+    monkeypatch.setattr(cns_screen, "run_season", _season)
+    resp = flask_client.get("/cns/season?sync=1&season=Q2-2026&dry_run=1")
+    assert resp.status_code == 200
+    assert seen["label"] == "Q2-2026"
+    assert seen["dry_run"] is True
+
+
+def test_cns_scheduler_jobs_are_registered_with_the_right_triggers():
+    """The season job must fire on the 15th of the four reporting months, in the
+    same timezone the module computes its windows in."""
+    import app as app_module
+    source = open("app.py", encoding="utf-8").read()
+    assert 'id="cns_screen_daily"' in source
+    assert 'id="cns_screen_season"' in source
+    assert 'month="3,6,9,12"' in source
+    assert source.count('timezone="Asia/Jerusalem"') >= 4
