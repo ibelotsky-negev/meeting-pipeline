@@ -1,0 +1,62 @@
+# CNS earnings screen -- universe overrides.
+#
+# force_include: companies the FMP industry screener does NOT return but that
+# must be screened anyway. Includes two classes: (1) ADR-listed companies whose
+# US listings carry no industry classification or market cap in the screener
+# (Roche, Lundbeck, UCB, Eisai and Daiichi Sankyo are missing from the FMP
+# screener for this reason). (2) Still-trading companies with sparse FMP
+# transcript coverage (e.g., Alector: isActivelyTrading=True but last transcript
+# 2025-08-07, still sub-$1B so below the $1B screener floor).
+# Both classes need manual inclusion to remain visible. A live probe on 2026-09-09
+# confirmed coverage status. Being missing from the screener is NOT sufficient on
+# its own -- the company must also still hold a US earnings call; see entity_only.
+force_include:
+  - RHHBY      # Roche -- prasinezumab, trontinemab. 60 transcripts, latest 2026-07-23
+  - HLUYY      # Lundbeck -- pure-play CNS. Latest 2026-08-19
+  - UCBJY      # UCB -- epilepsy franchise. Latest 2026-07-30
+  - ESALY      # Eisai -- Leqembi. Latest 2026-08-03
+  - DSNKY      # Daiichi Sankyo. Latest 2026-01-30
+  - NVO        # Novo Nordisk
+  - GSK
+  - IPSEY      # Ipsen
+  - MKKGY      # Merck KGaA
+  - BAYRY      # Bayer
+  - SMMNY      # Sumitomo Pharma
+  - NVS        # Novartis
+  - TAK        # Takeda
+  - SNY        # Sanofi
+  - AZN        # AstraZeneca
+  - TEVA
+  - BIIB       # Biogen
+  - NBIX       # Neurocrine
+  - ACAD       # Acadia -- pimavanserin/Nuplazid, Daybue
+  - ALKS       # Alkermes -- active BD counterparty
+  - SUPN       # Supernus
+  - HRMY       # Harmony Biosciences
+  - SLNO       # Soleno -- VYKAT, Prader-Willi
+  - AXSM       # Axsome
+  - DNLI       # Denali
+  - ALEC       # Alector -- neurodegeneration (progranulin/TREM2). Still trading
+               # (isActivelyTrading=True, ~$255M) but FMP coverage is sparse:
+               # last transcript 2025-08-07. Screened anyway -- a missing
+               # transcript surfaces as a coverage gap, not silence.
+
+# entity_only: names that belong in the prompt's high-precision entity list but
+# hold NO earnings call, so they must never be fetched. Primary membership
+# criterion: isActivelyTrading=False (acquired, delisted, private, or otherwise
+# off the market). Dates below are the last observed transcript, for context
+# only. Alector is the ruling test: still trading with sparse coverage -> stays
+# in force_include (the criterion is trading status, NOT transcript recency).
+# Special case: Astellas, Ono, and Shionogi are US ADRs with no published
+# transcript in over a year; moving them here to avoid redundant fetch attempts.
+# If any resumes publishing on its ADR, move it back to force_include.
+entity_only:
+  - Otsuka         # no transcripts under OTSKY or OTSKF at all
+  - Cerevel        # acquired by AbbVie; last call 2023-11-01
+  - Karuna         # acquired by BMS; last call 2023-11-02
+  - Intra-Cellular # acquired by J&J; last call 2024-10-30
+  - Sage           # acquired/delisted; isActivelyTrading=False; last call 2025-04-29
+  - Astellas       # last ADR call 2025-04-25
+  - Ono            # last call 2025-08-01
+  - Shionogi       # last call 2025-07-28
+  - Boehringer     # private, holds no earnings call

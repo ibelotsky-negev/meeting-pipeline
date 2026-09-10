@@ -151,6 +151,9 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 | `/followup/run` | Manual Follow-Up Engine daily check (`?dry_run=&sync=`) |
 | `/followup/intake` | Manual Follow-Up Engine inbox intake scan (`?dry_run=&sync=`) |
 | `/followup/status` | Follow-Up Engine last run + per-watch summaries (all statuses) |
+| `/cns/run` | Manual CNS earnings screen run (`?dry_run=&days=&limit=&backlog=&force=&reconcile=&sync=`). `dry_run=1` writes no state but STILL emails the digest with a `[DRY] ` subject prefix, and screening costs real Opus tokens either way -- it bounds state, not spend |
+| `/cns/season` | Manual CNS earnings season wrap-up from stored findings (`?season=&start=&end=&dry_run=&sync=`) |
+| `/cns/status` | Last CNS screen run outcome (per-company decisions, dropped-quote count, coverage gaps, `fmp_enabled`) |
 
 ## Architecture Notes
 
@@ -169,6 +172,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **FYI Triage:** daily 06:00 Asia/Jerusalem, scans the two high-volume auto-filed folders "4: notification" + "8: marketing", classifies each message IMPORTANT vs NOISE with Sonnet (reading the body, not just the from-address), and MOVES the important ones to "2: FYI". Dual-gated (`?live=1` AND env `FYI_LIVE=1`) -- ships DRY, auto-promotes to live once Ken sets `FYI_LIVE` (`fyi_triage.py`). See the FYI Triage Module section + ROLLOUT.md.
 - **X-transcribe-email:** any internal teammate emails Sara (`sara@palomar-labs.com`) an x.com/twitter.com or youtube.com/youtu.be link to a single post/video (a podcast episode link is detected too and reported unsupported; a container URL -- channel, profile, playlist, show -- is not a request at all); a 15-min inbox scan transcribes each video (YouTube captions first, falling back to yt-dlp + Grok STT; X always via yt-dlp + Grok STT), summarizes with Claude, and REPLIES in-thread (Graph `createReply`) with a structured summary in the body + the full transcript as a `.md` attachment per link. A question asked alongside the link, or a link-free follow-up reply in an already-transcribed conversation, is answered from the cached transcript (`x_transcribe_email.py`). See the x-transcribe-email Module section.
 - **Follow-Up Engine (pilot):** a 15-min scan of Sara's inbox registers one watch per ask from a forwarded thread ("chase X if no reply in N days"); a daily 17:00 America/Chicago (`FOLLOWUP_TZ`) check then places a ready-to-send reminder DRAFT in the thread owner's Outlook Drafts -- it NEVER sends to a counterparty -- and stays report-only until `FOLLOWUP_LIVE=1` (`followup_engine.py`). See the followup-engine Module section.
+- **CNS Earnings Screen:** daily 07:00 Asia/Jerusalem, screens large-pharma earnings-call transcripts (FMP) for passages relevant to Ariadne Bio's agenda -- BD appetite for external CNS assets, competitor CNS pipeline movement, TA-strategy shifts -- via a keyword prefilter, Q&A zone detection, and Opus 5 under a fixed prompt with quote verification; a season wrap-up runs 16 Mar/Jun/Sep/Dec off stored findings only, never re-screening (`cns_screen.py` + `cns_fmp.py`). Disables itself when `FMP_API_KEY` is unset. See the cns-earnings-screen Module section.
 
 ## email-pipeline-sync Module
 
@@ -576,6 +580,115 @@ share it.
 - Endpoints: `/followup/run`, `/followup/intake` (both `?dry_run=&sync=`),
   `/followup/status`. CLI: `python followup_engine.py --intake|--check [--dry-run]`.
 
+## cns-earnings-screen Module
+
+Two modules -- `cns_fmp.py` (FMP data: universe screen, transcript discovery
+and fetch, period normalization) and `cns_screen.py` (everything else: text
+prep, keyword prefilter, Q&A zone detection, Claude screening, quote
+verification, state, digest, orchestration). Both imported lazily by app.py
+(route + cron handlers only), never at module load, so app.py stays importable
+with no `FMP_API_KEY`. Full spec:
+`docs/superpowers/specs/2026-09-09-cns-earnings-screen-design.md`.
+
+- **Universe:** three FMP industry screens (pharma/biotech, >$1B market cap,
+  US listings) unioned with a `force_include` roster in
+  `cns_screen_universe.yaml` for ADRs the screener misses on its own (Roche,
+  Otsuka, Lundbeck, UCB, Eisai, Astellas -- confirmed live 2026-09-09 that none
+  of them clear the screener alone); `entity_only` marks a name with no
+  screenable US transcripts at all (Otsuka). Cached to `cns_universe.json`,
+  refreshed every `CNS_UNIVERSE_TTL_DAYS`.
+- **Daily flow (`run_daily`):** discover new transcripts from the global feed
+  (reconciled weekly with a per-symbol sweep) -> fetch + STORE each one (state
+  file, required for verification/replay, not incidental) -> prefilter (domain
+  keyword gate; a transcript with zero hits is recorded `no_cns_content` and
+  never reaches the model, zero spend) -> mask safe-harbor boilerplate, locate
+  the Q&A boundary, screen with Opus 5 under Ken's fixed prompt
+  (`cns_screen_prompt.md`) and a JSON schema -> VERIFY every quote appears
+  verbatim in the stored transcript, dropping any that does not
+  (`verify_findings`) -> email one digest, only on days with new transcripts.
+  `run_season` (16th of Mar/Jun/Sep/Dec) reads ONLY the stored findings for
+  the season's call-date window and never re-screens, so it is safe to re-run
+  for comparison. One Opus call over every stored finding in the window, so the
+  payload is size-capped by `CNS_SEASON_MAX_PAYLOAD_CHARS` (`_season_payload`
+  drops LOW-priority findings first, then `why_it_matters`, and LOGS what it
+  trimmed -- never silent; the Weekly-Pulse lesson, applied).
+- **Two structural facts drive the design** (verified across twelve real FMP
+  transcripts 2026-09-09): neither transcript format has paragraphs (format B
+  turns run to 25,525 chars), so the keyword YAML's "same paragraph"
+  co-occurrence rule is a CHARACTER PROXIMITY window (`CNS_GATE_WINDOW`)
+  instead; and both formats say "question-and-answer"/"Q&A" inside the
+  operator's OPENING boilerplate, so Q&A boundary detection is position-banded
+  (`CNS_ZONE_BAND`, 0.15-0.85 of the document) and reports `UNKNOWN` rather
+  than guessing when nothing lands in the band.
+- **The digest has THREE independent honesty sections and they are not
+  interchangeable.** (a) `nothing_relevant` -- screened, nothing found. (b)
+  **Reported, transcript not available** -- the calendar-driven coverage gap
+  (`_compute_coverage_gaps`), for a company that reported but whose transcript
+  never arrived. (c) **Screened with errors** -- a per-transcript `failed`,
+  `gap` or `truncated` outcome. (c) exists because a failure is in NEITHER (a)
+  nor `findings_by_company`, so before it the only way a failed screen reached a
+  reader was through (b), which mislabels it "transcript not available" when the
+  transcript WAS available and the screen is what broke.
+- **The coverage-gap window and the discovery window are DELIBERATELY different
+  sizes** -- the same trap as the Weekly Pulse's two domain lists.
+  `CNS_LOOKBACK_DAYS` (3) is the DISCOVERY window and drives transcript fetches,
+  so it stays narrow. `CNS_GAP_WINDOW_DAYS` (30) is the earnings-CALENDAR window
+  for the gap section: one cheap call, so it stays wide. Fetching the calendar
+  over the discovery window left the gap list exactly ONE date wide (today-3),
+  and EMPTY for any configuration where grace >= lookback -- so raising
+  `CNS_TRANSCRIPT_GRACE_DAYS` to quiet a false positive switched the whole
+  section off. `_compute_coverage_gaps` is module-level and takes `today_iso`
+  as a parameter so the arithmetic is unit-testable without the run lock.
+- **A screener outage is never cached.** `cns_fmp.build_universe` unions the
+  force-include roster unconditionally, so a total screener failure still
+  returns a truthy ~26-symbol dict -- indistinguishable from success by
+  truthiness. `resolve_universe` decides on the `source` field instead
+  (`_universe_source`): a `roster-only` universe is RETURNED (the run proceeds
+  at degraded coverage) but NOT written to `cns_universe.json`, because caching
+  it would pin the screen at ~11% coverage for a full `CNS_UNIVERSE_TTL_DAYS`
+  and the gap section could not catch it either (`reported_symbols` filters to
+  the universe). `/cns/status` reports `universe_source`.
+- **Verification is load-bearing:** `verify_findings` requires every quote to
+  appear verbatim (whitespace/smart-quote tolerant) in the stored transcript;
+  a fabricated or paraphrased quote is DROPPED, never reported. `dropped_quotes`
+  in the digest and `/cns/status` is this layer visibly working, not a bug.
+  `unconfirmed_high_signal` independently reports when a high-value keyword
+  (apathy, Prader-Willi, etc.) appears in the transcript but the model quoted
+  nothing near it -- the most expensive miss this screen can make.
+- **State** on `/data`: `cns_ledger.json` (per-period status; TERMINAL states
+  -- `screened`, `no_cns_content`, `truncated` -- are never reprocessed, while
+  `gap` and `failed` retry up to `CNS_MAX_FETCH_ATTEMPTS`. `truncated` is
+  terminal on purpose: a `stop_reason=max_tokens` truncation is DETERMINISTIC at
+  a fixed max_tokens and effort, so retrying it burned all four attempts on
+  identical failures. It raises `CnsTruncatedError` and stays visible through
+  the digest's "Screened with errors" section instead),
+  `cns_findings.json` (verified findings, read by the season wrap-up),
+  `cns_universe.json` (cached universe), `cns_lock.json` (atomic
+  `O_CREAT|O_EXCL` run lock, stale-reclaimed after `CNS_LOCK_MAX_AGE`),
+  `cns_status.json` (last-run outcome), `cns_transcripts/` (stored raw
+  transcripts). `save_findings` runs BEFORE `save_ledger` on every processed
+  item, so a crash between the two writes can only cause a harmless re-screen,
+  never a lost verified finding.
+- **`ambiguity_rules` in `cns_screen_keywords.yaml` is prose, not code** -- each
+  rule (PD vs pharmacodynamics, MSA vs master service agreement, etc.) is
+  implemented explicitly in `_gate_ok`. Adding a rule to the YAML alone does
+  nothing; add it to `_gate_ok` and a test alongside the YAML edit.
+- **Endpoints:** `/cns/run`, `/cns/season` (both `?sync=` for inline JSON,
+  else a background thread + `{"status": "started"}`), `/cns/status`. ONE
+  `_cns_trigger_lock` gates both routes AND both cron jobs (`cns_daily_run`,
+  `cns_season_run`), because the daily scan and the season wrap-up share
+  `cns_ledger.json` / `cns_findings.json` -- mirrors `_followup_lock` above.
+  Cron: daily 07:00 and season **16th** of Mar/Jun/Sep/Dec 08:00, both
+  Asia/Jerusalem. The 16th, not the 15th (the day the season window closes):
+  screening is SEQUENTIAL, so a peak-season daily scan of up to
+  `CNS_MAX_TRANSCRIPTS_PER_RUN` Opus transcripts can still hold
+  `_cns_trigger_lock` at 08:00, and a season job that finds it held logs
+  "already running" and NEVER retries -- losing that quarter's wrap-up outright.
+  CLI: `python cns_screen.py [--days N] [--limit N] [--live] [--backlog]
+  [--force] [--reconcile] [--season Q2-2026] [--no-email]`. Without `--live` the
+  run writes no state but STILL screens (real Opus spend) and STILL emails a
+  `[DRY] `-prefixed digest; `--no-email` is what suppresses the send.
+
 ## Common Failure Modes
 
 | Symptom | Cause | Fix |
@@ -622,6 +735,18 @@ share it.
 | Sara keeps replying to an autoresponder | Autoresponder sends no `Auto-Submitted`/`Precedence` header | `is_auto_reply` guards BOTH paths (a media link in the autoresponder's template no longer bypasses it), and the per-conversation cap `XTE_THREAD_MAX_QUESTIONS` stops a header-less one after 20 and goes silent; lower it if needed |
 | Follow-up question gets a transcription reply instead of an answer | A link in the sender's signature made the message look like a new request -- `uniqueBody` strips quoted history but KEEPS signatures | Two guards. A CONTAINER link (channel / profile / Spotify show) is not a request at all, so a signature carrying one is inert; and no podcast link of any host ever counts as a new request. What still reads as new is a signature link to a real TRANSCRIBABLE ITEM (X post / Space / broadcast, YouTube video or clip) Sara has never transcribed -- transcribe it once, or drop it from the signature |
 | Channel / profile / playlist / Spotify-show link gets no reply at all | By design -- a container URL is not a transcription request (`_is_container_url`), so the message is left for other handlers exactly like an article link | Send the link to ONE post or video. Reversed the old "any X link earns an honest no-video reply" rule: ordinary mail and follow-ups share this gate, and a container can never be cached, so it could never self-heal. NOT containers (these do get a reply): `/i/spaces/<id>`, `/i/broadcasts/<id>`, `youtube.com/clip/<id>`. A podcast `/episode/` or a show page on a non-Spotify host is ALSO detected and answered -- but ONLY in a conversation Sara has not already cached: once this conversation has a cached transcript, a podcast link no longer counts as a request at all (`_has_new_link`), so a podcast-only message gets no reply, and a podcast link plus words answers the PREVIOUSLY transcribed video, never mentioning that podcasts are unsupported |
+| Every CNS finding is labelled `QA`, or every one `PREPARED_REMARKS` | Zone detection matched the operator's OPENING boilerplate. BOTH transcript formats say "question-and-answer" and "Q&A" in the opening: AbbVie's only occurrence is char 176 of 56,663 (0.3%), Biogen's at 354 and 1,606 | By design the detector only accepts candidates inside `CNS_ZONE_BAND` (0.15-0.85 of the document). If this recurs, a new handoff phrasing is needed in `HANDOFF_PATTERNS` -- add it, do not widen the band |
+| A CNS transcript logs `zone UNKNOWN` | No handoff phrase landed in the position band. Roche's real transcript matched nothing until "open the Q&A" was added | Expected and honest. The model's own zone label stands. Add the phrasing to `HANDOFF_PATTERNS` with a fixture if it is a common format |
+| A company is listed as `reported, transcript not available` for days | FMP publishes about 4 hours after a call, but a listed period can return EMPTY content (AXSM FY2026Q2: dates endpoint lists 2026-08-10, fetch returns a well-formed row with 0 chars) or bare JSON `null` | Expected while FMP backfills. The period stays retryable until `CNS_MAX_FETCH_ATTEMPTS`. It is NOT recorded as screened, so nothing is lost |
+| Roche, Otsuka, Lundbeck, UCB, Eisai or Astellas missing from the screen | The FMP industry screener returns NONE of them -- their US listings are ADRs with no industry classification or market cap. Verified live 2026-09-09 | They come in via `force_include` in `cns_screen_universe.yaml`. Otsuka has no transcripts under any ticker and is `entity_only` on purpose |
+| A generic BD passage with no neuro content shows up as a finding | The BD gate needs a domain term within `CNS_GATE_WINDOW` (600) characters. The keyword YAML says "same paragraph", but FMP transcripts have NO paragraphs (format A is one 56K-char line; format B turns reach 25K chars), so proximity replaces it | Lower `CNS_GATE_WINDOW`. Do not switch to speaker turns as the unit -- a 25K-char turn is not a gate |
+| A new `ambiguity_rules` entry in the keyword YAML has no effect | That YAML block is human-readable PROSE. Each rule is implemented explicitly in `_gate_ok` and asserted by a test | Add the rule to `_gate_ok` and a test alongside the YAML edit |
+| The same call is screened twice | Two endpoints reported its period in different shapes and the ledger key diverged | All three shapes must go through `cns_fmp.normalize_period` -> `period_key`. Never build a key by hand |
+| CNS screen never runs, no errors | `FMP_API_KEY` unset. The module disables itself by design rather than crashing the scheduler | Set `FMP_API_KEY` on Railway. `/cns/status` reports `fmp_enabled` |
+| The CNS digest's "Reported, transcript not available" section is always empty, and raising `CNS_TRANSCRIPT_GRACE_DAYS` to quiet a false positive silenced it completely | The earnings calendar was fetched over the DISCOVERY window (`CNS_LOOKBACK_DAYS`, 3) while the gap list keeps only calls older than the grace period (3). The intersection was exactly one date (`today-3`), and EMPTY for any grace >= lookback -- so the feature switched itself off in response to being tuned. The three end-to-end tests all mocked `reported_symbols` with dates outside the real window, so the suite could not see it | Fixed @2.35.1 -- the calendar is read over its own `CNS_GAP_WINDOW_DAYS` (30) window and `_compute_coverage_gaps` is module-level with `today_iso` injected, so the arithmetic is unit-tested directly. Never conflate the two windows: discovery drives fetches and stays narrow, the calendar read is one cheap call and stays wide |
+| The CNS screen runs at a fraction of its coverage for a week, with no error | All three FMP industry screens failed (`_fmp_get` returns `None` on any HTTP error) but `build_universe` unions the force-include roster unconditionally, so the result was a truthy ~26-symbol dict cached as fresh for `CNS_UNIVERSE_TTL_DAYS`. The gap section could not catch it either -- `reported_symbols` filters to the universe | Fixed @2.35.1 -- `resolve_universe` counts entries whose `source == "screener"` (`_universe_source`) and REFUSES to cache a `roster-only` universe, logging an ERROR and proceeding at degraded coverage. Check `universe_source` on `/cns/status` |
+| A CNS transcript keeps failing four times with the same error and never reports | Before 2.35.1 a `stop_reason=max_tokens` truncation was recorded as retryable, but with adaptive thinking and a fixed effort it is DETERMINISTIC -- every retry reproduced it and burned the whole `CNS_MAX_FETCH_ATTEMPTS` budget | Fixed @2.35.1 -- `CnsTruncatedError` records the TERMINAL status `truncated` and surfaces in the digest's "Screened with errors" section. Raise `CNS_MAX_TOKENS` and re-run `/cns/run?backlog=1` to redo that period |
+| A CNS season wrap-up never arrived for a whole quarter, log says "Skipped scheduled season wrap-up -- already running" | The season job shares `_cns_trigger_lock` with the daily 07:00 scan (both write the same ledger). Screening is sequential, so a peak-season run can still hold the lock at 08:00. Moving the cron to the 16th (mid-month, fewer calls, smaller queue) makes the collision much less likely, but still possible if the daily run is long. The season job never retries | Fixed @2.35.1 -- the season cron moved to the **16th** of Mar/Jun/Sep/Dec, reducing collision likelihood. Recover a lost quarter with `/cns/season?season=Q2-2026` |
 
 ## Environment Variables (Railway)
 
@@ -649,6 +774,8 @@ followup-engine: `FOLLOWUP_LIVE` (set `1` to arm draft creation; UNSET at ship
 FYI Triage: `FYI_LIVE` (set to `1` to arm real moves -- the second of the two gates; UNSET at ship = dry), `FYI_LOOKBACK_HOURS` (cron window, default 24), `FYI_RECIPIENTS` (summary email, default bk@negevlabs.com), optional `FYI_CLASSIFIER_MODEL` / `FYI_MAX_DAYS` / `FYI_MAX_PER_FOLDER` / `FYI_CONCURRENCY` / `FYI_BROADCAST_DOMAINS` (broker/ESP blast domains -> deterministic NOISE) / `FYI_HELD_DOMAINS` + `FYI_HELD_NAMES` (tracked holdings -> material IR is deterministic IMPORTANT) and `INTERNAL_DOMAINS` (own-outbound -> deterministic NOISE).
 
 x-transcribe-email: reuses `BOT_SENDER_EMAIL` (Sara's mailbox), `XAI_API_KEY` (STT), `CLAUDE_API_KEY` (summary), `INTERNAL_DOMAINS` (sender allow-list); optional `XTE_TEAM_EXTRA` (extra served addresses beyond INTERNAL_DOMAINS, comma-separated, default empty), `XTE_INTERVAL_MINUTES` (scan cadence, default 15), `XTE_MAX_MESSAGES` (scan window, default 25), `XTE_MAX_LINKS` (per-email cap, default 5), `XTE_SUMMARY_MODEL`, `XTE_THREAD_TTL_DAYS` (follow-up transcript cache eviction, default 30), `XTE_THREAD_MAX` (cached-conversation cap, default 200), `XTE_THREAD_MAX_QUESTIONS` (per-conversation follow-up loop breaker, default 20).
+
+cns-earnings-screen: `FMP_API_KEY` (disables the whole module when unset), optional `CNS_LOOKBACK_DAYS` (daily DISCOVERY window, default 3), `CNS_GAP_WINDOW_DAYS` (earnings-CALENDAR window for the coverage-gap section, default 30 -- deliberately wider than the discovery window; see the module section), `CNS_MAX_TRANSCRIPTS_PER_RUN` (per-run cap, default 60), `CNS_TRANSCRIPT_GRACE_DAYS` (days after a reported call before missing-transcript is flagged, default 3), `CNS_MAX_FETCH_ATTEMPTS` (retry cap on a transcript gap, default 4), `CNS_UNIVERSE_TTL_DAYS` (universe cache refresh, default 7), `CNS_MIN_MARKET_CAP` (universe floor, default 1000000000), `CNS_MIN_TRANSCRIPT_CHARS` (below this the content is unusable -> coverage gap, default 2000), `CNS_FEED_PAGES` (max pages of the global latest feed per run, default 40), `CNS_RECONCILE_WEEKDAY` (weekly per-symbol sweep, 0=Mon 6=Sun, default 6), `CNS_SCREEN_MODEL` / `CNS_SEASON_MODEL` (default claude-opus-5), `CNS_ANTHROPIC_TIMEOUT` (per-call timeout seconds, default 300), `CNS_SEASON_MAX_PAYLOAD_CHARS` (season wrap-up payload cap, default 400000), `CNS_GATE_WINDOW` (BD-term proximity gate, default 600 chars), `CNS_ZONE_BAND` (Q&A position band, default "0.15,0.85"), `CNS_RECIPIENTS` (digest email, default bk@negevlabs.com,dan@negevlabs.com). Reuses `CLAUDE_API_KEY`, `BOT_SENDER_EMAIL`, `MS_GRAPH_*`.
 
 ## Current Known Issues
 

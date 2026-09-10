@@ -3719,6 +3719,134 @@ def fyi_status():
     return jsonify(fyi_triage.read_status())
 
 
+# ======================================================================
+#  CNS EARNINGS SCREEN -- CNS / rare-neuro competitive intelligence
+#  Spec: docs/superpowers/specs/2026-09-09-cns-earnings-screen-design.md
+#  Modules imported lazily; disabled entirely when FMP_API_KEY is unset.
+#  ONE trigger lock gates both routes AND both cron jobs, because the daily
+#  scan and the season wrap-up share cns_ledger.json / cns_findings.json.
+# ======================================================================
+
+_cns_trigger_lock = _threading.Lock()
+
+
+@app.route("/cns/run", methods=["GET", "POST"])
+def cns_run():
+    """Manually trigger the CNS earnings screen (cns_screen module).
+    ?dry_run=1  -- screen and render but write NO state (no ledger, no findings,
+                   no stored transcript). It STILL emails the digest, with a
+                   "[DRY] " subject prefix and a banner, because a dry run whose
+                   output nobody can see is not useful. Screening costs real
+                   Opus tokens either way -- dry_run bounds state, not spend.
+    ?days=N     -- lookback window in days (default CNS_LOOKBACK_DAYS, 3).
+    ?limit=N    -- cap transcripts this run (default CNS_MAX_TRANSCRIPTS_PER_RUN).
+    ?backlog=1  -- reprocess everything in the window, ignoring the ledger.
+    ?force=1    -- clear an orphaned run lock first (operator override).
+    ?reconcile=1 -- force the per-symbol reconciliation sweep.
+    ?sync=true  -- run inline and return the result/traceback as JSON."""
+    import traceback as _cns_tb
+    days = request.args.get("days", type=int)
+    limit = request.args.get("limit", type=int)
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    backlog = request.args.get("backlog", "").lower() in ("true", "1", "yes")
+    force = request.args.get("force", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
+    reconcile = True if request.args.get("reconcile", "").lower() in ("true", "1", "yes") else None
+    if not _cns_trigger_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import cns_screen
+            return jsonify(cns_screen.run_daily(
+                dry_run=dry_run, days=days, limit=limit, backlog=backlog,
+                force=force, reconcile=reconcile))
+        except Exception as e:
+            logger.error(f"[cns] Sync run failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _cns_tb.format_exc()}), 500
+        finally:
+            _cns_trigger_lock.release()
+
+    def _run():
+        try:
+            import cns_screen
+            cns_screen.run_daily(dry_run=dry_run, days=days, limit=limit,
+                                 backlog=backlog, force=force, reconcile=reconcile)
+            logger.info("[cns] Manual run complete")
+        except Exception as e:
+            logger.error(f"[cns] Manual run failed: {e}", exc_info=True)
+        finally:
+            _cns_trigger_lock.release()
+
+    logger.info(f"[cns] Trigger: days={days} limit={limit} dry_run={dry_run} "
+                f"backlog={backlog} -- launching background thread")
+    thread = _threading.Thread(target=_run, daemon=True)
+    try:
+        thread.start()
+    except Exception as e:
+        _cns_trigger_lock.release()
+        logger.error(f"[cns] Failed to start run thread: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": f"could not start run: {e}"}), 500
+    return jsonify({"status": "started", "days": days, "limit": limit,
+                    "dry_run": dry_run, "backlog": backlog})
+
+
+@app.route("/cns/season", methods=["GET", "POST"])
+def cns_season():
+    """Build the CNS earnings season wrap-up from STORED findings.
+    ?season=Q2-2026 -- season label; absent uses the season containing today.
+    ?start=&end=    -- explicit call-date window instead of a label.
+    ?dry_run=1      -- subject prefixed [DRY]; the wrap-up never mutates state.
+    ?sync=true      -- run inline and return the result as JSON."""
+    import traceback as _cns_tb
+    label = request.args.get("season")
+    start = request.args.get("start")
+    end = request.args.get("end")
+    dry_run = request.args.get("dry_run", "").lower() in ("true", "1", "yes")
+    sync = request.args.get("sync", "").lower() in ("true", "1", "yes")
+    if not _cns_trigger_lock.acquire(blocking=False):
+        return jsonify({"status": "already_running"}), 409
+
+    if sync:
+        try:
+            import cns_screen
+            return jsonify(cns_screen.run_season(
+                label=label, start=start, end=end, dry_run=dry_run))
+        except Exception as e:
+            logger.error(f"[cns] Season run failed: {e}", exc_info=True)
+            return jsonify({"status": "error", "error": str(e),
+                            "traceback": _cns_tb.format_exc()}), 500
+        finally:
+            _cns_trigger_lock.release()
+
+    def _run():
+        try:
+            import cns_screen
+            cns_screen.run_season(label=label, start=start, end=end, dry_run=dry_run)
+            logger.info("[cns] Season wrap-up complete")
+        except Exception as e:
+            logger.error(f"[cns] Season wrap-up failed: {e}", exc_info=True)
+        finally:
+            _cns_trigger_lock.release()
+
+    thread = _threading.Thread(target=_run, daemon=True)
+    try:
+        thread.start()
+    except Exception as e:
+        _cns_trigger_lock.release()
+        return jsonify({"status": "error", "error": f"could not start run: {e}"}), 500
+    return jsonify({"status": "started", "season": label, "dry_run": dry_run})
+
+
+@app.route("/cns/status", methods=["GET"])
+def cns_status():
+    """Last CNS screen run outcome: per-company decisions, dropped-quote count,
+    coverage gaps, live heartbeat, and whether FMP is configured."""
+    import cns_screen
+    return jsonify(cns_screen.read_status())
+
+
 _xte_trigger_lock = _threading.Lock()
 
 
@@ -4027,7 +4155,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.34.0-prompt-integrity", "deployed": "2026-09-02"})
+    return jsonify({"version": "2.35.1-cns-review-fixes", "deployed": "2026-09-10"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4095,7 +4223,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.34.0-prompt-integrity", "steps": {}}
+    results = {"version": "2.35.1-cns-review-fixes", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -5058,6 +5186,53 @@ def fyi_daily_run():
         logger.error(f"[fyi] Failed: {e}", exc_info=True)
 
 
+def cns_daily_run():
+    """Scheduled daily CNS earnings screen (cns_screen module).
+
+    No-ops when FMP_API_KEY is unset. Shares _cns_trigger_lock with the manual
+    routes and with the season job so no two of them can touch the shared
+    ledger at once."""
+    if not _cns_trigger_lock.acquire(blocking=False):
+        logger.warning("[cns] Skipped scheduled run -- already running")
+        return
+    try:
+        import cns_screen
+        result = cns_screen.run_daily()
+        logger.info(f"[cns] Daily screen complete: {result.get('status')} "
+                    f"processed={result.get('processed')}")
+    except Exception as e:
+        logger.error(f"[cns] Daily screen failed: {e}", exc_info=True)
+    finally:
+        _cns_trigger_lock.release()
+
+
+def cns_season_run():
+    """Scheduled CNS earnings season wrap-up (16 Mar / Jun / Sep / Dec).
+
+    Reads stored findings only -- it never re-screens and never mutates the
+    ledger, so a re-run is safe.
+
+    The 16th, not the 15th: the season's call-date window CLOSES on the 15th,
+    and this job shares _cns_trigger_lock with the daily scan (they write the
+    same ledger and findings store). Screening is sequential, so a peak-season
+    daily run of up to CNS_MAX_TRANSCRIPTS_PER_RUN Opus transcripts can still be
+    running at 08:00. On a collision this job logs "already running" and NEVER
+    retries, which would lose that quarter's wrap-up outright -- running the day
+    after the window closes makes the collision much less likely, because the 16th is mid-month with a small pending queue -- but the daily job runs that morning too and shares the lock, so a long run can still cause the wrap-up to skip."""
+    if not _cns_trigger_lock.acquire(blocking=False):
+        logger.warning("[cns] Skipped scheduled season wrap-up -- already running")
+        return
+    try:
+        import cns_screen
+        result = cns_screen.run_season()
+        logger.info(f"[cns] Season wrap-up complete: {result.get('status')} "
+                    f"season={result.get('season')}")
+    except Exception as e:
+        logger.error(f"[cns] Season wrap-up failed: {e}", exc_info=True)
+    finally:
+        _cns_trigger_lock.release()
+
+
 def x_transcribe_email_run():
     """Scheduled scan of Sara's mailbox for x.com links to transcribe + reply
     (x_transcribe_email module). Shares the manual trigger lock so a scheduled
@@ -5157,6 +5332,39 @@ def start_scheduler():
         id="fyi_triage_daily",
         replace_existing=True,
         misfire_grace_time=3600,
+    )
+    # CNS earnings screen: daily 07:00 Asia/Jerusalem. tz-aware cron so DST is
+    # handled automatically. No-ops when FMP_API_KEY is unset, so it is safe to
+    # register unconditionally.
+    _scheduler.add_job(
+        cns_daily_run,
+        trigger="cron",
+        hour=7,
+        minute=0,
+        timezone="Asia/Jerusalem",
+        id="cns_screen_daily",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    # Season wrap-up on the 16th of March, June, September and December -- the
+    # day AFTER each reporting season's call-date window closes on the 15th (see
+    # SEASONS in cns_screen.py). The 16th rather than the 15th because this job
+    # shares _cns_trigger_lock with the daily 07:00 scan: screening is
+    # sequential, a peak-season run of up to 60 Opus transcripts can still hold
+    # the lock at 08:00, and a season job that finds it held logs "already
+    # running" and never retries -- silently losing the whole quarter's
+    # wrap-up. Same timezone the module computes its windows in.
+    _scheduler.add_job(
+        cns_season_run,
+        trigger="cron",
+        month="3,6,9,12",
+        day=16,
+        hour=8,
+        minute=0,
+        timezone="Asia/Jerusalem",
+        id="cns_screen_season",
+        replace_existing=True,
+        misfire_grace_time=7200,
     )
     # X-transcribe-email: scan Sara's mailbox every 15min for internal mail with
     # x.com links and reply with transcript + summary. Shares _xte_trigger_lock
