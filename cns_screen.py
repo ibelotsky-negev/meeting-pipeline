@@ -1250,3 +1250,433 @@ def send_digest(subject: str, html: str, recipients=None) -> bool:
     except Exception as e:
         logger.error(f"[cns] digest send failed: {e}", exc_info=True)
         return False
+
+
+# ======================================================================
+#  ORCHESTRATION
+# ======================================================================
+CNS_LOOKBACK_DAYS = int(os.environ.get("CNS_LOOKBACK_DAYS", "3"))
+CNS_MAX_TRANSCRIPTS_PER_RUN = int(os.environ.get("CNS_MAX_TRANSCRIPTS_PER_RUN", "60"))
+CNS_TRANSCRIPT_GRACE_DAYS = int(os.environ.get("CNS_TRANSCRIPT_GRACE_DAYS", "3"))
+CNS_RECONCILE_WEEKDAY = int(os.environ.get("CNS_RECONCILE_WEEKDAY", "6"))
+CNS_SEASON_MODEL = os.environ.get("CNS_SEASON_MODEL", "claude-opus-5")
+CNS_SEASON_MAX_TOKENS = int(os.environ.get("CNS_SEASON_MAX_TOKENS", "32000"))
+
+
+def resolve_universe(force_refresh: bool = False) -> dict:
+    """-> the screening universe, from cache when fresh.
+
+    The force-include roster is applied on EVERY resolve, including cache hits,
+    so editing cns_screen_universe.yaml takes effect on the next run without
+    waiting out the universe TTL."""
+    config = load_universe_config()
+    roster = config["force_include"]
+    if not force_refresh:
+        cached = load_universe_cache()
+        if cached is not None:
+            for symbol in roster:
+                cached.setdefault(symbol, {
+                    "name": symbol, "industry": None, "market_cap": None,
+                    "exchange": None, "country": None, "source": "roster"})
+            return cached
+    universe = cns_fmp.build_universe(force_include=roster)
+    if universe:
+        save_universe_cache(universe)
+    return universe
+
+
+def process_one(item: dict, universe: dict, ledger: dict,
+                findings_store: dict, dry_run: bool) -> dict:
+    """Fetch, prepare, screen, verify and persist ONE transcript.
+
+    -> an outcome record for the digest and status file. Never raises: a single
+    company's failure must not abort a 240-company run.
+
+    Ledger writes happen HERE, per transcript, not at the end of the run. A
+    restart or crash mid-run therefore cannot re-email a finding that was
+    already delivered."""
+    symbol = item["symbol"]
+    fiscal_year, quarter = item["fiscal_year"], item["quarter"]
+    key = cns_fmp.period_key(symbol, fiscal_year, quarter)
+    company = (universe.get(symbol) or {}).get("name") or symbol
+    period_label = f"Q{quarter} FY{fiscal_year}"
+    outcome = {"key": key, "symbol": symbol, "company": company,
+               "period": period_label, "call_date": item.get("date"),
+               "status": "failed", "dropped": 0, "findings": 0, "reason": None}
+
+    content, meta = cns_fmp.fetch_transcript(symbol, fiscal_year, quarter)
+    if content is None:
+        # A listed period whose content is empty is a COVERAGE GAP, not a screen
+        # with no findings. It must stay retryable so it is picked up once FMP
+        # backfills -- AXSM FY2026Q2 was exactly this case.
+        outcome["status"] = "gap"
+        outcome["reason"] = meta
+        if not dry_run:
+            record_ledger(ledger, key, "gap", reason=meta, date=item.get("date"))
+        return outcome
+
+    call_date = meta or item.get("date") or ""
+    if not dry_run:
+        store_transcript(symbol, fiscal_year, quarter, content)
+
+    prepared = prepare_transcript(content)
+    if not prepared.prefilter.screen:
+        outcome["status"] = "no_cns_content"
+        if not dry_run:
+            record_ledger(ledger, key, "no_cns_content", date=call_date)
+        return outcome
+
+    # Screening AND verification are both guarded by the SAME try/except.
+    # process_one's contract is "never raises" (a single company's failure
+    # must not abort a 240-company run); verify_findings/unconfirmed_high_signal
+    # can themselves raise (e.g. on a malformed finding dict from the model),
+    # and an exception there is exactly as fatal to the run as one from
+    # screen_transcript. Keeping them in one guarded region is what makes the
+    # "never raises" promise actually true.
+    try:
+        result = screen_transcript(prepared, company, period_label, call_date)
+        kept, dropped = verify_findings(result.get("findings") or [],
+                                        prepared.text, prepared.boundary)
+        unconfirmed = unconfirmed_high_signal(prepared.prefilter, kept, prepared.text)
+    except CnsScreenError as e:
+        logger.warning(f"[cns] {key} screening failed: {e}")
+        outcome["status"] = "failed"
+        outcome["reason"] = str(e)
+        if not dry_run:
+            record_ledger(ledger, key, "failed", reason=str(e), date=call_date)
+        return outcome
+    except Exception as e:
+        logger.error(f"[cns] {key} unexpected screening/verification error: {e}",
+                     exc_info=True)
+        outcome["status"] = "failed"
+        outcome["reason"] = f"unexpected: {e}"
+        if not dry_run:
+            record_ledger(ledger, key, "failed", reason=str(e), date=call_date)
+        return outcome
+
+    outcome.update({
+        "status": "screened",
+        "dropped": len(dropped),
+        "findings": len(kept),
+        "relevant": bool(result.get("relevant")) and bool(kept),
+        "overall_take": result.get("overall_take") or "",
+        "verified_findings": kept,
+        "unconfirmed": unconfirmed,
+        "zone_known": prepared.zone_known,
+        "prefilter": prepared.prefilter.as_summary(),
+    })
+    if not dry_run:
+        if kept:
+            findings_store[key] = {
+                "symbol": symbol, "company": company, "period": period_label,
+                "call_date": call_date,
+                "overall_take": result.get("overall_take") or "",
+                "findings": kept,
+                "screened_at": datetime.now(timezone.utc).isoformat(),
+            }
+        record_ledger(ledger, key, "screened", date=call_date,
+                      findings_count=len(kept), dropped=len(dropped))
+    return outcome
+
+
+def _window_dates(days: int):
+    """-> (start_iso, end_iso) for a trailing window ending today."""
+    end = date.today()
+    start = date.fromordinal(end.toordinal() - max(0, int(days)))
+    return start.isoformat(), end.isoformat()
+
+
+def _run_daily_inner(dry_run: bool, days, limit, backlog: bool,
+                     send_email: bool, reconcile) -> dict:
+    universe = resolve_universe()
+    if not universe:
+        write_status({"status": "error", "error": "universe resolved empty",
+                      "finished_at": datetime.now(timezone.utc).isoformat()})
+        return {"status": "error", "error": "universe resolved empty"}
+
+    lookback = CNS_LOOKBACK_DAYS if days is None else int(days)
+    start_iso, end_iso = _window_dates(lookback)
+    _set_progress(phase="discovery", done=0, total=0)
+
+    discovered = cns_fmp.discover_from_feed(universe, start_iso, end_iso)
+    if reconcile is None:
+        reconcile = date.today().weekday() == CNS_RECONCILE_WEEKDAY
+    if reconcile:
+        logger.info("[cns] running the weekly per-symbol reconciliation sweep")
+        seen = {cns_fmp.period_key(d["symbol"], d["fiscal_year"], d["quarter"])
+                for d in discovered}
+        for extra in cns_fmp.discover_from_dates(universe, start_iso, end_iso):
+            key = cns_fmp.period_key(extra["symbol"], extra["fiscal_year"], extra["quarter"])
+            if key not in seen:
+                seen.add(key)
+                discovered.append(extra)
+
+    ledger = load_ledger()
+    findings_store = load_findings()
+    pending = [
+        item for item in discovered
+        if backlog or ledger_should_process(
+            ledger, cns_fmp.period_key(item["symbol"], item["fiscal_year"], item["quarter"]))
+    ]
+    pending.sort(key=lambda item: (item.get("date") or "", item["symbol"]))
+
+    cap = CNS_MAX_TRANSCRIPTS_PER_RUN if limit is None else int(limit)
+    cap_hit = len(pending) > cap
+    if cap_hit:
+        logger.warning(f"[cns] {len(pending)} transcripts pending, capping at {cap} "
+                       "-- the remainder is picked up on the next run")
+        pending = pending[:cap]
+
+    _set_progress(phase="screening", done=0, total=len(pending))
+    outcomes = []
+    for item in pending:
+        outcomes.append(process_one(item, universe, ledger, findings_store, dry_run))
+        _bump_progress(f"{item['symbol']} Q{item['quarter']} FY{item['fiscal_year']}")
+        if not dry_run:
+            # Persist after EACH transcript so a crash cannot re-email a
+            # finding that already went out.
+            save_ledger(ledger)
+            save_findings(findings_store)
+        _touch_run_lock()
+
+    reported = cns_fmp.reported_symbols(universe, start_iso, end_iso)
+    grace_cutoff = date.fromordinal(
+        date.today().toordinal() - CNS_TRANSCRIPT_GRACE_DAYS).isoformat()
+    have = {o["symbol"] for o in outcomes if o["status"] in ("screened", "no_cns_content")}
+    gaps = [
+        {"symbol": symbol, "date": call_date}
+        for symbol, call_date in sorted(reported.items())
+        if call_date <= grace_cutoff and symbol not in have
+        and not any(
+            (ledger.get(k) or {}).get("status") in _TERMINAL_STATUSES
+            for k in ledger if k.startswith(f"{symbol}:"))
+    ]
+
+    with_findings = [o for o in outcomes if o.get("verified_findings")]
+    context = {
+        "window": f"{start_iso} to {end_iso}",
+        "screened": sum(1 for o in outcomes if o["status"] == "screened"),
+        "findings_by_company": [{
+            "company": o["company"], "symbol": o["symbol"], "period": o["period"],
+            "call_date": o["call_date"], "overall_take": o.get("overall_take") or "",
+            "findings": o["verified_findings"],
+        } for o in with_findings],
+        "nothing_relevant": sorted(
+            o["symbol"] for o in outcomes
+            if o["status"] in ("screened", "no_cns_content") and not o.get("verified_findings")),
+        "reported_no_transcript": gaps,
+        "unconfirmed": [u for o in outcomes for u in (o.get("unconfirmed") or [])],
+        "dropped_quotes": sum(int(o.get("dropped") or 0) for o in outcomes),
+        "cap_hit": cap_hit,
+        "dry_run": dry_run,
+    }
+
+    emailed = False
+    if send_email and outcomes:
+        high = sum(1 for o in with_findings for f in o["verified_findings"]
+                   if (f.get("priority") or "").upper() == "HIGH")
+        prefix = "[DRY] " if dry_run else ""
+        subject = (f"{prefix}CNS earnings screen -- {len(with_findings)} compan"
+                   f"{'y' if len(with_findings) == 1 else 'ies'} with findings"
+                   + (f", {high} HIGH" if high else ""))
+        emailed = send_digest(subject, render_digest_html(context))
+    elif send_email:
+        logger.info("[cns] no new transcripts in the window -- no digest sent")
+
+    status = {
+        "status": "ok",
+        "dry_run": dry_run,
+        "window": context["window"],
+        "universe_size": len(universe),
+        "discovered": len(discovered),
+        "processed": len(outcomes),
+        "screened": context["screened"],
+        "with_findings": len(with_findings),
+        "dropped_quotes": context["dropped_quotes"],
+        "cap_hit": cap_hit,
+        "reconciled": bool(reconcile),
+        "emailed": emailed,
+        "reported_no_transcript": gaps,
+        "decisions": [{k: o.get(k) for k in
+                       ("symbol", "period", "status", "findings", "dropped",
+                        "reason", "zone_known")} for o in outcomes],
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    write_status(status)
+    _set_progress(phase="idle")
+    return status
+
+
+def run_daily(dry_run=None, days=None, limit=None, backlog=False, force=False,
+              send_email=True, reconcile=None) -> dict:
+    """Public entry for the daily scan. Acquires both locks, runs, releases.
+
+    dry_run defaults to TRUE when no FMP key is present and FALSE otherwise; the
+    caller can force either. A dry run writes NO state at all."""
+    if not cns_fmp.fmp_enabled():
+        logger.warning("[cns] FMP_API_KEY not set -- CNS screen disabled")
+        return {"status": "disabled", "reason": "FMP_API_KEY not set"}
+    if dry_run is None:
+        dry_run = False
+    if force:
+        logger.warning("[cns] force=1 -- clearing any existing run lock")
+        _release_run_lock()
+    if not _acquire_run_lock():
+        logger.warning("[cns] skipping -- another run is in progress (cross-process)")
+        return {"status": "skipped", "reason": "run already in progress"}
+    if not _cns_lock.acquire(blocking=False):
+        logger.warning("[cns] skipping -- another run is in progress (in-process)")
+        _release_run_lock()
+        return {"status": "skipped", "reason": "run already in progress"}
+    stop = _threading.Event()
+
+    def _heartbeat():
+        while not stop.wait(max(60, CNS_LOCK_MAX_AGE // 4)):
+            _touch_run_lock()
+
+    beat = _threading.Thread(target=_heartbeat, daemon=True)
+    beat.start()
+    try:
+        return _run_daily_inner(dry_run, days, limit, backlog, send_email, reconcile)
+    except Exception as e:
+        import traceback as _tb
+        trace = _tb.format_exc()
+        logger.error(f"[cns] run failed: {trace}")
+        write_status({"status": "error", "error": str(e), "traceback": trace,
+                      "finished_at": datetime.now(timezone.utc).isoformat()})
+        raise
+    finally:
+        stop.set()
+        beat.join(timeout=2)
+        _cns_lock.release()
+        _release_run_lock()
+
+
+_SEASON_PROMPT = """You are writing the quarterly CNS competitive-intelligence
+wrap-up for a CNS-focused biotech venture studio. Its lead program is a
+non-hallucinogenic 5-HT2A/2C agonist for apathy in Parkinson's disease; it also
+works on serotonergic mechanisms in Prader-Willi syndrome.
+
+Below are the verified findings from every large-pharma earnings call screened
+this season. Every quote was checked verbatim against its transcript.
+
+Write the wrap-up in HTML fragments (h3, p, ul, li only -- no html/head/body
+tags, no styling). Cover, in this order:
+1. BD appetite across pharma: who signalled hunger for external CNS assets, how
+   explicitly, and in prepared remarks or under analyst pressure.
+2. Competitor pipeline moves by area: Parkinson's and synucleinopathies,
+   neuropsychiatry, rare neuro, and the serotonergic and muscarinic mechanisms.
+3. Therapeutic-area posture: who is building a neuroscience franchise and who is
+   stepping back.
+4. Watchlist companies one by one, briefly, and only where there is something to
+   say.
+5. The read-through for this studio: what to act on, and what to watch.
+
+Ground every claim in the findings given. Do not speculate beyond them, and do
+not invent quotes. Where the season was quiet on a topic, say so plainly."""
+
+
+def _season_narrative(payload: str, label: str, model: str = None) -> str:
+    """-> the HTML narrative for the season wrap-up.
+
+    Streamed because the output is long. Separate from the per-transcript
+    screener: this one reasons over merged findings and must see all of them at
+    once, so it is deliberately not chunked."""
+    client = _anthropic_client()
+    with client.messages.stream(
+        model=model or CNS_SEASON_MODEL,
+        max_tokens=CNS_SEASON_MAX_TOKENS,
+        system=_SEASON_PROMPT,
+        messages=[{"role": "user",
+                   "content": f"Season: {label}\n\nVerified findings as JSON:\n{payload}"}],
+    ) as stream:
+        response = stream.get_final_message()
+    if getattr(response, "stop_reason", None) == "refusal":
+        raise CnsScreenError("season narrative refused (stop_reason=refusal)")
+    return _response_text(response)
+
+
+def run_season(label=None, start=None, end=None, dry_run=False,
+               send_email=True) -> dict:
+    """Build and email the season wrap-up from STORED findings.
+
+    Reads only. It never re-screens and never touches the ledger, so it is safe
+    to re-run for comparison -- the same property the pulse replay has."""
+    if label:
+        start_iso, end_iso = season_window(label)
+    elif start and end:
+        start_iso, end_iso, label = start, end, f"{start} to {end}"
+    else:
+        current = season_for_date(date.today())
+        if not current:
+            return {"status": "skipped",
+                    "reason": f"{date.today().isoformat()} falls between seasons"}
+        label, start_iso, end_iso = current
+
+    store = load_findings()
+    in_window = {
+        key: entry for key, entry in store.items()
+        if start_iso <= (entry.get("call_date") or "") <= end_iso
+    }
+    if not in_window:
+        logger.info(f"[cns] no stored findings in {label} ({start_iso}..{end_iso})")
+        return {"status": "empty", "season": label, "companies": 0}
+
+    payload = json.dumps(
+        sorted(in_window.values(), key=lambda e: e.get("symbol") or ""),
+        indent=1, default=str)
+    try:
+        narrative = _season_narrative(payload, label)
+    except Exception as e:
+        logger.error(f"[cns] season narrative failed: {e}", exc_info=True)
+        return {"status": "error", "season": label, "error": str(e)}
+
+    total_findings = sum(len(e.get("findings") or []) for e in in_window.values())
+    html = (
+        '<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;'
+        'font-size:14px;color:#1a202c;max-width:820px;">'
+        f'<p style="color:#4a5568;">{_esc(label)} &middot; call dates '
+        f'{_esc(start_iso)} to {_esc(end_iso)} &middot; {len(in_window)} companies '
+        f'&middot; {total_findings} verified findings</p>'
+        + narrative
+        + '<hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0 8px;">'
+        '<p style="color:#a0aec0;font-size:12px;">Sara &middot; CNS earnings screen'
+        '</p></div>')
+
+    emailed = False
+    if send_email:
+        prefix = "[DRY] " if dry_run else ""
+        emailed = send_digest(f"{prefix}CNS Earnings Season Wrap: {label}", html)
+    return {"status": "ok", "season": label, "window": f"{start_iso}..{end_iso}",
+            "companies": len(in_window), "findings": total_findings,
+            "emailed": emailed, "dry_run": dry_run}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="CNS earnings screen (Sara module)")
+    parser.add_argument("--days", type=int, default=None, help="lookback window in days")
+    parser.add_argument("--limit", type=int, default=None, help="cap transcripts this run")
+    parser.add_argument("--live", action="store_true", help="write state and send mail")
+    parser.add_argument("--backlog", action="store_true",
+                        help="reprocess everything in the window, ignoring the ledger")
+    parser.add_argument("--force", action="store_true", help="clear an orphaned run lock")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="force the per-symbol reconciliation sweep")
+    parser.add_argument("--season", default=None, help="season label, e.g. Q2-2026")
+    parser.add_argument("--no-email", action="store_true", help="never send mail")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+    if args.season:
+        result = run_season(label=args.season, dry_run=not args.live,
+                            send_email=not args.no_email)
+    else:
+        result = run_daily(dry_run=not args.live, days=args.days, limit=args.limit,
+                           backlog=args.backlog, force=args.force,
+                           send_email=not args.no_email,
+                           reconcile=True if args.reconcile else None)
+    print(json.dumps(result, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

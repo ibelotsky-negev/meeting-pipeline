@@ -5,6 +5,7 @@ import os
 import pytest
 
 import cns_screen
+import cns_fmp
 
 
 def test_load_keywords_exposes_every_group_the_code_relies_on():
@@ -724,3 +725,172 @@ def test_send_digest_never_raises_on_success_path():
     assert calls[0][0] == "graph_post"
 
     monkeypatch.undo()
+
+
+def test_process_one_records_no_cns_content_without_calling_the_model(cns_state, monkeypatch):
+    """The skip gate. An oncology-only call must cost zero model spend."""
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: ("Operator. Our PD-L1 oncology asset grew. "
+                                         + "filler. " * 400, "2026-07-31"))
+
+    def _boom(*a, **k):
+        raise AssertionError("model must not be called for a no-CNS transcript")
+
+    monkeypatch.setattr(cns_screen, "screen_transcript", _boom)
+    ledger, store = {}, {}
+    item = {"symbol": "XYZ", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    outcome = cns_screen.process_one(item, {"XYZ": {"name": "Xyz"}}, ledger, store, False)
+    assert outcome["status"] == "no_cns_content"
+    assert ledger["XYZ:2026:Q2"]["status"] == "no_cns_content"
+
+
+def test_process_one_records_a_retryable_gap_on_empty_content(cns_state, monkeypatch):
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: (None, "content_too_short:0"))
+    ledger, store = {}, {}
+    item = {"symbol": "AXSM", "fiscal_year": 2026, "quarter": 2, "date": "2026-08-10"}
+    outcome = cns_screen.process_one(item, {"AXSM": {}}, ledger, store, False)
+    assert outcome["status"] == "gap"
+    assert cns_screen.ledger_should_process(ledger, "AXSM:2026:Q2") is True
+
+
+def test_process_one_verifies_quotes_and_persists_only_verified(cns_state, monkeypatch):
+    body = ("Operator. Welcome. " + "filler words here. " * 200
+            + "We have significant capacity for business development, "
+              "particularly in neuroscience. " + "more filler. " * 200)
+    monkeypatch.setattr(cns_fmp, "fetch_transcript", lambda *a, **k: (body, "2026-07-31"))
+    monkeypatch.setattr(cns_screen, "screen_transcript", lambda *a, **k: {
+        "company": "AbbVie", "period": "Q2 2026", "relevant": True,
+        "overall_take": "Neuro BD appetite.",
+        "findings": [
+            {"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+             "speaker": "X",
+             "quote": "We have significant capacity for business development, "
+                      "particularly in neuroscience.",
+             "why_it_matters": "y", "entities": []},
+            {"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+             "speaker": "X", "quote": "We are buying a Parkinson's company tomorrow.",
+             "why_it_matters": "fabricated", "entities": []},
+        ]})
+    ledger, store = {}, {}
+    item = {"symbol": "ABBV", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    outcome = cns_screen.process_one(item, {"ABBV": {"name": "AbbVie"}},
+                                     ledger, store, False)
+    assert outcome["status"] == "screened"
+    assert outcome["dropped"] == 1
+    assert len(store["ABBV:2026:Q2"]["findings"]) == 1
+
+
+def test_process_one_dry_run_writes_no_state(cns_state, monkeypatch):
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: ("Operator. Neuroscience. " + "f. " * 900,
+                                         "2026-07-31"))
+    monkeypatch.setattr(cns_screen, "screen_transcript", lambda *a, **k: {
+        "company": "X", "period": "Q2 2026", "relevant": False,
+        "overall_take": "nothing", "findings": []})
+    ledger, store = {}, {}
+    item = {"symbol": "ABBV", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    cns_screen.process_one(item, {"ABBV": {}}, ledger, store, True)
+    assert ledger == {}, "dry run must not mark anything processed"
+    assert store == {}
+
+
+def test_process_one_failed_model_call_is_retryable(cns_state, monkeypatch):
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: ("Operator. Neuroscience. " + "f. " * 900,
+                                         "2026-07-31"))
+
+    def _fail(*a, **k):
+        raise cns_screen.CnsScreenError("model refused the request")
+
+    monkeypatch.setattr(cns_screen, "screen_transcript", _fail)
+    ledger, store = {}, {}
+    item = {"symbol": "ABBV", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    outcome = cns_screen.process_one(item, {"ABBV": {}}, ledger, store, False)
+    assert outcome["status"] == "failed"
+    assert cns_screen.ledger_should_process(ledger, "ABBV:2026:Q2") is True
+
+
+def test_run_daily_skips_when_a_run_is_already_in_progress(cns_state, monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "test-key")
+    assert cns_screen._acquire_run_lock() is True
+    try:
+        result = cns_screen.run_daily(dry_run=True, send_email=False)
+        assert result["status"] == "skipped"
+    finally:
+        cns_screen._release_run_lock()
+
+
+def test_run_daily_disabled_without_an_fmp_key(cns_state, monkeypatch):
+    monkeypatch.delenv("FMP_API_KEY", raising=False)
+    result = cns_screen.run_daily(dry_run=True, send_email=False)
+    assert result["status"] == "disabled"
+
+
+def test_run_daily_honours_the_per_run_cap(cns_state, monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    monkeypatch.setattr(cns_screen, "CNS_MAX_TRANSCRIPTS_PER_RUN", 2)
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {f"S{i}": {"name": f"S{i}"} for i in range(5)})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [
+        {"symbol": f"S{i}", "fiscal_year": 2026, "quarter": 2,
+         "date": "2026-07-31"} for i in range(5)])
+    monkeypatch.setattr(cns_fmp, "reported_symbols", lambda *a, **k: {})
+    seen = []
+
+    def _fake_process(item, *a, **k):
+        seen.append(item["symbol"])
+        return {"key": item["symbol"], "symbol": item["symbol"], "status": "no_cns_content",
+                "company": item["symbol"], "period": "Q2 FY2026",
+                "call_date": "2026-07-31", "dropped": 0, "findings": 0}
+
+    monkeypatch.setattr(cns_screen, "process_one", _fake_process)
+    result = cns_screen.run_daily(dry_run=True, send_email=False)
+    assert len(seen) == 2
+    assert result["cap_hit"] is True
+
+
+def test_run_daily_reports_reported_but_missing_beyond_the_grace_period(cns_state, monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {"SNY": {"name": "Sanofi"}})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [])
+    monkeypatch.setattr(cns_fmp, "reported_symbols",
+                        lambda *a, **k: {"SNY": "2026-01-29"})
+    result = cns_screen.run_daily(dry_run=True, send_email=False)
+    assert any(g["symbol"] == "SNY" for g in result["reported_no_transcript"])
+
+
+def test_run_season_reads_stored_findings_and_never_rescreens(cns_state, monkeypatch):
+    cns_screen.save_findings({"ABBV:2026:Q2": {
+        "symbol": "ABBV", "company": "AbbVie", "period": "Q2 FY2026",
+        "call_date": "2026-07-31", "overall_take": "Neuro BD appetite.",
+        "findings": [{"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+                      "speaker": "X", "quote": "q" * 40,
+                      "why_it_matters": "y", "entities": []}]}})
+
+    def _boom(*a, **k):
+        raise AssertionError("a season wrap-up must never re-screen")
+
+    monkeypatch.setattr(cns_screen, "process_one", _boom)
+    monkeypatch.setattr(cns_screen, "_season_narrative",
+                        lambda *a, **k: "<p>Narrative.</p>")
+    result = cns_screen.run_season(label="Q2-2026", dry_run=True, send_email=False)
+    assert result["status"] == "ok"
+    assert result["companies"] == 1
+    # the ledger is untouched, so the wrap-up is safe to re-run for comparison
+    assert cns_screen.load_ledger() == {}
+
+
+def test_run_season_excludes_calls_outside_the_window(cns_state, monkeypatch):
+    cns_screen.save_findings({
+        "A:2026:Q2": {"symbol": "A", "company": "A", "period": "Q2 FY2026",
+                      "call_date": "2026-07-31", "overall_take": "",
+                      "findings": [{"quote": "q" * 40, "priority": "HIGH"}]},
+        "B:2026:Q1": {"symbol": "B", "company": "B", "period": "Q1 FY2026",
+                      "call_date": "2026-05-01", "overall_take": "",
+                      "findings": [{"quote": "q" * 40, "priority": "HIGH"}]},
+    })
+    monkeypatch.setattr(cns_screen, "_season_narrative", lambda *a, **k: "n")
+    result = cns_screen.run_season(label="Q2-2026", dry_run=True, send_email=False)
+    assert result["companies"] == 1
