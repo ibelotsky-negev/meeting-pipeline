@@ -1007,7 +1007,6 @@ def test_process_one_survives_a_store_transcript_failure(cns_state, monkeypatch)
 
 
 def test_cns_status_route(flask_client, monkeypatch):
-    import app as app_module
     monkeypatch.setattr(cns_screen, "read_status",
                         lambda: {"status": "ok", "screened": 4})
     resp = flask_client.get("/cns/status")
@@ -1057,11 +1056,333 @@ def test_cns_season_route_passes_the_label(flask_client, monkeypatch):
 
 
 def test_cns_scheduler_jobs_are_registered_with_the_right_triggers():
-    """The season job must fire on the 15th of the four reporting months, in the
-    same timezone the module computes its windows in."""
-    import app as app_module
+    """The season job must fire on the 16th of the four reporting months, in the
+    same timezone the module computes its windows in.
+
+    The 16th, not the 15th: the season window CLOSES on the 15th, and screening
+    is sequential, so a peak-season daily scan of up to 60 Opus transcripts can
+    still hold the shared _cns_trigger_lock at 08:00. Colliding there would make
+    the season job log "already running" and never retry -- losing that
+    quarter's wrap-up entirely."""
     source = open("app.py", encoding="utf-8").read()
     assert 'id="cns_screen_daily"' in source
     assert 'id="cns_screen_season"' in source
     assert 'month="3,6,9,12"' in source
+    assert "day=16" in source, "the season job must run the day AFTER the window closes"
     assert source.count('timezone="Asia/Jerusalem"') >= 4
+
+
+# ======================================================================
+#  FINAL-REVIEW FIX WAVE
+# ======================================================================
+
+
+def test_compute_coverage_gaps_respects_the_grace_period():
+    """A call inside the grace period has not had time to publish yet."""
+    gaps = cns_screen._compute_coverage_gaps(
+        reported={"SNY": "2026-09-08"}, ledger={}, have=set(),
+        today_iso="2026-09-10", grace_days=3)
+    assert gaps == []
+
+
+def test_compute_coverage_gaps_reports_a_call_past_the_grace_period():
+    gaps = cns_screen._compute_coverage_gaps(
+        reported={"SNY": "2026-09-01"}, ledger={}, have=set(),
+        today_iso="2026-09-10", grace_days=3)
+    assert gaps == [{"symbol": "SNY", "date": "2026-09-01"}]
+
+
+def test_compute_coverage_gaps_skips_a_symbol_already_screened_this_run():
+    gaps = cns_screen._compute_coverage_gaps(
+        reported={"SNY": "2026-09-01"}, ledger={}, have={"SNY"},
+        today_iso="2026-09-10", grace_days=3)
+    assert gaps == []
+
+
+def test_compute_coverage_gaps_ignores_an_older_terminal_ledger_entry():
+    """A screen from LAST quarter must never suppress a newer missing call."""
+    ledger = {"ABBV:2026:Q1": {"status": "screened", "date": "2026-05-01"}}
+    gaps = cns_screen._compute_coverage_gaps(
+        reported={"ABBV": "2026-07-31"}, ledger=ledger, have=set(),
+        today_iso="2026-09-10", grace_days=3)
+    assert gaps == [{"symbol": "ABBV", "date": "2026-07-31"}]
+
+
+def test_compute_coverage_gaps_suppressed_by_a_terminal_entry_on_or_after():
+    ledger = {"ABBV:2026:Q2": {"status": "screened", "date": "2026-07-31"}}
+    gaps = cns_screen._compute_coverage_gaps(
+        reported={"ABBV": "2026-07-31"}, ledger=ledger, have=set(),
+        today_iso="2026-09-10", grace_days=3)
+    assert gaps == []
+
+
+def test_compute_coverage_gaps_dateless_terminal_entry_suppresses_nothing():
+    """A ledger entry with no date says nothing about WHICH call it covers, so
+    erring toward reporting is deliberate."""
+    ledger = {"ABBV:2026:Q2": {"status": "screened"},
+              "PFE:2026:Q2": {"status": "no_cns_content", "date": ""}}
+    gaps = cns_screen._compute_coverage_gaps(
+        reported={"ABBV": "2026-07-31", "PFE": "2026-07-29"},
+        ledger=ledger, have=set(), today_iso="2026-09-10", grace_days=3)
+    assert [g["symbol"] for g in gaps] == ["ABBV", "PFE"]
+
+
+def test_compute_coverage_gaps_is_sorted_by_symbol():
+    gaps = cns_screen._compute_coverage_gaps(
+        reported={"SNY": "2026-09-01", "ABBV": "2026-09-02", "MRK": "2026-09-01"},
+        ledger={}, have=set(), today_iso="2026-09-10", grace_days=3)
+    assert [g["symbol"] for g in gaps] == ["ABBV", "MRK", "SNY"]
+
+
+def test_gap_window_is_wider_than_the_discovery_window():
+    """The earnings-calendar window and the discovery window are DELIBERATELY
+    different sizes. Conflating them made the section one calendar day wide,
+    and it self-disabled entirely whenever grace >= lookback."""
+    assert cns_screen.CNS_GAP_WINDOW_DAYS > cns_screen.CNS_LOOKBACK_DAYS
+    assert cns_screen.CNS_GAP_WINDOW_DAYS > cns_screen.CNS_TRANSCRIPT_GRACE_DAYS
+
+
+def test_run_daily_fetches_the_calendar_over_its_own_wider_window(cns_state, monkeypatch):
+    """Regression guard for the one-day-wide gap section: reported_symbols must
+    be called with the GAP window, not the discovery window."""
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    monkeypatch.setattr(cns_screen, "CNS_GAP_WINDOW_DAYS", 30)
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {"SNY": {"name": "Sanofi", "source": "screener"}})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [])
+    seen = {}
+
+    def _reported(universe, start, end):
+        seen["start"], seen["end"] = start, end
+        return {}
+
+    monkeypatch.setattr(cns_fmp, "reported_symbols", _reported)
+    cns_screen.run_daily(dry_run=True, days=3, send_email=False)
+    span = (_date.fromisoformat(seen["end"]).toordinal()
+            - _date.fromisoformat(seen["start"]).toordinal())
+    assert span == 30, f"calendar window was {span} days wide, not the gap window"
+
+
+def test_resolve_universe_refuses_to_cache_a_roster_only_universe(cns_state, monkeypatch):
+    """A total screener outage returns the roster alone. Caching that would run
+    the screen at ~11% coverage for a full CNS_UNIVERSE_TTL_DAYS."""
+    monkeypatch.setattr(cns_fmp, "build_universe", lambda **k: {
+        "RHHBY": {"name": "RHHBY", "source": "roster"},
+        "NVS": {"name": "NVS", "source": "roster"},
+    })
+    universe = cns_screen.resolve_universe(force_refresh=True)
+    assert set(universe) == {"RHHBY", "NVS"}, "the run must still proceed"
+    assert not os.path.exists(cns_screen.CNS_UNIVERSE_FILE), \
+        "a roster-only universe must NOT be cached as fresh"
+
+
+def test_resolve_universe_caches_a_mixed_universe(cns_state, monkeypatch):
+    monkeypatch.setattr(cns_fmp, "build_universe", lambda **k: {
+        "PFE": {"name": "Pfizer", "source": "screener"},
+        "RHHBY": {"name": "RHHBY", "source": "roster"},
+    })
+    universe = cns_screen.resolve_universe(force_refresh=True)
+    assert set(universe) == {"PFE", "RHHBY"}
+    assert os.path.exists(cns_screen.CNS_UNIVERSE_FILE)
+
+
+def test_universe_source_labels_a_degraded_universe():
+    assert cns_screen._universe_source(
+        {"PFE": {"source": "screener"}, "NVS": {"source": "roster"}}) == "screener+roster"
+    assert cns_screen._universe_source({"NVS": {"source": "roster"}}) == "roster-only"
+    assert cns_screen._universe_source({}) == "roster-only"
+
+
+def test_run_daily_status_reports_the_universe_source(cns_state, monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {"NVS": {"name": "Novartis", "source": "roster"}})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [])
+    monkeypatch.setattr(cns_fmp, "reported_symbols", lambda *a, **k: {})
+    result = cns_screen.run_daily(dry_run=True, send_email=False)
+    assert result["universe_source"] == "roster-only"
+
+
+def test_render_digest_html_reports_a_failed_transcript():
+    """A per-transcript failure is recorded in cns_status.json, but it must also
+    reach the person reading the email -- it is excluded from both
+    findings_by_company and nothing_relevant."""
+    html = cns_screen.render_digest_html({
+        "window": "w", "findings_by_company": [], "nothing_relevant": [],
+        "reported_no_transcript": [], "unconfirmed": [],
+        "screen_errors": [{"symbol": "BIIB", "reason": "screen_transcript: boom"}],
+        "dropped_quotes": 0, "screened": 0, "cap_hit": False, "dry_run": False,
+    })
+    assert "Screened with errors" in html
+    assert "BIIB" in html
+    assert "screen_transcript: boom" in html
+
+
+def test_render_digest_html_omits_the_error_section_when_clean():
+    html = cns_screen.render_digest_html({
+        "window": "w", "findings_by_company": [], "nothing_relevant": [],
+        "reported_no_transcript": [], "unconfirmed": [], "screen_errors": [],
+        "dropped_quotes": 0, "screened": 1, "cap_hit": False, "dry_run": False,
+    })
+    assert "Screened with errors" not in html
+
+
+def test_render_digest_html_escapes_the_error_section():
+    html = cns_screen.render_digest_html({
+        "window": "w", "findings_by_company": [], "nothing_relevant": [],
+        "reported_no_transcript": [], "unconfirmed": [],
+        "screen_errors": [{"symbol": "<b>X</b>", "reason": "<script>alert(1)</script>"}],
+        "dropped_quotes": 0, "screened": 0, "cap_hit": False, "dry_run": False,
+    })
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_run_daily_context_carries_failed_and_gap_outcomes(cns_state, monkeypatch):
+    monkeypatch.setenv("FMP_API_KEY", "k")
+    monkeypatch.setattr(cns_screen, "resolve_universe",
+                        lambda **k: {"BIIB": {"name": "Biogen", "source": "screener"}})
+    monkeypatch.setattr(cns_fmp, "discover_from_feed", lambda *a, **k: [
+        {"symbol": "BIIB", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}])
+    monkeypatch.setattr(cns_fmp, "reported_symbols", lambda *a, **k: {})
+    monkeypatch.setattr(cns_fmp, "fetch_transcript",
+                        lambda *a, **k: (None, "content_too_short:0"))
+    rendered = {}
+    monkeypatch.setattr(cns_screen, "render_digest_html",
+                        lambda context: rendered.update(context) or "<div></div>")
+    monkeypatch.setattr(cns_screen, "send_digest", lambda *a, **k: True)
+    cns_screen.run_daily(dry_run=True, send_email=True)
+    assert rendered["screen_errors"] == [
+        {"symbol": "BIIB", "reason": "content_too_short:0"}]
+
+
+def test_build_user_content_names_the_entity_only_companies():
+    """entity_only names were parsed and never consumed. Astellas, Ono and
+    Shionogi are in neither the roster nor the keyword YAML's
+    watchlist_companies, so nothing but this hint makes the model notice them."""
+    prepared = cns_screen.prepare_transcript(_fixture("format_a_abbv.txt"))
+    content = cns_screen.build_user_content(prepared, "AbbVie", "Q2 2026", "2026-07-31")
+    assert "Astellas" in content
+    assert "Ono" in content
+    assert "Shionogi" in content
+    # the hint must sit OUTSIDE the untrusted fence, with the instructions
+    assert content.index("Astellas") < content.index(cns_screen.FENCE_OPEN)
+
+
+def test_season_payload_trims_over_the_cap_and_stays_under_it():
+    """One un-chunked Opus call over every stored finding is unbounded: a peak
+    season (240 companies x 8 findings) is roughly 250K tokens."""
+    entries = [{
+        "symbol": f"SYM{i}", "company": f"Company {i}", "period": "Q2 FY2026",
+        "call_date": "2026-07-31", "overall_take": "take " * 50,
+        "findings": [{
+            "signal": "BD_INTENT",
+            "priority": "LOW" if f % 2 else "HIGH",
+            "zone": "QA", "speaker": "CEO",
+            "quote": "q" * 400,
+            "why_it_matters": "w" * 400,
+            "entities": [],
+        } for f in range(8)],
+    } for i in range(60)]
+    full = cns_screen._season_payload(entries, max_chars=10 ** 9)
+    assert len(full) > 400000, "the un-trimmed payload must be the unbounded case"
+
+    # lever 1: drop LOW-priority findings
+    stage_one = cns_screen._season_payload(entries, max_chars=400000)
+    assert len(stage_one) <= 400000, "dropping LOW findings did not bring it under"
+    assert '"LOW"' not in stage_one
+    assert '"HIGH"' in stage_one, "HIGH findings must survive"
+
+    # lever 2: also drop why_it_matters
+    stage_two = cns_screen._season_payload(entries, max_chars=200000)
+    assert len(stage_two) <= 200000, "dropping why_it_matters did not bring it under"
+    assert "why_it_matters" not in stage_two
+    assert "q" * 400 in stage_two, "the verbatim quotes must survive both levers"
+
+    # the source rows must not be mutated -- the store is read back elsewhere
+    assert len(entries[0]["findings"]) == 8
+    assert entries[0]["findings"][0]["why_it_matters"] == "w" * 400
+
+
+def test_season_payload_never_trims_silently(caplog):
+    """Both levers exhausted and still over cap: the run proceeds, but it says
+    so. A silent over-cap payload is the Weekly-Pulse failure mode this guard
+    exists to avoid."""
+    import logging
+
+    entries = [{"symbol": f"S{i}", "findings": [
+        {"priority": "HIGH", "quote": "q" * 500, "why_it_matters": "w" * 200}]}
+        for i in range(40)]
+    with caplog.at_level(logging.WARNING, logger="cns-screen"):
+        payload = cns_screen._season_payload(entries, max_chars=1000)
+    assert len(payload) > 1000, "nothing left to trim -- it cannot fit"
+    assert any("STILL" in r.message for r in caplog.records), \
+        "an over-cap payload must be logged, never sent silently"
+
+
+def test_season_payload_leaves_a_small_payload_untouched():
+    entries = [{"symbol": "ABBV", "findings": [
+        {"priority": "LOW", "why_it_matters": "keep me"}]}]
+    payload = cns_screen._season_payload(entries)
+    assert "keep me" in payload
+    assert "LOW" in payload
+
+
+def test_truncated_response_is_terminal_and_not_retried(cns_state, monkeypatch):
+    """A max_tokens truncation is DETERMINISTIC at a fixed max_tokens and
+    effort, so retrying it burns all four fetch attempts on identical
+    failures."""
+    body = ("Operator. Welcome. " + "filler words here. " * 200
+            + "We have significant capacity for business development, "
+              "particularly in neuroscience. " + "more filler. " * 200)
+    monkeypatch.setattr(cns_fmp, "fetch_transcript", lambda *a, **k: (body, "2026-07-31"))
+
+    def _truncated(*a, **k):
+        raise cns_screen.CnsTruncatedError("response hit max_tokens")
+
+    monkeypatch.setattr(cns_screen, "screen_transcript", _truncated)
+    ledger, store = {}, {}
+    item = {"symbol": "BIIB", "fiscal_year": 2026, "quarter": 2, "date": "2026-07-31"}
+    outcome = cns_screen.process_one(item, {"BIIB": {}}, ledger, store, False)
+    assert outcome["status"] == "truncated"
+    assert ledger["BIIB:2026:Q2"]["status"] == "truncated"
+    assert cns_screen.ledger_should_process(ledger, "BIIB:2026:Q2") is False, \
+        "a deterministic truncation must not consume the retry budget"
+    assert "truncated" in cns_screen._TERMINAL_STATUSES
+
+
+def test_screen_transcript_raises_truncated_on_max_tokens():
+    prepared = cns_screen.prepare_transcript(_fixture("format_a_abbv.txt"))
+    with pytest.raises(cns_screen.CnsTruncatedError):
+        cns_screen.screen_transcript(
+            prepared, "AbbVie", "Q2 2026", "2026-07-31",
+            call_fn=lambda **kw: _Resp(_good_payload(), stop_reason="max_tokens"))
+    # a refusal stays a plain (retryable) failure
+    with pytest.raises(cns_screen.CnsScreenError) as excinfo:
+        cns_screen.screen_transcript(
+            prepared, "AbbVie", "Q2 2026", "2026-07-31",
+            call_fn=lambda **kw: _Resp(_good_payload(), stop_reason="refusal"))
+    assert not isinstance(excinfo.value, cns_screen.CnsTruncatedError)
+
+
+def test_truncated_outcome_reaches_the_digest_error_section():
+    html = cns_screen.render_digest_html({
+        "window": "w", "findings_by_company": [], "nothing_relevant": [],
+        "reported_no_transcript": [], "unconfirmed": [],
+        "screen_errors": [{"symbol": "BIIB",
+                           "reason": "screen_transcript: response hit max_tokens"}],
+        "dropped_quotes": 0, "screened": 0, "cap_hit": False, "dry_run": False,
+    })
+    assert "max_tokens" in html
+
+
+def test_universe_yaml_header_does_not_claim_entity_only_names_are_screened():
+    """The force_include header used to name Astellas, Ono and Shionogi as
+    members of that list while all three sit in entity_only below."""
+    with open(cns_screen.UNIVERSE_CONFIG_PATH, encoding="utf-8") as handle:
+        text = handle.read()
+    # split on the KEY at column 0, not on the word inside the comment above it
+    header = text.split("\nforce_include:")[0]
+    for name in ("Astellas", "Ono", "Shionogi"):
+        assert name not in header, \
+            f"{name} is entity_only but the force_include header still names it"

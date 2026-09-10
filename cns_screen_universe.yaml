@@ -3,12 +3,13 @@
 # force_include: companies the FMP industry screener does NOT return but that
 # must be screened anyway. Includes two classes: (1) ADR-listed companies whose
 # US listings carry no industry classification or market cap in the screener
-# (Roche, Lundbeck, UCB, Eisai, Daiichi Sankyo, Astellas, Ono, Shionogi are
-# missing from the FMP screener for this reason). (2) Still-trading companies
-# with sparse FMP transcript coverage (e.g., Alector: isActivelyTrading=True
-# but last transcript 2025-08-07, still sub-$1B so below the $1B screener floor).
+# (Roche, Lundbeck, UCB, Eisai and Daiichi Sankyo are missing from the FMP
+# screener for this reason). (2) Still-trading companies with sparse FMP
+# transcript coverage (e.g., Alector: isActivelyTrading=True but last transcript
+# 2025-08-07, still sub-$1B so below the $1B screener floor).
 # Both classes need manual inclusion to remain visible. A live probe on 2026-09-09
-# confirmed coverage status.
+# confirmed coverage status. Being missing from the screener is NOT sufficient on
+# its own -- the company must also still hold a US earnings call; see entity_only.
 force_include:
   - RHHBY      # Roche -- prasinezumab, trontinemab. 60 transcripts, latest 2026-07-23
   - HLUYY      # Lundbeck -- pure-play CNS. Latest 2026-08-19
@@ -46,7 +47,9 @@ force_include:
 # market). Dates below are the last observed transcript, for context only -- the
 # criterion is trading status, NOT transcript recency. (Alector proved the
 # distinction: still trading, yet sparse FMP coverage -> moved to force_include
-# to remain visible.)
+# to remain visible.) Astellas, Ono and Shionogi belong HERE, not in
+# force_include: the FMP screener misses them like the other ADRs, but they hold
+# no current US earnings call to fetch, which is what decides membership.
 entity_only:
   - Otsuka         # no transcripts under OTSKY or OTSKF at all
   - Cerevel        # acquired by AbbVie; last call 2023-11-01

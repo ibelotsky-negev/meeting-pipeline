@@ -3733,7 +3733,11 @@ _cns_trigger_lock = _threading.Lock()
 @app.route("/cns/run", methods=["GET", "POST"])
 def cns_run():
     """Manually trigger the CNS earnings screen (cns_screen module).
-    ?dry_run=1  -- classify and render but write no state and send no mail.
+    ?dry_run=1  -- screen and render but write NO state (no ledger, no findings,
+                   no stored transcript). It STILL emails the digest, with a
+                   "[DRY] " subject prefix and a banner, because a dry run whose
+                   output nobody can see is not useful. Screening costs real
+                   Opus tokens either way -- dry_run bounds state, not spend.
     ?days=N     -- lookback window in days (default CNS_LOOKBACK_DAYS, 3).
     ?limit=N    -- cap transcripts this run (default CNS_MAX_TRANSCRIPTS_PER_RUN).
     ?backlog=1  -- reprocess everything in the window, ignoring the ledger.
@@ -4151,7 +4155,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.35.0-cns-earnings-screen", "deployed": "2026-09-09"})
+    return jsonify({"version": "2.35.1-cns-review-fixes", "deployed": "2026-09-10"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4219,7 +4223,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.35.0-cns-earnings-screen", "steps": {}}
+    results = {"version": "2.35.1-cns-review-fixes", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -5203,10 +5207,18 @@ def cns_daily_run():
 
 
 def cns_season_run():
-    """Scheduled CNS earnings season wrap-up (15 Mar / Jun / Sep / Dec).
+    """Scheduled CNS earnings season wrap-up (16 Mar / Jun / Sep / Dec).
 
     Reads stored findings only -- it never re-screens and never mutates the
-    ledger, so a re-run is safe."""
+    ledger, so a re-run is safe.
+
+    The 16th, not the 15th: the season's call-date window CLOSES on the 15th,
+    and this job shares _cns_trigger_lock with the daily scan (they write the
+    same ledger and findings store). Screening is sequential, so a peak-season
+    daily run of up to CNS_MAX_TRANSCRIPTS_PER_RUN Opus transcripts can still be
+    running at 08:00. On a collision this job logs "already running" and NEVER
+    retries, which would lose that quarter's wrap-up outright -- running the day
+    after the window closes makes that collision impossible."""
     if not _cns_trigger_lock.acquire(blocking=False):
         logger.warning("[cns] Skipped scheduled season wrap-up -- already running")
         return
@@ -5334,14 +5346,19 @@ def start_scheduler():
         replace_existing=True,
         misfire_grace_time=3600,
     )
-    # Season wrap-up on the 15th of March, June, September and December -- the
-    # closing day of each reporting season's call-date window (see SEASONS in
-    # cns_screen.py). Same timezone the module computes its windows in.
+    # Season wrap-up on the 16th of March, June, September and December -- the
+    # day AFTER each reporting season's call-date window closes on the 15th (see
+    # SEASONS in cns_screen.py). The 16th rather than the 15th because this job
+    # shares _cns_trigger_lock with the daily 07:00 scan: screening is
+    # sequential, a peak-season run of up to 60 Opus transcripts can still hold
+    # the lock at 08:00, and a season job that finds it held logs "already
+    # running" and never retries -- silently losing the whole quarter's
+    # wrap-up. Same timezone the module computes its windows in.
     _scheduler.add_job(
         cns_season_run,
         trigger="cron",
         month="3,6,9,12",
-        day=15,
+        day=16,
         hour=8,
         minute=0,
         timezone="Asia/Jerusalem",

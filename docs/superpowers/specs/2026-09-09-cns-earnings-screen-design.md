@@ -130,6 +130,17 @@ The split is deliberate: the FMP client is the only part that touches the
 network in normal operation, so isolating it keeps the screening logic fully
 testable offline.
 
+**Screening is SEQUENTIAL, deliberately.** There is no concurrency knob, and
+adding one is ruled out rather than merely unimplemented: `process_one` mutates
+the shared `ledger` and `findings_store` dicts, and the per-item persistence
+ORDER that guarantees durability (findings written before the ledger, so a crash
+between the two can only cause a harmless re-screen and never a lost finding)
+depends on those writes happening one at a time. Threading it would mean
+restructuring persistence, which buys nothing at this volume. A long run is safe
+because the `O_CREAT|O_EXCL` run lock carries an mtime heartbeat, so a run that
+outlives `CNS_LOCK_MAX_AGE` is not mistaken for a stale lock and reclaimed
+underneath itself.
+
 ### Daily flow
 
 1. **Universe** (`cns_fmp.build_universe`) -- three industry screens, market cap
@@ -233,11 +244,22 @@ In order:
 4. **Reported but no transcript** -- universe companies whose `earnings-calendar`
    date passed more than `CNS_TRANSCRIPT_GRACE_DAYS` (default 3) ago with no
    transcript fetched. This is what makes a Sanofi-style coverage gap visible.
-5. **Unconfirmed high-signal keyword hits** -- paragraphs matching the YAML's
+   The calendar is read over `CNS_GAP_WINDOW_DAYS` (default 30), which is
+   DELIBERATELY a different size from the discovery window: the grace filter
+   trims the recent end of it, so reading the calendar over the 3-day discovery
+   window left the eligible set exactly one date wide, and empty for any
+   configuration with grace >= lookback. Discovery drives fetches and stays
+   narrow; the calendar read is one cheap call and stays wide.
+5. **Screened with errors** -- per-transcript `failed`, `gap` and `truncated`
+   outcomes, with the reason. A failure is in neither the findings list nor the
+   nothing-relevant line, so without this section the only way it reached a
+   reader was the coverage-gap list above, which would mislabel it "transcript
+   not available" when the transcript was available and the SCREEN failed.
+6. **Unconfirmed high-signal keyword hits** -- paragraphs matching the YAML's
    `high_signal_rare_terms` that the model did NOT report. A model miss on
    apathy, Prader-Willi, or 5-HT2C is the single most expensive failure this
    screen can have, so the keyword layer reports it independently.
-6. Dropped-quote count, if any.
+7. Dropped-quote count, if any.
 
 ### Season wrap-up
 
@@ -245,10 +267,18 @@ Windows are defined on call date, not fiscal label:
 
 | Season label | Call-date window | Cron |
 |---|---|---|
-| Q4 / annual | Jan 1 -- Mar 15 | Mar 15 |
-| Q1 | Apr 1 -- Jun 15 | Jun 15 |
-| Q2 | Jul 1 -- Sep 15 | Sep 15 |
-| Q3 | Oct 1 -- Dec 15 | Dec 15 |
+| Q4 / annual | Jan 1 -- Mar 15 | Mar 16 |
+| Q1 | Apr 1 -- Jun 15 | Jun 16 |
+| Q2 | Jul 1 -- Sep 15 | Sep 16 |
+| Q3 | Oct 1 -- Dec 15 | Dec 16 |
+
+The cron runs the day AFTER the window closes, not on the closing day. The
+season job shares the single `_cns_trigger_lock` with the daily 07:00 scan
+(they write the same ledger and findings store), screening is sequential, and a
+peak-season run of up to `CNS_MAX_TRANSCRIPTS_PER_RUN` Opus transcripts can
+still be running at 08:00. A season job that finds the lock held logs "already
+running" and never retries, so a collision would lose that quarter's wrap-up
+outright. Running on the 16th makes the collision impossible.
 
 One Opus 5 call reads every stored finding in the window and writes a narrative:
 BD appetite across pharma, pipeline moves by area, TA-posture shifts, watchlist
@@ -300,11 +330,12 @@ New env vars:
 | `CNS_MIN_MARKET_CAP` | `1000000000` | Universe floor |
 | `CNS_UNIVERSE_TTL_DAYS` | `7` | Universe cache lifetime |
 | `CNS_FEED_PAGES` | `40` | Max pages of the latest feed per run |
-| `CNS_LOOKBACK_DAYS` | `3` | Daily discovery window |
+| `CNS_LOOKBACK_DAYS` | `3` | Daily DISCOVERY window (drives transcript fetches) |
+| `CNS_GAP_WINDOW_DAYS` | `30` | Earnings-CALENDAR window for the coverage-gap section. Deliberately wider than the discovery window -- see Digest contents |
 | `CNS_MAX_TRANSCRIPTS_PER_RUN` | `60` | Per-run cost bound |
 | `CNS_TRANSCRIPT_GRACE_DAYS` | `3` | Reported-but-missing threshold |
 | `CNS_RECONCILE_WEEKDAY` | `6` | Weekly per-symbol sweep (0=Mon, 6=Sun) |
-| `CNS_CONCURRENCY` | `4` | Parallel screening calls |
+| `CNS_SEASON_MAX_PAYLOAD_CHARS` | `400000` | Size cap on the season wrap-up's single Opus payload. Over it, LOW-priority findings are dropped first, then `why_it_matters`, and what was trimmed is logged |
 | `CNS_ANTHROPIC_TIMEOUT` | `300` | Per-call timeout, seconds |
 | `CNS_GATE_WINDOW` | `600` | Proximity window, chars, for BD and ambiguity gating |
 | `CNS_MIN_TRANSCRIPT_CHARS` | `2000` | Below this the content is unusable -> coverage gap |
@@ -329,8 +360,14 @@ State files on `/data`: `cns_universe.json`, `cns_ledger.json`,
 | `/cns/season` | Season wrap-up. `?season=Q2-2026&start=&end=&dry_run=&sync=` |
 | `/cns/status` | Last run outcome, per-company decisions, dropped-quote count, heartbeat |
 
-Cron: daily 07:00 Asia/Jerusalem; season wrap-up on the 15th of March, June,
-September and December at 08:00 Asia/Jerusalem.
+Cron: daily 07:00 Asia/Jerusalem; season wrap-up on the 16th of March, June,
+September and December at 08:00 Asia/Jerusalem (the day after the window
+closes -- see Season wrap-up for why not the 15th).
+
+`?dry_run=1` on `/cns/run` writes NO state, but it still screens (real Opus
+spend) and still emails the digest with a `[DRY] ` subject prefix. It bounds
+state, not cost. The CLI mirrors this: `python cns_screen.py` without `--live`
+is the dry form, and `--no-email` is what suppresses the send.
 
 ## Claude API usage
 
