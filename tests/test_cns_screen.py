@@ -1386,3 +1386,59 @@ def test_universe_yaml_header_does_not_claim_entity_only_names_are_screened():
     for name in ("Astellas", "Ono", "Shionogi"):
         assert name not in header, \
             f"{name} is entity_only but the force_include header still names it"
+
+
+def _walk_schema(node, path="root"):
+    """Yield (path, key) for every mapping key in a JSON schema tree."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield path, key
+            yield from _walk_schema(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _walk_schema(value, f"{path}[{index}]")
+
+
+def test_findings_schema_uses_no_api_rejected_keywords():
+    """Regression guard for a live 400 that no offline test could catch.
+
+    The structured-outputs API rejects `maxItems` on an array:
+        output_config.format.schema: For 'array' type, property 'maxItems'
+        is not supported
+    Probed live against claude-opus-5 on 2026-09-10, where it failed the
+    first five real transcripts before any finding was produced. Every other
+    test in this file injects a fake caller, so the schema is never validated
+    by the API -- this assertion is the only thing standing between a schema
+    edit and a whole run of 400s.
+    """
+    rejected = {"maxItems", "minItems", "uniqueItems",
+                "maxLength", "minLength", "pattern",
+                "maximum", "minimum", "format"}
+    found = sorted({key for _, key in _walk_schema(cns_screen.FINDINGS_SCHEMA)
+                    if key in rejected})
+    assert found == [], (
+        f"FINDINGS_SCHEMA carries schema keyword(s) the API rejects: {found}. "
+        "Probe any new keyword against the live API before adding it."
+    )
+
+
+def test_screen_transcript_truncates_to_the_finding_cap(monkeypatch):
+    """The cap lives in code because the schema cannot express it."""
+    monkeypatch.setattr(cns_screen, "CNS_MAX_FINDINGS", 3)
+    prepared = cns_screen.prepare_transcript(_fixture("format_a_abbv.txt"))
+    payload = {
+        "company": "AbbVie", "period": "Q2 2026", "relevant": True,
+        "overall_take": "Many findings.",
+        "findings": [
+            {"signal": "BD_INTENT", "priority": "HIGH", "zone": "QA",
+             "speaker": None, "quote": f"quote number {n} here",
+             "why_it_matters": "y", "entities": []}
+            for n in range(9)
+        ],
+    }
+    result = cns_screen.screen_transcript(
+        prepared, "AbbVie", "Q2 2026", "2026-07-31",
+        call_fn=lambda **kw: _Resp(payload))
+    assert len(result["findings"]) == 3
+    assert result["findings"][0]["quote"] == "quote number 0 here"
+    assert result["findings"][2]["quote"] == "quote number 2 here"
