@@ -734,3 +734,95 @@ def screen_transcript(prepared, company: str, period_label: str, call_date: str,
     result["relevant"] = bool(result.get("relevant"))
     result["overall_take"] = str(result.get("overall_take") or "")
     return result
+
+
+# ======================================================================
+#  QUOTE VERIFICATION
+# ======================================================================
+# Ken's prompt requires every quote to be copied verbatim, and his usage notes
+# call for asserting that after each run: "This catches the one failure mode
+# that would quietly poison the output -- a plausible-sounding quote the model
+# composed rather than copied." This is that assertion, and it is
+# unconditional. A finding whose quote cannot be located is DROPPED.
+CNS_MIN_QUOTE_CHARS = int(os.environ.get("CNS_MIN_QUOTE_CHARS", "25"))
+CNS_MAX_UNCONFIRMED = int(os.environ.get("CNS_MAX_UNCONFIRMED", "12"))
+CNS_EXCERPT_CHARS = int(os.environ.get("CNS_EXCERPT_CHARS", "240"))
+
+_WHITESPACE = re.compile(r"\s+")
+
+
+def canon_body(text: str) -> str:
+    """-> normalized, whitespace-collapsed, lowercased text. NOT stripped.
+
+    Deliberately unstripped so it is PREFIX-MONOTONIC: canon_body(raw[:n]) is
+    exactly the canonical prefix of canon_body(raw). That property is what makes
+    it valid to map a raw boundary offset into canonical space with
+    len(canon_body(raw[:boundary])). A .strip() here would silently break the
+    zone recomputation for any transcript whose text starts with whitespace."""
+    return _WHITESPACE.sub(" ", normalize_text(text)).lower()
+
+
+def verify_findings(findings, raw_text: str, boundary):
+    """-> (kept, dropped). dropped entries are (finding, reason).
+
+    Matching is done in canonical space so a quote survives collapsed
+    whitespace, a folded smart apostrophe, and case drift -- differences that
+    are transcription noise, not fabrication.
+
+    `zone` is RECOMPUTED from where the quote actually sits. The model's label
+    is advisory: it cannot see character offsets, and a wrong zone changes the
+    finding's priority under Ken's rules. When there is no boundary, the model's
+    label is left alone rather than replaced with a guess."""
+    haystack = canon_body(raw_text)
+    canonical_boundary = None
+    if boundary is not None:
+        canonical_boundary = len(canon_body((raw_text or "")[:boundary]))
+
+    kept, dropped = [], []
+    for finding in findings or []:
+        needle = canon_body(finding.get("quote") or "").strip()
+        if len(needle) < CNS_MIN_QUOTE_CHARS:
+            dropped.append((finding, "quote_too_short"))
+            continue
+        index = haystack.find(needle)
+        if index < 0:
+            dropped.append((finding, "quote_not_found"))
+            continue
+        verified = dict(finding)
+        verified["_offset"] = index
+        if canonical_boundary is not None:
+            verified["zone"] = zone_of(index, canonical_boundary)
+        else:
+            verified["zone"] = finding.get("zone") or "UNKNOWN"
+        kept.append(verified)
+    if dropped:
+        logger.warning(f"[cns] dropped {len(dropped)} finding(s) failing "
+                       "verbatim-quote verification")
+    return kept, dropped
+
+
+def unconfirmed_high_signal(prefilter_result, kept, raw_text: str):
+    """-> [{term, excerpt}] for high-signal terms the model did NOT quote.
+
+    An independent recall check. The prefilter and the model can each miss
+    different things; this surfaces the case where the keyword layer saw a term
+    Ken always wants to read about (apathy, non-hallucinogenic, neuroplastogen,
+    5-HT2C, Prader-Willi, hyperphagia, Parkinson's disease psychosis) and no
+    reported finding quotes it. That is a model miss, and it is the most
+    expensive kind this screen can have."""
+    reported = " ".join(canon_body(f.get("quote") or "") for f in (kept or []))
+    normalized = normalize_text(raw_text)
+    seen, out = set(), []
+    for term, offset in (prefilter_result.high_signal_hits or []):
+        key = term.lower()
+        if key in seen:
+            continue
+        if canon_body(term).strip() and canon_body(term).strip() in reported:
+            continue
+        seen.add(key)
+        lo = max(0, offset - CNS_EXCERPT_CHARS)
+        hi = min(len(normalized), offset + CNS_EXCERPT_CHARS)
+        out.append({"term": term, "excerpt": normalized[lo:hi].strip()})
+        if len(out) >= CNS_MAX_UNCONFIRMED:
+            break
+    return out

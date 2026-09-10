@@ -402,3 +402,85 @@ def test_screen_call_retries_plain_endpoint_when_beta_fallback_rejected():
     resp = cns_screen._screen_call(_Client(), "sys", "user")
     assert attempts == ["beta", "plain"]
     assert resp.stop_reason == "end_turn"
+
+
+def test_verify_findings_keeps_a_verbatim_quote():
+    raw = "Operator. Welcome. We have significant capacity for business development."
+    findings = [{"quote": "We have significant capacity for business development.",
+                 "zone": "PREPARED_REMARKS"}]
+    kept, dropped = cns_screen.verify_findings(findings, raw, None)
+    assert len(kept) == 1 and not dropped
+
+
+def test_verify_findings_drops_a_fabricated_quote():
+    """The one failure mode that would quietly poison the whole output."""
+    raw = "Operator. Welcome. Our oncology franchise grew."
+    findings = [{"quote": "We are actively hunting Parkinson's assets.",
+                 "zone": "QA"}]
+    kept, dropped = cns_screen.verify_findings(findings, raw, None)
+    assert kept == []
+    assert dropped[0][1] == "quote_not_found"
+
+
+def test_verify_findings_tolerates_smart_quotes_and_whitespace():
+    raw = "Operator. We see    real\nopportunity in Parkinson\u2019s disease today."
+    findings = [{"quote": "We see real opportunity in Parkinson's disease today.",
+                 "zone": "QA"}]
+    kept, dropped = cns_screen.verify_findings(findings, raw, None)
+    assert len(kept) == 1, f"dropped unexpectedly: {dropped}"
+
+
+def test_verify_findings_drops_a_too_short_quote():
+    raw = "Operator. Welcome to the call. Neuroscience is a priority."
+    kept, dropped = cns_screen.verify_findings([{"quote": "the", "zone": "QA"}], raw, None)
+    assert kept == []
+    assert dropped[0][1] == "quote_too_short"
+
+
+def test_verify_findings_recomputes_zone_across_collapsed_whitespace():
+    """The boundary is a RAW offset while the match position is CANONICAL.
+    Without mapping the boundary into canonical space, a quote just after the
+    boundary is mislabelled PREPARED_REMARKS."""
+    prepared_part = ("Operator. Welcome to the call."
+                     + ("   \n   padding words here." * 40))
+    qa_part = " Analyst (X). What is your appetite for neuroscience assets?"
+    raw = prepared_part + qa_part
+    boundary = len(prepared_part)
+    findings = [
+        {"quote": "What is your appetite for neuroscience assets?",
+         "zone": "PREPARED_REMARKS"},   # model got it wrong on purpose
+        {"quote": "Operator. Welcome to the call.", "zone": "QA"},   # also wrong on purpose
+    ]
+    kept, dropped = cns_screen.verify_findings(findings, raw, boundary)
+    assert not dropped
+    by_quote = {f["quote"]: f["zone"] for f in kept}
+    assert by_quote["What is your appetite for neuroscience assets?"] == "QA"
+    assert by_quote["Operator. Welcome to the call."] == "PREPARED_REMARKS"
+
+
+def test_verify_findings_leaves_model_zone_when_boundary_unknown():
+    raw = "Operator. Welcome. Neuroscience remains a core therapeutic area."
+    findings = [{"quote": "Neuroscience remains a core therapeutic area.",
+                 "zone": "QA"}]
+    kept, _ = cns_screen.verify_findings(findings, raw, None)
+    assert kept[0]["zone"] == "QA", "no boundary -> do not override the model"
+
+
+def test_unconfirmed_high_signal_reports_a_model_miss():
+    """A miss on apathy or Prader-Willi is the most expensive failure this
+    screen has, so the keyword layer reports it independently of the model."""
+    raw = ("Operator. Welcome. We are studying apathy in Parkinson's disease. "
+           "Separately our oncology franchise grew twelve percent.")
+    res = cns_screen.prefilter(raw)
+    # the model reported nothing
+    missed = cns_screen.unconfirmed_high_signal(res, [], raw)
+    terms = {m["term"].lower() for m in missed}
+    assert "apathy" in terms
+    assert missed[0]["excerpt"]
+
+
+def test_unconfirmed_high_signal_stays_quiet_when_the_model_quoted_it():
+    raw = "Operator. We are studying apathy in Parkinson's disease."
+    res = cns_screen.prefilter(raw)
+    kept = [{"quote": "We are studying apathy in Parkinson's disease."}]
+    assert cns_screen.unconfirmed_high_signal(res, kept, raw) == []
