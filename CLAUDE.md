@@ -588,7 +588,7 @@ prep, keyword prefilter, Q&A zone detection, Claude screening, quote
 verification, state, digest, orchestration). Both imported lazily by app.py
 (route + cron handlers only), never at module load, so app.py stays importable
 with no `FMP_API_KEY`. Full spec:
-`.superpowers/sdd/2026-09-09-cns-earnings-screen/2026-09-09-cns-earnings-screen-design.md`.
+`docs/superpowers/specs/2026-09-09-cns-earnings-screen-design.md`.
 
 - **Universe:** three FMP industry screens (pharma/biotech, >$1B market cap,
   US listings) unioned with a `force_include` roster in
