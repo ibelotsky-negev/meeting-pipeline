@@ -4155,7 +4155,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.35.1-cns-review-fixes", "deployed": "2026-09-10"})
+    return jsonify({"version": "2.35.2-cns-schema-fix", "deployed": "2026-09-10"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4223,7 +4223,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.35.1-cns-review-fixes", "steps": {}}
+    results = {"version": "2.35.2-cns-schema-fix", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

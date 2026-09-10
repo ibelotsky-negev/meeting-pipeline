@@ -596,9 +596,17 @@ FINDINGS_SCHEMA = {
         "period": {"type": "string"},
         "relevant": {"type": "boolean"},
         "overall_take": {"type": "string"},
+        # NO "maxItems" here. The structured-outputs API REJECTS it with
+        # 400 invalid_request_error: "For 'array' type, property 'maxItems'
+        # is not supported". Probed live against claude-opus-5 on 2026-09-10,
+        # where it failed the first five real transcripts. The cap is still
+        # requested in prose by the prompt ("Report at most 8 findings") and
+        # is ENFORCED in code by screen_transcript, which truncates to
+        # CNS_MAX_FINDINGS after parsing -- see there. Do not add a schema
+        # keyword back without probing it live: offline tests inject a fake
+        # caller, so they can never validate what the API actually accepts.
         "findings": {
             "type": "array",
-            "maxItems": CNS_MAX_FINDINGS,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -765,7 +773,17 @@ def screen_transcript(prepared, company: str, period_label: str, call_date: str,
     findings = result.get("findings")
     if not isinstance(findings, list):
         findings = []
-    result["findings"] = [f for f in findings if isinstance(f, dict)]
+    # Enforce the finding cap HERE, not in the schema. The API rejects
+    # "maxItems" on an array (see FINDINGS_SCHEMA), so prose asks for the cap
+    # and this line guarantees it. Ken's prompt says to keep the
+    # highest-priority findings when more qualify, and the model returns them
+    # in priority order, so truncating the tail is the intended behavior.
+    kept = [f for f in findings if isinstance(f, dict)]
+    if len(kept) > CNS_MAX_FINDINGS:
+        logger.info(f"[cns] {company} returned {len(kept)} findings; "
+                    f"truncating to the first {CNS_MAX_FINDINGS}")
+        kept = kept[:CNS_MAX_FINDINGS]
+    result["findings"] = kept
     result.setdefault("company", company)
     result.setdefault("period", period_label)
     result["relevant"] = bool(result.get("relevant"))
