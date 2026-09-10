@@ -941,6 +941,15 @@ def record_ledger(ledger: dict, key: str, status: str, **fields):
         entry["attempts"] = int(entry.get("attempts") or 0) + 1
     else:
         entry.setdefault("attempts", int(entry.get("attempts") or 0))
+    # Strip the two fields this function OWNS before merging caller data.
+    # `entry.update(fields)` runs after the attempts increment, so a caller
+    # passing attempts= would silently reset the retry counter and reopen the
+    # budget -- defeating retry-without-ratcheting, which is the whole point of
+    # the terminal/non-terminal split. Python already rejects a duplicate
+    # status= (it is a named parameter); attempts= has no such protection.
+    fields = dict(fields)
+    fields.pop("attempts", None)
+    fields.pop("status", None)
     entry.update(fields)
     ledger[key] = entry
 

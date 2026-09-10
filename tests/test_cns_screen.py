@@ -557,3 +557,37 @@ def test_status_round_trip_and_default(cns_state):
     assert cns_screen.read_status()["status"] == "no_runs"
     cns_screen.write_status({"status": "ok", "screened": 3})
     assert cns_screen.read_status()["screened"] == 3
+
+
+def test_record_ledger_rejects_caller_supplied_attempts_reset(cns_state, monkeypatch):
+    """Prove that record_ledger guards against a caller resetting the retry
+    counter via attempts=. This was a silent contract violation -- a caller
+    could pass attempts= as a kwarg and silently clobber the increment logic,
+    reopening a budget for retries that had already been exhausted. The fix
+    removes attempts from the caller-supplied fields before the update."""
+    monkeypatch.setattr(cns_screen, "CNS_MAX_FETCH_ATTEMPTS", 3)
+    ledger, key = {}, "TEST:2026:Q2"
+
+    # record two gaps to advance attempts to 2; ledger_should_process is still True
+    cns_screen.record_ledger(ledger, key, "gap", reason="first_gap")
+    assert ledger[key]["attempts"] == 1
+    assert cns_screen.ledger_should_process(ledger, key) is True
+
+    cns_screen.record_ledger(ledger, key, "gap", reason="second_gap")
+    assert ledger[key]["attempts"] == 2
+    assert cns_screen.ledger_should_process(ledger, key) is True
+
+    # now try to clobber: pass attempts=0 as a kwarg to reset the counter.
+    # the guard must reject this, compute attempts=3 normally, and preserve
+    # the legitimate co-passed field (reason).
+    cns_screen.record_ledger(ledger, key, "gap", attempts=0, reason="clobber_attempt")
+    assert ledger[key]["attempts"] == 3, (
+        "attempts=0 passed as a kwarg was silently accepted; "
+        "the fix did not guard against it"
+    )
+    assert ledger[key]["reason"] == "clobber_attempt", (
+        "legitimate caller fields were dropped; the guard over-removed"
+    )
+    assert cns_screen.ledger_should_process(ledger, key) is False, (
+        "with attempts==3 and cap==3, the period must not retry"
+    )
