@@ -87,6 +87,9 @@ if not TEAM_MEMBER_NAMES:
         "shlomi@negevlabs.com": "Shlomi Raz",
         "dan@negevlabs.com": "Dan Jeffries",
         "ka@negevlabs.com": "Kostia Adamsky",
+        # Ariadne Bio hire (2026-10): no @negevlabs.com mailbox, so her
+        # @ariadnebio.com address is canonical (normalize_team_email passes it through).
+        "vessela@ariadnebio.com": "Vessela Gavrailova",
     }
 # Build list for template: [{email, name}, ...]
 TEAM_MEMBERS_LIST = [{"email": e, "name": n} for e, n in sorted(TEAM_MEMBER_NAMES.items(), key=lambda x: x[1])]
