@@ -788,6 +788,10 @@ def _failure_message(error: str) -> str:
     if "channel or playlist" in low:
         return ("That YouTube link points to a channel or playlist, not a single video -- "
                 "send the link to one video and I'll transcribe it.")
+    if "captions blocked by youtube" in low:
+        return ("YouTube is refusing requests from Sara's server right now -- a block "
+                "on the server's address, not on this video. Re-sending will not help "
+                "until that is fixed. This is not a length limit.")
     if "captions fetch failed" in low:
         return ("YouTube would not hand over the captions just now (temporary) -- "
                 "re-send the link in a few minutes and it should go through. "

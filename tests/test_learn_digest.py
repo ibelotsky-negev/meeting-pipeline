@@ -1565,13 +1565,30 @@ class TestCaptionRetry:
         assert calls["n"] == 1    # fail fast, do not waste the caller's time
 
     def test_exhausted_retries_report_a_transient_reason(self, monkeypatch):
-        Api, calls = self._api_failing_then(99, _named_lib_error("IpBlocked")("blocked"))
+        Api, calls = self._api_failing_then(
+            99, _named_lib_error("YouTubeRequestFailed")("500"))
         _install_fake_yta(monkeypatch, Api)
         text, err = ld.fetch_youtube_transcript(self._URL)
         assert text is None
         assert "captions fetch failed (temporary)" in err
-        assert "IpBlocked" in err
+        assert "YouTubeRequestFailed" in err
         assert calls["n"] == ld.LEARN_YT_ATTEMPTS
+
+    def test_ip_block_is_reported_as_a_block_not_a_blip(self, monkeypatch):
+        """2026-10-07: YouTube IpBlocked Railway's egress IP and the same video
+        failed identically an hour apart. Labelling that "temporary" told the
+        user to re-send into a wall. Still retried (a rotating proxy gets a
+        fresh IP per attempt), but REPORTED as a server block."""
+        monkeypatch.delenv("YT_PROXY_URL", raising=False)
+        for name in ("IpBlocked", "RequestBlocked"):
+            Api, calls = self._api_failing_then(99, _named_lib_error(name)("blocked"))
+            _install_fake_yta(monkeypatch, Api)
+            text, err = ld.fetch_youtube_transcript(self._URL)
+            assert text is None
+            assert err.startswith("captions blocked by YouTube"), err
+            assert "temporary" not in err
+            assert "no proxy set" in err and name in err
+            assert calls["n"] == ld.LEARN_YT_ATTEMPTS
 
     def test_success_first_try_reports_no_error(self, monkeypatch):
         _install_fake_yta(monkeypatch, _api_with_tracks(_Track("ru", True, ["privet"])))
@@ -1584,3 +1601,118 @@ class TestCaptionRetry:
     def test_text_only_wrapper_still_returns_a_string(self, monkeypatch):
         _install_fake_yta(monkeypatch, _api_with_tracks(_Track("en", True, ["hi"])))
         assert ld._fetch_youtube_transcript(self._URL) == "hi"
+
+
+class TestYoutubeProxy:
+    """YT_PROXY_URL routes YouTube -- and only YouTube -- through a proxy."""
+
+    _URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    _PROXY = "http://user-rotate:pw@p.webshare.io:80"
+
+    @pytest.fixture(autouse=True)
+    def _no_backoff(self, monkeypatch):
+        monkeypatch.setattr(ld, "LEARN_YT_RETRY_WAIT", 0)
+
+    def _install_recording_yta(self, monkeypatch, fail_first=0):
+        """Fake library recording every client construction and its proxy."""
+        import sys
+        import types
+        built = []
+
+        class Cfg:
+            def __init__(self, http_url=None, https_url=None):
+                self.http_url, self.https_url = http_url, https_url
+
+        class Api:
+            def __init__(self, proxy_config=None):
+                built.append(proxy_config)
+
+            def list(self, vid):
+                if len(built) <= fail_first:
+                    raise _named_lib_error("IpBlocked")("blocked")
+                return [_Track("ru", True, ["privet"])]
+
+            def fetch(self, vid):
+                raise AssertionError("must go through list()")
+
+        mod = types.ModuleType("youtube_transcript_api")
+        mod.YouTubeTranscriptApi = Api
+        proxies = types.ModuleType("youtube_transcript_api.proxies")
+        proxies.GenericProxyConfig = Cfg
+        monkeypatch.setitem(sys.modules, "youtube_transcript_api", mod)
+        monkeypatch.setitem(sys.modules, "youtube_transcript_api.proxies", proxies)
+        return built
+
+    def test_unset_connects_direct(self, monkeypatch):
+        monkeypatch.delenv("YT_PROXY_URL", raising=False)
+        built = self._install_recording_yta(monkeypatch)
+        assert ld.fetch_youtube_transcript(self._URL) == ("privet", "")
+        assert built == [None]
+
+    def test_set_routes_captions_through_the_proxy(self, monkeypatch):
+        monkeypatch.setenv("YT_PROXY_URL", "  " + self._PROXY + "  ")
+        built = self._install_recording_yta(monkeypatch)
+        assert ld.fetch_youtube_transcript(self._URL) == ("privet", "")
+        assert len(built) == 1
+        assert built[0].http_url == self._PROXY
+        assert built[0].https_url == self._PROXY
+
+    def test_each_retry_builds_a_fresh_client(self, monkeypatch):
+        """A fresh client = a fresh connection = a fresh rotating-proxy IP.
+        Reusing one client would retry from the same blocked address."""
+        monkeypatch.setenv("YT_PROXY_URL", self._PROXY)
+        monkeypatch.setattr(ld, "LEARN_YT_ATTEMPTS", 3)
+        built = self._install_recording_yta(monkeypatch, fail_first=2)
+        assert ld.fetch_youtube_transcript(self._URL) == ("privet", "")
+        assert len(built) == 3
+        assert len({id(c) for c in built}) == 3
+
+    def test_block_through_the_proxy_says_so(self, monkeypatch):
+        monkeypatch.setenv("YT_PROXY_URL", self._PROXY)
+        self._install_recording_yta(monkeypatch, fail_first=99)
+        text, err = ld.fetch_youtube_transcript(self._URL)
+        assert text is None and "via proxy" in err
+        assert "pw" not in err  # credentials never leak into the reason
+
+    def _capture_ytdlp_opts(self, monkeypatch):
+        """Fake yt_dlp that records its options and yields no media."""
+        import sys
+        import types
+        seen = []
+
+        class Ydl:
+            def __init__(self, opts):
+                seen.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def extract_info(self, url, download=False):
+                return None
+
+        mod = types.ModuleType("yt_dlp")
+        mod.YoutubeDL = Ydl
+        monkeypatch.setitem(sys.modules, "yt_dlp", mod)
+        return seen
+
+    def test_ytdlp_uses_the_proxy_for_youtube(self, monkeypatch):
+        monkeypatch.setenv("YT_PROXY_URL", self._PROXY)
+        seen = self._capture_ytdlp_opts(monkeypatch)
+        path, _, err, tmpdir = ld.extract_x_post_audio(self._URL, timeout=10)
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        assert path is None and "no media info" in err
+        assert seen and seen[0].get("proxy") == self._PROXY
+
+    def test_ytdlp_keeps_x_direct(self, monkeypatch):
+        """X is not blocked, and residential proxies bill per GB."""
+        monkeypatch.setenv("YT_PROXY_URL", self._PROXY)
+        seen = self._capture_ytdlp_opts(monkeypatch)
+        _, _, _, tmpdir = ld.extract_x_post_audio(
+            "https://x.com/someone/status/1234567890", timeout=10)
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        assert seen and "proxy" not in seen[0]

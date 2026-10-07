@@ -356,6 +356,17 @@ class TestFailureMessage:
     def test_no_video_reason_is_humanized(self):
         assert "No video was found" in xte._failure_message("no video could be found")
 
+    def test_ip_block_does_not_tell_the_user_to_resend(self):
+        """The 2026-10-07 reply said 're-send in a few minutes'; the user did,
+        an hour later, and hit the identical block. A server-IP block must
+        say re-sending will not help -- and keep the audio detail out."""
+        err = ("captions blocked by YouTube (server IP, no proxy set): IpBlocked; "
+               "audio fallback also failed: yt-dlp: Sign in to confirm")
+        shown = xte._failure_message(err)
+        assert "will not help" in shown
+        assert "few minutes" not in shown and "temporary" not in shown
+        assert "Sign in" not in shown
+
 
 class TestAttachmentNaming:
     def test_status_id_uses_x_status_then_youtube_id(self):
