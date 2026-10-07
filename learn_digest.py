@@ -675,6 +675,35 @@ _YT_TRANSIENT_ERRORS = (
 LEARN_YT_ATTEMPTS = int(os.environ.get("LEARN_YT_ATTEMPTS", "3"))
 LEARN_YT_RETRY_WAIT = float(os.environ.get("LEARN_YT_RETRY_WAIT", "2"))
 
+# The subset of transient errors that mean YouTube is refusing THIS SERVER'S
+# IP, not having a bad moment. IpBlocked is the cloud-provider ban: it hit
+# Railway's egress IP on 2026-10-07 and the same video failed identically an
+# hour apart, so the old "re-send in a few minutes" reply sent the user round
+# a loop that could never succeed. They are still retried -- through a
+# rotating proxy each attempt gets a fresh IP -- but are REPORTED as a block.
+_YT_BLOCKED_ERRORS = ("RequestBlocked", "IpBlocked")
+
+
+def _youtube_proxy_url() -> str:
+    """YT_PROXY_URL routes YouTube traffic -- captions AND the yt-dlp audio
+    fallback -- through an HTTP proxy, because YouTube blocks most cloud IPs.
+    For a Webshare rotating residential proxy the value is
+    http://<username>-rotate:<password>@p.webshare.io:80 . Read at CALL time
+    (never module scope), like the other optional resolver keys. Unset means
+    direct connections, exactly as before."""
+    return (os.environ.get("YT_PROXY_URL") or "").strip()
+
+
+def _youtube_api(api_cls):
+    """Build a caption client, proxied when YT_PROXY_URL is set. Called once
+    PER ATTEMPT on purpose: a fresh client opens a fresh connection, which is
+    what makes a rotating proxy hand out a new IP for the retry."""
+    proxy = _youtube_proxy_url()
+    if not proxy:
+        return api_cls()
+    from youtube_transcript_api.proxies import GenericProxyConfig
+    return api_cls(proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy))
+
 
 def _is_transient_yt_error(exc) -> bool:
     """True when another attempt could plausibly succeed.
@@ -729,7 +758,8 @@ def fetch_youtube_transcript(url: str):
     for attempt in range(attempts):
         try:
             if hasattr(YouTubeTranscriptApi, "fetch"):
-                chunks = _fetch_transcript_any_language(YouTubeTranscriptApi(), vid)
+                chunks = _fetch_transcript_any_language(
+                    _youtube_api(YouTubeTranscriptApi), vid)
             else:
                 chunks = YouTubeTranscriptApi.get_transcript(vid)
             parts = []
@@ -746,11 +776,19 @@ def fetch_youtube_transcript(url: str):
                 logger.info(f"[learn] youtube transcript unavailable {vid}: "
                             f"{type(e).__name__}")
                 return None, ""
-            last_transient = f"captions fetch failed (temporary): {type(e).__name__}"
+            name = type(e).__name__
+            if name in _YT_BLOCKED_ERRORS:
+                via = "via proxy" if _youtube_proxy_url() else "no proxy set"
+                last_transient = f"captions blocked by YouTube (server IP, {via}): {name}"
+            else:
+                last_transient = f"captions fetch failed (temporary): {name}"
             logger.warning(f"[learn] youtube transcript {vid} attempt "
                            f"{attempt + 1}/{attempts} failed: {type(e).__name__}: {e}")
             if attempt < attempts - 1:
                 time.sleep(LEARN_YT_RETRY_WAIT * (attempt + 1))
+    if last_transient.startswith("captions blocked"):
+        logger.error(f"[learn] YouTube is blocking this server for {vid} "
+                     f"({last_transient}) -- set or check YT_PROXY_URL")
     return None, last_transient
 
 
@@ -940,6 +978,7 @@ def extract_x_post_audio(source_url: str, timeout: int = None):
     timeout = timeout or LEARN_YTDLP_TIMEOUT
     tmpdir = tempfile.mkdtemp(prefix="learn_stt_")
     last_err = "unknown yt-dlp error"
+    proxy = _youtube_proxy_url() if classify_url(source_url) == "youtube" else ""
 
     def _work(holder):
         try:
@@ -955,6 +994,10 @@ def extract_x_post_audio(source_url: str, timeout: int = None):
                     "preferredcodec": "m4a",
                 }],
             }
+            # YouTube only: X is not blocked, and a residential proxy bills
+            # per GB, so X audio keeps going direct.
+            if proxy:
+                ydl_opts["proxy"] = proxy
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(source_url, download=False)
                 if not info:
