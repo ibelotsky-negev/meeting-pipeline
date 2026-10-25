@@ -556,6 +556,7 @@ def stub_collectors(monkeypatch):
     stage = {"id": "s2", "label": "Value Validation", "probability": 0.4,
              "is_closed": False, "order": 0}
     monkeypatch.setattr(dpd, "get_pipeline_stages", lambda: [stage])
+    monkeypatch.setattr(dpd, "get_all_stage_labels", lambda: {})
     monkeypatch.setattr(dpd, "get_owner_maps", lambda skipped=None: ({}, {}))
     monkeypatch.setattr(dpd, "get_pipeline_deals", lambda closing_stage_id="": [])
     monkeypatch.setattr(dpd, "collect_activity", lambda *a, **k: [])
@@ -596,3 +597,57 @@ def test_run_digest_records_error_with_traceback(ledger, monkeypatch, tmp_path):
     assert status["status"] == "error"
     assert "boom-400" in status["error"]
     assert "RuntimeError" in status["traceback"]
+
+
+# ----------------------------------------------------------------------
+#  Cross-pipeline stage labels (deal moved in from another pipeline)
+# ----------------------------------------------------------------------
+
+def test_get_all_stage_labels_prefixes_pipeline(monkeypatch):
+    payload = {"results": [
+        {"id": "3760999624", "label": "PL 2026 Fundraise",
+         "stages": [{"id": "5248700642", "label": "Discovery"}]},
+        {"id": "4252440818", "label": "PL 2027 Fundraise",
+         "stages": [{"id": "6293121243", "label": "Discovery"}]},
+    ]}
+    calls = []
+    monkeypatch.setattr(eps, "hubspot_request",
+                        lambda method, endpoint, **k: calls.append(endpoint) or payload)
+    labels = dpd.get_all_stage_labels()
+    assert calls == ["/crm/v3/pipelines/deals"]
+    assert labels["5248700642"] == "PL 2026 Fundraise / Discovery"
+    assert labels["6293121243"] == "PL 2027 Fundraise / Discovery"
+
+
+def test_get_all_stage_labels_failure_is_empty(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("HUBSPOT_API_KEY not set")
+    monkeypatch.setattr(eps, "hubspot_request", boom)
+    assert dpd.get_all_stage_labels() == {}
+
+
+def test_run_digest_labels_stage_move_from_other_pipeline(ledger, monkeypatch, tmp_path, stub_collectors):
+    """A deal rolled over from the 2026 pipeline reads 'PL 2026 Fundraise /
+    Closing -> Discovery', not a raw old-pipeline stage id."""
+    monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
+    stage = {"id": "s1", "label": "Discovery", "probability": 0.1,
+             "is_closed": False, "order": 0}
+    monkeypatch.setattr(dpd, "get_pipeline_stages", lambda: [stage])
+    monkeypatch.setattr(dpd, "get_all_stage_labels",
+                        lambda: {"old5": "PL 2026 Fundraise / Closing",
+                                 "s1": "PL 2027 Fundraise / Discovery"})
+    raw = {"id": "d1", "properties": {
+        "dealname": "Rolled Over", "dealstage": "s1", "hubspot_owner_id": "",
+        "hs_lastmodifieddate": (NOW - timedelta(hours=1)).isoformat()}}
+    monkeypatch.setattr(dpd, "get_pipeline_deals", lambda closing_stage_id="": [raw])
+    seen = {}
+
+    def fake_deltas(changed_ids, deals_by_id, since, until, by_user, stage_labels):
+        seen.update(stage_labels)
+        return [], []
+    monkeypatch.setattr(dpd, "collect_deltas", fake_deltas)
+    monkeypatch.setattr(dpd, "send_digest_email", lambda s, b: None)
+    dpd.run_digest(dry_run=True)
+    assert seen["old5"] == "PL 2026 Fundraise / Closing"
+    # The current pipeline's own (unprefixed) label wins over the all-pipelines map
+    assert seen["s1"] == "Discovery"

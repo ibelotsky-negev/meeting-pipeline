@@ -2,7 +2,7 @@
 """
 daily-pipeline-digest -- Sara module
 
-Compiles every change and new activity in the NL 2026 Fundraise pipeline
+Compiles every change and new activity in the PL 2027 Fundraise pipeline
 over the previous window (default 24h, resilient to missed runs) and emails
 Ken a single readable morning brief. Covers all deal owners, narrates deltas
 rather than state, and applies Negev operating rules deterministically
@@ -257,6 +257,27 @@ def get_pipeline_stages() -> list:
         })
     stages.sort(key=lambda s: s["order"])
     return stages
+
+
+def get_all_stage_labels() -> dict:
+    """{stage_id: "Pipeline / Stage"} across EVERY deal pipeline. A deal moved
+    into this pipeline from another one (the 2026 -> 2027 fundraise roll-over)
+    has its old stage id in dealstage history, which the current pipeline's
+    stage map cannot label. Best-effort: {} on any failure, and the caller
+    falls back to the raw id exactly as before."""
+    try:
+        data = eps.hubspot_request("GET", "/crm/v3/pipelines/deals")
+    except Exception as e:
+        logger.warning(f"All-pipelines stage lookup failed: {e}")
+        return {}
+    labels = {}
+    for p in data.get("results") or []:
+        pipeline_label = p.get("label") or ""
+        for s in p.get("stages") or []:
+            stage_label = s.get("label") or ""
+            labels[str(s.get("id", ""))] = (
+                f"{pipeline_label} / {stage_label}" if pipeline_label else stage_label)
+    return labels
 
 
 def find_closing_stage(stages: list):
@@ -960,7 +981,8 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
     skipped = []
     try:
         stages = get_pipeline_stages()
-        stage_labels = {s["id"]: s["label"] for s in stages}
+        # This pipeline's own labels win; other pipelines only fill the gaps
+        stage_labels = {**get_all_stage_labels(), **{s["id"]: s["label"] for s in stages}}
         closing = find_closing_stage(stages)
         closing_id = closing["id"] if closing else ""
         if not closing:
@@ -1047,7 +1069,7 @@ def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Daily NL 2026 Fundraise pipeline digest")
+    parser = argparse.ArgumentParser(description="Daily PL 2027 Fundraise pipeline digest")
     parser.add_argument("--since", help="Window start YYYY-MM-DD (overrides ledger window)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Collect and compose but send no email; run not recorded as window anchor")

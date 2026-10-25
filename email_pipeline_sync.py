@@ -3,7 +3,7 @@
 email-pipeline-sync -- Sara module
 
 Scans Outlook mailboxes (Microsoft Graph, app-only auth) for correspondence
-with contacts associated to deals in the NL 2026 Fundraise HubSpot pipeline,
+with contacts associated to deals in the PL 2027 Fundraise HubSpot pipeline,
 classifies each email as deal-relevant via Claude, and logs relevant emails
 to HubSpot as email engagements -- only if not already logged.
 
@@ -53,9 +53,10 @@ logger = logging.getLogger("email-pipeline-sync")
 HUBSPOT_BASE = "https://api.hubapi.com"
 MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# NL 2026 Fundraise pipeline (all stages, including Closed Lost -- re-engagement
-# history is part of the record)
-PIPELINE_ID = os.environ.get("EMAIL_SYNC_PIPELINE_ID", "3760999624")
+# PL 2027 Fundraise pipeline (all stages, including Closed Lost -- re-engagement
+# history is part of the record). Replaced PL 2026 Fundraise (3760999624) on
+# 2026-10-25.
+PIPELINE_ID = os.environ.get("EMAIL_SYNC_PIPELINE_ID", "4252440818")
 
 # Internal senders/recipients -- an email is in scope only when a roster contact
 # appears on the thread AND at least one of these addresses is present.
@@ -89,7 +90,7 @@ MAX_MESSAGES_PER_SEARCH = int(os.environ.get("EMAIL_SYNC_MAX_PER_SEARCH", "500")
 
 # Fundraise context injected into the classifier prompt
 PIPELINE_CONTEXT = (
-    "NL 2026 Fundraise: Negev Labs Class B funding round. Topics that signal deal "
+    "PL 2027 Fundraise: Palomar Labs (formerly Negev Labs) funding round. Topics that signal deal "
     "relevance include: investment amounts and allocations, re-ups by existing "
     "investors, KYC and AML documentation, UPA (Unit Purchase Agreement) drafts and "
     "negotiation, wire instructions and wire confirmations, shareholder letters, "

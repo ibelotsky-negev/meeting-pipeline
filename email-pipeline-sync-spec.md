@@ -4,7 +4,7 @@
 
 **Project Name:** email-pipeline-sync (new module in `meeting-pipeline` project)
 
-**Description:** A Sara module that scans Outlook mailboxes for email correspondence with contacts associated to deals in the NL 2026 Fundraise HubSpot pipeline, classifies whether each email relates to the contact's deal, and logs deal-relevant emails to HubSpot as email engagements — but only if they are not already logged. Compensates for HubSpot's native Outlook logging, which fires inconsistently.
+**Description:** A Sara module that scans Outlook mailboxes for email correspondence with contacts associated to deals in the PL 2027 Fundraise HubSpot pipeline (PL 2026 Fundraise until 2026-10-25), classifies whether each email relates to the contact's deal, and logs deal-relevant emails to HubSpot as email engagements — but only if they are not already logged. Compensates for HubSpot's native Outlook logging, which fires inconsistently.
 
 **Target Audience:** Internal — Ken Belotsky (process owner), Alex Kubasov (CRM operations, primary consumer of complete deal timelines), Vadim Uzberg and Shlomi Raz (account owners whose correspondence gets captured).
 
@@ -20,7 +20,7 @@
 
 | Component | What It Does | Where It Runs | Status |
 |---|---|---|---|
-| Pipeline Roster Builder | Pulls all deals from NL 2026 Fundraise pipeline (ID 3760999624), resolves associated contacts, builds contact→deal map with email addresses | meeting-pipeline / HubSpot API | built |
+| Pipeline Roster Builder | Pulls all deals from PL 2027 Fundraise pipeline (ID 4252440818; was PL 2026 Fundraise 3760999624), resolves associated contacts, builds contact→deal map with email addresses | meeting-pipeline / HubSpot API | built |
 | Mailbox Scanner | Searches Outlook via Microsoft Graph for messages to/from roster email addresses within the run window | meeting-pipeline / MS Graph API | built |
 | Dedupe Checker | For each candidate email, checks HubSpot for an existing email engagement with the same `internetMessageId` (fallback: subject + timestamp ±2 min + sender match) | meeting-pipeline / HubSpot Engagements API | built |
 | Relevance Classifier | LLM call (Claude) classifying each email as DEAL_RELEVANT / NOT_RELEVANT / UNCERTAIN against the contact's deal context (deal name, stage, fundraise keywords) | meeting-pipeline / Anthropic API | built |
@@ -35,7 +35,7 @@
 3. Mailbox Scanner queries MS Graph per roster address: messages where the address appears in from/to/cc, received within run window.
 4. For each message: Run Ledger check (already processed?) → skip if yes.
 5. Dedupe Checker queries HubSpot engagements on the contact: match `internetMessageId` → skip and record as duplicate if found.
-6. Relevance Classifier: prompt includes deal name, investor name, pipeline context (NL 2026 Fundraise: Class B round, re-ups, KYC, UPA, wire, shareholder letter, MJFF, etc.) plus email subject/body. Returns DEAL_RELEVANT / NOT_RELEVANT / UNCERTAIN.
+6. Relevance Classifier: prompt includes deal name, investor name, pipeline context (PL 2027 Fundraise round, re-ups, KYC, UPA, wire, shareholder letter, MJFF, etc.) plus email subject/body. Returns DEAL_RELEVANT / NOT_RELEVANT / UNCERTAIN.
 7. DEAL_RELEVANT → HubSpot Logger creates engagement, associates contact + deal + company. UNCERTAIN → flagged in Run Report for human review, not logged. NOT_RELEVANT → recorded in ledger, not logged.
 8. Run Report generated and delivered.
 
@@ -69,7 +69,7 @@ Emails are in scope when a roster contact appears on the thread AND at least one
 
 ### MVP (required for the first version)
 
-- [x] **Pipeline roster builder** — resolve all contacts + emails associated with NL 2026 Fundraise deals via HubSpot API. Foundation for everything else.
+- [x] **Pipeline roster builder** — resolve all contacts + emails associated with PL 2027 Fundraise deals via HubSpot API. Foundation for everything else.
 - [x] **Mailbox scanner (all team mailboxes)** — Graph search per roster address within run window across: bk@negevlabs.com, bk@negevcap.com, ak@negevcap.com, vu@negevcap.com, shlomi@negevlabs.com, shlomi@ariadnebio.com. *Prerequisite: Mail.Read application-permission access for ak@, vu@, and both shlomi@ mailboxes; shlomi@ariadnebio.com is a separate tenant — confirm access path before first full run.*
 - [x] **Ledger-based idempotency** — never process the same internetMessageId twice across runs.
 - [x] **HubSpot dedupe check** — skip emails already logged as engagements on the contact.
