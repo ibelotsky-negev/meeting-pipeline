@@ -8,6 +8,15 @@ import cns_screen
 import cns_fmp
 
 
+@pytest.fixture(autouse=True)
+def _no_weekday_reconcile(monkeypatch):
+    # run_daily(reconcile=None) runs the per-symbol sweep when TODAY is
+    # CNS_RECONCILE_WEEKDAY (Sunday), which makes run_daily tests that never
+    # stub discover_from_dates hit the network one day a week. 7 never matches
+    # date.weekday(); a test that wants the sweep passes reconcile=True.
+    monkeypatch.setattr(cns_screen, "CNS_RECONCILE_WEEKDAY", 7)
+
+
 def test_load_keywords_exposes_every_group_the_code_relies_on():
     kw = cns_screen.load_keywords()
     for group in cns_screen.DOMAIN_GROUPS:

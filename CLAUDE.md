@@ -167,7 +167,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 - **Microsoft Graph** uses app-only auth (team-wide), refresh token persisted at `/data/refresh_token.txt`
 - **Teams transcripts** via Graph webhook subscription, renewed every 50 min via APScheduler
 - **To-Do sync** polls Asana tasks and creates matching Microsoft To-Do tasks for @negevlabs.com users
-- **Daily Pipeline Digest:** daily 06:45 IST (03:45 UTC), compiles every change + new activity in the NL 2026 Fundraise HubSpot pipeline over the trailing window (default 24h, resilient to missed runs), narrates deltas rather than state, applies Negev operating rules (stale-deal / overdue-task / wire-watch flags), and emails Ken a single morning brief (`daily_pipeline_digest.py`). See the daily-pipeline-digest Module section.
+- **Daily Pipeline Digest:** daily 06:45 IST (03:45 UTC), compiles every change + new activity in the PL 2027 Fundraise HubSpot pipeline over the trailing window (default 24h, resilient to missed runs), narrates deltas rather than state, applies Negev operating rules (stale-deal / overdue-task / wire-watch flags), and emails Ken a single morning brief (`daily_pipeline_digest.py`). See the daily-pipeline-digest Module section.
 - **Read/Learn Digest:** Friday 06:00 Asia/Jerusalem, drains Ken's Outlook "read/learn" folder, resolves each saved link, Opus cluster+curate against a Ken's-needs profile, emails one HTML digest + creates Asana keeper tasks (`learn_digest.py`). See the Read/Learn Digest Module section.
 - **FYI Triage:** daily 06:00 Asia/Jerusalem, scans the two high-volume auto-filed folders "4: notification" + "8: marketing", classifies each message IMPORTANT vs NOISE with Sonnet (reading the body, not just the from-address), and MOVES the important ones to "2: FYI". Dual-gated (`?live=1` AND env `FYI_LIVE=1`) -- ships DRY, auto-promotes to live once Ken sets `FYI_LIVE` (`fyi_triage.py`). See the FYI Triage Module section + ROLLOUT.md.
 - **X-transcribe-email:** any internal teammate emails Sara (`sara@palomar-labs.com`) an x.com/twitter.com or youtube.com/youtu.be link to a single post/video (a podcast episode link is detected too and reported unsupported; a container URL -- channel, profile, playlist, show -- is not a request at all); a 15-min inbox scan transcribes each video (YouTube captions first, falling back to yt-dlp + Grok STT; X always via yt-dlp + Grok STT), summarizes with Claude, and REPLIES in-thread (Graph `createReply`) with a structured summary in the body + the full transcript as a `.md` attachment per link. A question asked alongside the link, or a link-free follow-up reply in an already-transcribed conversation, is answered from the cached transcript (`x_transcribe_email.py`). See the x-transcribe-email Module section.
@@ -177,7 +177,7 @@ Sara drafts emails with confident, direct tone. BANNED: "Just checking in", "I j
 ## email-pipeline-sync Module
 
 Standalone module (`email_pipeline_sync.py`) -- scans team Outlook mailboxes for
-correspondence with NL 2026 Fundraise pipeline contacts, classifies deal relevance
+correspondence with PL 2027 Fundraise pipeline contacts, classifies deal relevance
 via Claude (haiku), logs relevant emails to HubSpot as email engagements. Full spec:
 `email-pipeline-sync-spec.md`.
 
@@ -194,7 +194,7 @@ via Claude (haiku), logs relevant emails to HubSpot as email engagements. Full s
 ## daily-pipeline-digest Module
 
 Standalone module (`daily_pipeline_digest.py`) -- compiles every change and new
-activity in the NL 2026 Fundraise HubSpot pipeline over the previous window
+activity in the PL 2027 Fundraise HubSpot pipeline over the previous window
 (default 24h, resilient to missed runs via a persisted last-run watermark) and
 emails Ken a single readable morning brief. Covers all deal owners, narrates
 deltas rather than state, links deals/activities to their HubSpot records, and
@@ -209,6 +209,12 @@ the SQLite ledger file with `email_pipeline_sync.py` (imported as `eps`).
   does not crash). Status persisted at `/data/daily_pipeline_digest_status.json`.
 - Recipients: `DIGEST_RECIPIENTS` (default bk@negevlabs.com); optional
   `DIGEST_CC`. Pipeline: `DIGEST_PIPELINE_ID` (defaults to the shared id).
+- **Pipeline id (both modules):** PL 2027 Fundraise `4252440818`, the default of
+  `EMAIL_SYNC_PIPELINE_ID` in `email_pipeline_sync.py`, which the digest inherits.
+  Replaced PL 2026 Fundraise `3760999624` on 2026-10-25. On a year roll-over,
+  change that ONE default (and check neither env var is set on Railway, which
+  would override it). Stage moves INTO the pipeline from another one are labelled
+  `<old pipeline> / <stage>` via `get_all_stage_labels`, not a raw stage id.
 
 ## Read/Learn Digest Module
 
