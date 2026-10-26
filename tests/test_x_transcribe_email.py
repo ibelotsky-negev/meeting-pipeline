@@ -248,7 +248,7 @@ class TestTranscribeLink:
     def _audio_ok(self, monkeypatch, tmp_path, text="hello world"):
         d = tmp_path / "aud"; d.mkdir()
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: (str(d / "a.m4a"), 30.0, None, str(d)))
+                            lambda u, **k: (str(d / "a.m4a"), 30.0, None, str(d)))
         monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: (text, None))
         return d
 
@@ -261,14 +261,14 @@ class TestTranscribeLink:
 
     def test_x_no_audio_extracted(self, monkeypatch, tmp_path):
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: (None, 0, "no video could be found", str(tmp_path / "x")))
+                            lambda u, **k: (None, 0, "no video could be found", str(tmp_path / "x")))
         r = xte.transcribe_link("https://x.com/i/status/111", "x")
         assert not r["ok"] and "no video" in r["error"]
 
     def test_x_stt_failure(self, monkeypatch, tmp_path):
         d = tmp_path / "aud"; d.mkdir()
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: (str(d / "a.m4a"), 30.0, None, str(d)))
+                            lambda u, **k: (str(d / "a.m4a"), 30.0, None, str(d)))
         monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: (None, "STT status 400"))
         r = xte.transcribe_link("https://x.com/i/status/111", "x")
         assert not r["ok"] and "400" in r["error"]
@@ -306,7 +306,7 @@ class TestTranscribeLink:
         monkeypatch.setattr(ld, "fetch_youtube_transcript",
                             lambda u: (None, "captions fetch failed (temporary): RequestBlocked"))
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: (None, 0, "duration 5940s exceeds cap (3600s)",
+                            lambda u, **k: (None, 0, "duration 5940s exceeds cap (3600s)",
                                                      str(tmp_path / "x")))
         r = xte.transcribe_link(_YT_VIDEO, "youtube")
         assert not r["ok"]
@@ -333,7 +333,7 @@ class TestTranscribeLink:
         the duration cap is the real reason there."""
         monkeypatch.setattr(ld, "fetch_youtube_transcript", lambda u: (None, ""))
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: (None, 0, "duration 5940s exceeds cap (3600s)",
+                            lambda u, **k: (None, 0, "duration 5940s exceeds cap (3600s)",
                                                      str(tmp_path / "x")))
         r = xte.transcribe_link(_YT_VIDEO, "youtube")
         assert not r["ok"]
@@ -1084,7 +1084,7 @@ class TestYouTubeNonVideoLinks:
     def test_non_video_url_fails_honestly_without_touching_ytdlp(self, monkeypatch, url):
         called = []
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: called.append(u) or (None, 0, "err", None))
+                            lambda u, **k: called.append(u) or (None, 0, "err", None))
         monkeypatch.setattr(ld, "fetch_youtube_transcript",
                             lambda u: called.append(u) or (None, ""))
         r = xte.transcribe_link(url, "youtube")
@@ -1106,7 +1106,7 @@ class TestYouTubeNonVideoLinks:
 
         monkeypatch.setattr(ld, "_youtube_video_id", _boom)
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: called.append(u) or (None, 0, "err", None))
+                            lambda u, **k: called.append(u) or (None, 0, "err", None))
         r = xte.transcribe_link("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube")
         assert called == [] and not r["ok"]
 
@@ -1451,7 +1451,7 @@ class TestXSpacesAndBroadcastsAreItems:
         d = tmp_path / "aud"; d.mkdir()
         seen = []
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: seen.append(u) or (str(d / "a.m4a"), 30.0, None, str(d)))
+                            lambda u, **k: seen.append(u) or (str(d / "a.m4a"), 30.0, None, str(d)))
         monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: ("space words", None))
         r = xte.transcribe_link(url, "x")
         assert seen == [url]                      # resolver actually invoked
@@ -1517,7 +1517,7 @@ class TestYouTubeClipIsAnItem:
         d = tmp_path / "aud"; d.mkdir()
         seen = []
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: seen.append(u) or (str(d / "a.m4a"), 20.0, None, str(d)))
+                            lambda u, **k: seen.append(u) or (str(d / "a.m4a"), 20.0, None, str(d)))
         monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: ("clip words", None))
         r = xte.transcribe_link(self.CLIP, "youtube")
         assert seen == [self.CLIP]                          # resolver actually invoked
@@ -1526,7 +1526,7 @@ class TestYouTubeClipIsAnItem:
 
     def test_clip_failure_is_honest_not_a_channel_refusal(self, monkeypatch):
         monkeypatch.setattr(ld, "extract_x_post_audio",
-                            lambda u, timeout=None: (None, 0, "no video could be found in this clip", None))
+                            lambda u, **k: (None, 0, "no video could be found in this clip", None))
         r = xte.transcribe_link(self.CLIP, "youtube")
         assert not r["ok"]
         assert "channel or playlist" not in r["error"]
@@ -1661,3 +1661,126 @@ class TestPodcastLinkNeverBlocksAFollowUp:
         must still read as a request -- that is what earns the honest reply."""
         assert xte._has_new_link([(_APPLE_SHOW, "podcast")], None)
         assert xte._has_new_link([(_APPLE_SHOW, "podcast")], {})
+
+
+class TestLongAudioChunking:
+    """A teammate's 67-min X video was refused by the Read/Learn 60-min STT cap.
+    The email path now allows long media and splits it before STT."""
+
+    _URL = "https://x.com/davidsenra/status/2114356314411348074"
+
+    def _long_audio(self, monkeypatch, tmp_path, duration=4021.568, seen=None):
+        d = tmp_path / "aud"; d.mkdir()
+        (d / "a.m4a").write_bytes(b"x")
+
+        def _extract(u, **k):
+            if seen is not None:
+                seen.update(k)
+            return str(d / "a.m4a"), duration, None, str(d)
+        monkeypatch.setattr(ld, "extract_x_post_audio", _extract)
+        return d
+
+    def _fake_split(self, monkeypatch, n):
+        def _split(path, chunk_sec, out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+            out = []
+            for i in range(n):
+                p = os.path.join(out_dir, f"chunk_{i:03d}.m4a")
+                open(p, "wb").close()
+                out.append(p)
+            return out
+        monkeypatch.setattr(xte, "_split_audio", _split)
+
+    def test_email_path_passes_wider_caps_than_read_learn(self, monkeypatch, tmp_path):
+        seen = {}
+        self._long_audio(monkeypatch, tmp_path, seen=seen)
+        self._fake_split(monkeypatch, 4)
+        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: ("t", None))
+        xte.transcribe_link(self._URL, "x")
+        assert seen["max_duration"] == xte.XTE_MAX_DURATION_SEC > 4021.568
+        assert seen["max_duration"] > ld.LEARN_STT_MAX_DURATION_SEC
+        assert seen["max_bytes"] == xte.XTE_MAX_AUDIO_BYTES
+        assert seen["timeout"] == xte.XTE_YTDLP_TIMEOUT
+
+    def test_long_audio_is_chunked_and_joined_in_order(self, monkeypatch, tmp_path):
+        d = self._long_audio(monkeypatch, tmp_path)
+        self._fake_split(monkeypatch, 4)
+        calls = []
+
+        def _stt(p, timeout=None):
+            calls.append(os.path.basename(p))
+            return f"part {len(calls)}", None
+        monkeypatch.setattr(ld, "_grok_stt_from_file", _stt)
+        r = xte.transcribe_link(self._URL, "x")
+        assert r["ok"], r["error"]
+        assert calls == ["chunk_000.m4a", "chunk_001.m4a", "chunk_002.m4a", "chunk_003.m4a"]
+        assert r["transcript"] == "part 1\n\npart 2\n\npart 3\n\npart 4"
+        assert not os.path.isdir(str(d))  # tmpdir (incl. chunks) cleaned up
+
+    def test_failed_chunk_fails_the_link_naming_the_part(self, monkeypatch, tmp_path):
+        self._long_audio(monkeypatch, tmp_path)
+        self._fake_split(monkeypatch, 4)
+        n = {"i": 0}
+
+        def _stt(p, timeout=None):
+            n["i"] += 1
+            return (None, "STT status 500") if n["i"] == 3 else ("ok", None)
+        monkeypatch.setattr(ld, "_grok_stt_from_file", _stt)
+        r = xte.transcribe_link(self._URL, "x")
+        assert not r["ok"] and r["transcript"] == ""
+        assert "part 3 of 4" in r["error"] and "500" in r["error"]
+
+    def test_short_audio_skips_the_split(self, monkeypatch, tmp_path):
+        self._long_audio(monkeypatch, tmp_path, duration=300)
+
+        def _never(*a, **k):
+            raise AssertionError("short audio must not be split")
+        monkeypatch.setattr(xte, "_split_audio", _never)
+        monkeypatch.setattr(ld, "_grok_stt_from_file", lambda p, timeout=None: ("whole", None))
+        r = xte.transcribe_link(self._URL, "x")
+        assert r["ok"] and r["transcript"] == "whole"
+
+    def test_long_audio_that_cannot_be_split_fails_honestly(self, monkeypatch, tmp_path):
+        self._long_audio(monkeypatch, tmp_path)
+        monkeypatch.setattr(xte, "_split_audio", lambda *a: [])
+
+        def _never(*a, **k):
+            raise AssertionError("must not upload a long file whole")
+        monkeypatch.setattr(ld, "_grok_stt_from_file", _never)
+        r = xte.transcribe_link(self._URL, "x")
+        assert not r["ok"] and "split" in r["error"]
+
+    def test_split_audio_runs_ffmpeg_segmenter(self, monkeypatch, tmp_path):
+        seen = {}
+
+        class _P:
+            returncode = 0
+            stderr = ""
+
+        def _run(cmd, **k):
+            seen["cmd"] = cmd
+            out = os.path.dirname(cmd[-1])
+            for name in ("chunk_001.m4a", "chunk_000.m4a", "other.txt"):
+                open(os.path.join(out, name), "wb").close()
+            return _P()
+        monkeypatch.setattr(xte.subprocess, "run", _run)
+        out = xte._split_audio("in.m4a", 1200, str(tmp_path / "c"))
+        assert [os.path.basename(p) for p in out] == ["chunk_000.m4a", "chunk_001.m4a"]
+        cmd = seen["cmd"]
+        assert cmd[0] == "ffmpeg" and "segment" in cmd
+        assert cmd[cmd.index("-segment_time") + 1] == "1200"
+
+    def test_split_audio_ffmpeg_failure_returns_empty(self, monkeypatch, tmp_path):
+        class _P:
+            returncode = 1
+            stderr = "boom"
+        monkeypatch.setattr(xte.subprocess, "run", lambda cmd, **k: _P())
+        assert xte._split_audio("in.m4a", 1200, str(tmp_path / "c")) == []
+
+    def test_summary_sees_past_the_first_fifteen_minutes(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(ld, "_call_claude_text",
+                            lambda prompt, model, max_tokens=0: seen.setdefault("p", prompt) and "TITLE: x")
+        transcript = "a" * 50000 + "LATE_MARKER"
+        xte.summarize_transcript(self._URL, transcript)
+        assert "LATE_MARKER" in seen["p"]

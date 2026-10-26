@@ -970,12 +970,18 @@ def _pick_extracted_audio_path(tmpdir: str, info: dict, ydl, outtmpl: str):
     return audio_files[0]
 
 
-def extract_x_post_audio(source_url: str, timeout: int = None):
+def extract_x_post_audio(source_url: str, timeout: int = None,
+                         max_duration: int = None, max_bytes: int = None):
     """Extract audio from an X post URL via yt-dlp + ffmpeg.
 
     Returns (audio_path, duration_sec, error_reason, tmpdir). audio_path is None
-    on failure; tmpdir is a temp directory the caller must remove."""
+    on failure; tmpdir is a temp directory the caller must remove.
+
+    max_duration / max_bytes default to the Read/Learn caps; x_transcribe_email
+    passes wider ones because it chunks long audio before STT."""
     timeout = timeout or LEARN_YTDLP_TIMEOUT
+    max_duration = max_duration or LEARN_STT_MAX_DURATION_SEC
+    max_bytes = max_bytes or LEARN_STT_MAX_BYTES
     tmpdir = tempfile.mkdtemp(prefix="learn_stt_")
     last_err = "unknown yt-dlp error"
     proxy = _youtube_proxy_url() if classify_url(source_url) == "youtube" else ""
@@ -1004,10 +1010,8 @@ def extract_x_post_audio(source_url: str, timeout: int = None):
                     holder["error"] = "yt-dlp: no media info"
                     return
                 dur = info.get("duration") or 0
-                if dur and dur > LEARN_STT_MAX_DURATION_SEC:
-                    holder["error"] = (
-                        f"duration {dur}s exceeds cap ({LEARN_STT_MAX_DURATION_SEC}s)"
-                    )
+                if dur and dur > max_duration:
+                    holder["error"] = f"duration {dur}s exceeds cap ({max_duration}s)"
                     return
                 info = ydl.extract_info(source_url, download=True)
                 path = _pick_extracted_audio_path(tmpdir, info, ydl, outtmpl)
@@ -1015,8 +1019,8 @@ def extract_x_post_audio(source_url: str, timeout: int = None):
                     holder["error"] = "yt-dlp: no audio file produced"
                     return
                 size = os.path.getsize(path)
-                if size > LEARN_STT_MAX_BYTES:
-                    holder["error"] = f"audio size {size} exceeds cap ({LEARN_STT_MAX_BYTES})"
+                if size > max_bytes:
+                    holder["error"] = f"audio size {size} exceeds cap ({max_bytes})"
                     return
                 holder["path"] = path
                 holder["duration"] = (info or {}).get("duration") or dur
