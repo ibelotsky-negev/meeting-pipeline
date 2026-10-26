@@ -68,6 +68,7 @@ import html
 import base64
 import shutil
 import logging
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 import email_pipeline_sync as eps
@@ -99,6 +100,20 @@ XTE_THREAD_MAX_QUESTIONS = int(os.environ.get("XTE_THREAD_MAX_QUESTIONS", "20"))
 XTE_MAX_MESSAGES = int(os.environ.get("XTE_MAX_MESSAGES", "25"))
 XTE_MAX_LINKS = int(os.environ.get("XTE_MAX_LINKS", "5"))
 XTE_SUMMARY_MODEL = os.environ.get("XTE_SUMMARY_MODEL", ld.SUMMARY_MODEL)
+
+# Long-audio path. Read/Learn caps STT at 60 min; a teammate who emails a link
+# explicitly wants it, so this path allows far longer media and splits the
+# audio into XTE_STT_CHUNK_SEC pieces before STT -- one long upload would sit
+# on Grok's request timeout and on whatever file limit it enforces.
+XTE_MAX_DURATION_SEC = int(os.environ.get("XTE_MAX_DURATION_SEC", str(4 * 3600)))
+XTE_MAX_AUDIO_BYTES = int(os.environ.get("XTE_MAX_AUDIO_BYTES", str(500 * 1024 * 1024)))
+XTE_YTDLP_TIMEOUT = int(os.environ.get("XTE_YTDLP_TIMEOUT", "900"))
+XTE_STT_CHUNK_SEC = int(os.environ.get("XTE_STT_CHUNK_SEC", "1200"))
+XTE_FFMPEG_TIMEOUT = int(os.environ.get("XTE_FFMPEG_TIMEOUT", "600"))
+# Transcript chars sent to Claude for the summary / a follow-up answer. Was a
+# hard 14000 (~15 min of speech), so a long video was summarized from its
+# opening minutes only. Shared across links on a multi-link answer.
+XTE_TRANSCRIPT_PROMPT_CHARS = int(os.environ.get("XTE_TRANSCRIPT_PROMPT_CHARS", "150000"))
 
 # Extra addresses served beyond the internal domains -- for a team member's
 # personal address. Empty by default; config.is_internal_email already covers
@@ -519,6 +534,50 @@ PODCAST_UNSUPPORTED = (
 )
 
 
+def _split_audio(audio_path: str, chunk_sec: int, out_dir: str) -> list:
+    """Split audio into chunk_sec pieces (mono 16 kHz AAC -- plenty for speech,
+    and small enough that every piece uploads fast). Returns the piece paths in
+    playback order; [] on any ffmpeg failure."""
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", audio_path,
+           "-vn", "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "48k",
+           "-f", "segment", "-segment_time", str(int(chunk_sec)), "-reset_timestamps", "1",
+           os.path.join(out_dir, "chunk_%03d.m4a")]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=XTE_FFMPEG_TIMEOUT)
+    except Exception as e:
+        logger.warning(f"[xte] ffmpeg split failed: {type(e).__name__}: {e}")
+        return []
+    if proc.returncode != 0:
+        logger.warning(f"[xte] ffmpeg split rc={proc.returncode}: {(proc.stderr or '')[:300]}")
+        return []
+    return sorted(os.path.join(out_dir, f) for f in os.listdir(out_dir)
+                  if f.startswith("chunk_") and f.endswith(".m4a"))
+
+
+def _stt_audio(audio_path: str, duration: float, tmpdir: str):
+    """STT for audio of any length. Audio known to fit one chunk goes up whole
+    (the original path); longer or unknown-length audio is split and each piece
+    transcribed in order. All-or-nothing: a failed piece fails the link with
+    the piece named, never a silently gappy transcript. Returns (text, error)."""
+    if duration and duration <= XTE_STT_CHUNK_SEC:
+        return ld._grok_stt_from_file(audio_path)
+    pieces = _split_audio(audio_path, XTE_STT_CHUNK_SEC, os.path.join(tmpdir, "chunks"))
+    if not pieces:
+        if duration:
+            return None, "could not split the long audio for transcription"
+        # Unknown length and unsplittable: the whole file is the only option.
+        return ld._grok_stt_from_file(audio_path)
+    logger.info(f"[xte] STT in {len(pieces)} pieces ({int(duration or 0)}s)")
+    texts = []
+    for i, piece in enumerate(pieces, 1):
+        text, err = ld._grok_stt_from_file(piece)
+        if err or not text:
+            return None, f"speech-to-text failed on part {i} of {len(pieces)}: {err or 'empty transcript'}"
+        texts.append(text.strip())
+    return "\n\n".join(texts), None
+
+
 def _transcribe_audio_url(url: str) -> dict:
     """Shared yt-dlp + Grok STT path. ld.extract_x_post_audio is a generic
     yt-dlp wrapper despite its name -- it takes any URL and enforces the
@@ -527,11 +586,13 @@ def _transcribe_audio_url(url: str) -> dict:
     result = {"url": url, "ok": False, "error": "", "transcript": "", "chars": 0, "source": ""}
     tmpdir = None
     try:
-        audio_path, _duration, err, tmpdir = ld.extract_x_post_audio(url)
+        audio_path, duration, err, tmpdir = ld.extract_x_post_audio(
+            url, timeout=XTE_YTDLP_TIMEOUT,
+            max_duration=XTE_MAX_DURATION_SEC, max_bytes=XTE_MAX_AUDIO_BYTES)
         if err or not audio_path:
             result["error"] = err or "no audio could be extracted from this link"
             return result
-        text, stt_err = ld._grok_stt_from_file(audio_path)
+        text, stt_err = _stt_audio(audio_path, duration, tmpdir)
         if stt_err or not text:
             result["error"] = stt_err or "speech-to-text returned an empty transcript"
             return result
@@ -635,9 +696,11 @@ def summarize_transcript(url: str, transcript: str, note: str = "") -> str:
     prompt = _SUMMARY_INSTRUCTIONS
     if (note or "").strip():
         prompt += _QUESTION_INSTRUCTIONS.format(note=note.strip())
-    prompt += f"Source: {url}\n\nTranscript:\n{transcript[:14000]}"
+    if len(transcript or "") > XTE_TRANSCRIPT_PROMPT_CHARS:
+        logger.warning(f"[xte] summary input truncated {len(transcript)} -> {XTE_TRANSCRIPT_PROMPT_CHARS} chars")
+    prompt += f"Source: {url}\n\nTranscript:\n{(transcript or '')[:XTE_TRANSCRIPT_PROMPT_CHARS]}"
     try:
-        return (ld._call_claude_text(prompt, XTE_SUMMARY_MODEL, max_tokens=1200) or "").strip()
+        return (ld._call_claude_text(prompt, XTE_SUMMARY_MODEL, max_tokens=2000) or "").strip()
     except Exception as e:
         logger.warning(f"[xte] summarize failed {url[:70]}: {e}")
         return ""
@@ -692,9 +755,10 @@ def answer_question(question: str, links: list) -> str:
     Returns exactly NO_QUESTION_MARKER (see _is_no_question) when the model
     judges the sender's note was not actually a question about the video."""
     blocks = []
+    per_link = XTE_TRANSCRIPT_PROMPT_CHARS // max(1, len(links or []))
     for l in (links or []):
         blocks.append(f"--- {l.get('title') or l.get('url')} ({l.get('url')}) ---\n"
-                      f"{(l.get('transcript') or '')[:14000]}")
+                      f"{(l.get('transcript') or '')[:per_link]}")
     prompt = _ANSWER_INSTRUCTIONS + f"Question: {question}\n\nTranscript(s):\n" + "\n\n".join(blocks)
     try:
         return (ld._call_claude_text(prompt, XTE_SUMMARY_MODEL, max_tokens=1200) or "").strip()
