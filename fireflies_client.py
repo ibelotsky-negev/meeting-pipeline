@@ -247,7 +247,7 @@ def get_transcript_by_id(transcript_id: str) -> dict:
     query GetTranscript($id: String!) { transcript(id: $id) {
         id title dateString: date duration organizer_email participants
         summary { shorthand_bullet short_summary action_items keywords overview notes }
-        sentences { speaker_name text }
+        sentences { speaker_name text start_time }
     }}
     """
     data = fireflies_query(query, {"id": transcript_id})

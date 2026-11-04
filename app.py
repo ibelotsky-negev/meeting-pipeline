@@ -41,6 +41,7 @@ from stores import load_pending, save_pending, load_processed, save_processed, l
 from fireflies_client import fireflies_query, get_recent_transcripts, get_transcript_by_id, FirefliesQuotaExceeded, duration_to_minutes, quota_blocked_until, clear_quota_block  # noqa: F401
 from hubspot_client import (hubspot_request, find_hubspot_contact, _hubspot_owner_cache, resolve_hubspot_owner, create_hubspot_contact, get_contact_associations, log_hubspot_meeting, create_hubspot_task)  # noqa: F401
 from asana_client import asana_request, create_asana_task, find_asana_user_by_email  # noqa: F401
+from notify_content import build_fireflies_summary_html, build_transcript_attachment, build_transcript_text  # noqa: F401
 
 
 def strip_emojis(text: str) -> str:
@@ -1938,7 +1939,7 @@ def start_todo_poller():
 
 # ======================================================================
 
-def notify_organizer(recipients, approval_id: str, meeting_title: str, intelligence: dict = None, meeting_date_str: str = ""):
+def notify_organizer(recipients, approval_id: str, meeting_title: str, intelligence: dict = None, meeting_date_str: str = "", transcript: dict = None):
     """Send all internal participants a rich notification with meeting intelligence summary.
     recipients: list of email addresses or single email string.
     Supports multiple channels: email, slack, teams (comma-separated in NOTIFY_VIA)."""
@@ -2078,6 +2079,18 @@ def notify_organizer(recipients, approval_id: str, meeting_title: str, intellige
                     '</table></div>'
                 )
 
+            # Fireflies summary (below action items) + transcript attachment.
+            # Teams transcripts carry a synthetic placeholder summary -> skip it.
+            ff_summary_section = ""
+            transcript_attachment = None
+            if transcript:
+                try:
+                    if transcript.get("_source") != "teams":
+                        ff_summary_section = build_fireflies_summary_html(transcript.get("summary"))
+                    transcript_attachment = build_transcript_attachment(transcript)
+                except Exception as e:
+                    logger.warning(f"[notify] transcript summary/attachment build failed: {e}")
+
             # Build insights section
             insights_section = ""
             if insights_html:
@@ -2102,6 +2115,8 @@ def notify_organizer(recipients, approval_id: str, meeting_title: str, intellige
                 '</div>'
                 # Action Items
                 f'{tasks_table}'
+                # Fireflies meeting summary
+                f'{ff_summary_section}'
                 # Key Insights
                 f'{insights_section}'
                 # CTA - raw URL (mobile Outlook strips <a> tags, raw https:// URLs auto-link)
@@ -2128,6 +2143,8 @@ def notify_organizer(recipients, approval_id: str, meeting_title: str, intellige
                     "toRecipients": [{"emailAddress": {"address": r}} for r in recipients],
                 },
             }
+            if transcript_attachment:
+                send_payload["message"]["attachments"] = [transcript_attachment]
             if BOT_SENDER_EMAIL:
                 send_payload["message"]["from"] = {
                     "emailAddress": {"name": BOT_SENDER_NAME, "address": BOT_SENDER_EMAIL}
@@ -2138,8 +2155,16 @@ def notify_organizer(recipients, approval_id: str, meeting_title: str, intellige
             else:
                 # Delegated: send as authenticated user
                 url = f"{MS_GRAPH_BASE}/me/sendMail"
-            requests.post(url, json=send_payload, headers=headers, timeout=15)
-            logger.info(f"Email notification sent to {recipients} from {BOT_SENDER_EMAIL or 'self'}")
+            resp = requests.post(url, json=send_payload, headers=headers, timeout=30)
+            if resp.status_code >= 400 and transcript_attachment:
+                # Never lose the notification over the attachment: retry without it.
+                logger.warning(f"[notify] sendMail with transcript failed HTTP {resp.status_code}: {resp.text[:300]} -- retrying without attachment")
+                send_payload["message"].pop("attachments", None)
+                resp = requests.post(url, json=send_payload, headers=headers, timeout=15)
+            if resp.status_code >= 400:
+                logger.warning(f"[notify] sendMail failed HTTP {resp.status_code}: {resp.text[:300]}")
+            else:
+                logger.info(f"Email notification sent to {recipients} from {BOT_SENDER_EMAIL or 'self'}{' with transcript' if send_payload['message'].get('attachments') else ''}")
         except Exception as e:
             logger.warning(f"Email notification failed: {e}")
 
@@ -2206,7 +2231,7 @@ def process_transcript_phase1(transcript: dict) -> str:
     # Notify ONLY the resolved internal organizer (not all participants)
     # Sara is a tool for the meeting owner, not a broadcast system
     logger.info(f"[phase1] Notifying organizer only: {organizer_email}")
-    notify_organizer([organizer_email], approval_id, title, intelligence, meeting_date)
+    notify_organizer([organizer_email], approval_id, title, intelligence, meeting_date, transcript=transcript)
 
     logger.info(f"Phase 1 complete. Approval ID: {approval_id}  --  awaiting organizer review.")
     return approval_id
@@ -4155,7 +4180,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.36.0-xte-long-audio", "deployed": "2026-10-26"})
+    return jsonify({"version": "2.37.0-notify-transcript-summary", "deployed": "2026-11-04"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4223,7 +4248,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.36.0-xte-long-audio", "steps": {}}
+    results = {"version": "2.37.0-notify-transcript-summary", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
