@@ -53,15 +53,29 @@ def _lines_to_html(text: str) -> str:
     return "".join(out)
 
 
-def build_fireflies_summary_html(summary) -> str:
-    """HTML section with the Fireflies-generated summary (overview + topic bullets).
+def fireflies_meeting_url(transcript) -> str:
+    """Link to the meeting in Fireflies: the API's transcript_url, else /view/<id>.
+
+    "" for Teams transcripts (not in Fireflies) or when there is no id.
+    """
+    if not isinstance(transcript, dict) or transcript.get("_source") == "teams":
+        return ""
+    url = str(transcript.get("transcript_url") or "").strip()
+    if url.startswith("https://"):
+        return url
+    tid = str(transcript.get("id") or "").strip()
+    return f"https://app.fireflies.ai/view/{tid}" if tid else ""
+
+
+def build_fireflies_summary_html(summary, meeting_url: str = "") -> str:
+    """HTML section with the Fireflies-generated summary (overview + topic bullets)
+    and a link to the meeting in Fireflies.
 
     Returns "" when there is nothing to show, so the caller can concatenate
     unconditionally.
     """
-    summary = summary or {}
     if not isinstance(summary, dict):
-        return ""
+        summary = {}
     overview = _clean(summary.get("overview"))
     bullets = summary.get("shorthand_bullet") or ""
     if isinstance(bullets, list):
@@ -73,6 +87,13 @@ def build_fireflies_summary_html(summary) -> str:
     bullets_html = _lines_to_html(bullets)
     if bullets_html:
         body += bullets_html
+    if meeting_url:
+        # Raw URL, not just an <a>: mobile Outlook strips anchors but auto-links https://
+        safe = html.escape(meeting_url, quote=True)
+        body += (
+            '<p style="margin:12px 0 0 0;font-size:13px;">Open in Fireflies (recording + transcript): '
+            f'<a href="{safe}" style="color:#2563eb;">{safe}</a></p>'
+        )
     if not body:
         return ""
     return (

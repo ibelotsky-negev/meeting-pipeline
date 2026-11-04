@@ -126,3 +126,26 @@ def test_notify_without_transcript_unchanged(monkeypatch):
     app_module.notify_organizer(["bk@negevlabs.com"], "abc", "Mtg", INTEL, "")
     assert "attachments" not in sent[0]["message"]
     assert "Meeting Summary (Fireflies)" not in sent[0]["message"]["body"]["content"]
+
+
+def test_fireflies_meeting_url_prefers_api_then_id_and_skips_teams():
+    assert nc.fireflies_meeting_url({"id": "t1", "transcript_url": "https://app.fireflies.ai/view/x::t1"}) == "https://app.fireflies.ai/view/x::t1"
+    assert nc.fireflies_meeting_url({"id": "t1"}) == "https://app.fireflies.ai/view/t1"
+    assert nc.fireflies_meeting_url({"id": "t1", "transcript_url": "javascript:alert(1)"}) == "https://app.fireflies.ai/view/t1"
+    assert nc.fireflies_meeting_url({"id": "t1", "_source": "teams"}) == ""
+    assert nc.fireflies_meeting_url({}) == ""
+    assert nc.fireflies_meeting_url(None) == ""
+
+
+def test_summary_html_link_only_when_no_summary():
+    out = nc.build_fireflies_summary_html(None, "https://app.fireflies.ai/view/t1")
+    assert "Meeting Summary (Fireflies)" in out
+    assert 'href="https://app.fireflies.ai/view/t1"' in out
+
+
+def test_notify_includes_fireflies_link(monkeypatch):
+    sent = _wire(monkeypatch, [202])
+    app_module.notify_organizer(["bk@negevlabs.com"], "abc", "Mtg", INTEL, "", transcript=TRANSCRIPT)
+    body = sent[0]["message"]["body"]["content"]
+    assert "https://app.fireflies.ai/view/t1" in body
+    assert body.index("Meeting Summary (Fireflies)") < body.index("app.fireflies.ai/view/t1") < body.index("Review &amp; Approve")

@@ -41,7 +41,7 @@ from stores import load_pending, save_pending, load_processed, save_processed, l
 from fireflies_client import fireflies_query, get_recent_transcripts, get_transcript_by_id, FirefliesQuotaExceeded, duration_to_minutes, quota_blocked_until, clear_quota_block  # noqa: F401
 from hubspot_client import (hubspot_request, find_hubspot_contact, _hubspot_owner_cache, resolve_hubspot_owner, create_hubspot_contact, get_contact_associations, log_hubspot_meeting, create_hubspot_task)  # noqa: F401
 from asana_client import asana_request, create_asana_task, find_asana_user_by_email  # noqa: F401
-from notify_content import build_fireflies_summary_html, build_transcript_attachment, build_transcript_text  # noqa: F401
+from notify_content import build_fireflies_summary_html, build_transcript_attachment, build_transcript_text, fireflies_meeting_url  # noqa: F401
 
 
 def strip_emojis(text: str) -> str:
@@ -2086,7 +2086,8 @@ def notify_organizer(recipients, approval_id: str, meeting_title: str, intellige
             if transcript:
                 try:
                     if transcript.get("_source") != "teams":
-                        ff_summary_section = build_fireflies_summary_html(transcript.get("summary"))
+                        ff_summary_section = build_fireflies_summary_html(
+                            transcript.get("summary"), fireflies_meeting_url(transcript))
                     transcript_attachment = build_transcript_attachment(transcript)
                 except Exception as e:
                     logger.warning(f"[notify] transcript summary/attachment build failed: {e}")
