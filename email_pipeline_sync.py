@@ -3,9 +3,11 @@
 email-pipeline-sync -- Sara module
 
 Scans Outlook mailboxes (Microsoft Graph, app-only auth) for correspondence
-with contacts associated to deals in the PL 2027 Fundraise HubSpot pipeline,
-classifies each email as deal-relevant via Claude, and logs relevant emails
-to HubSpot as email engagements -- only if not already logged.
+with contacts associated to deals in the fundraise HubSpot pipelines (PL 2027
+Fundraise for Palomar Labs, Ariadne 2027 Fundraise for Ariadne Bio), classifies
+each email as deal-relevant via Claude AND routes it to ONE of those pipelines,
+and logs relevant emails to HubSpot as email engagements linked only to that
+pipeline's deals -- only if not already logged.
 
 Compensates for HubSpot's native Outlook logging, which fires inconsistently.
 
@@ -57,6 +59,48 @@ MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 # history is part of the record). Replaced PL 2026 Fundraise (3760999624) on
 # 2026-10-25.
 PIPELINE_ID = os.environ.get("EMAIL_SYNC_PIPELINE_ID", "4252440818")
+# Ariadne 2027 Fundraise -- Ariadne Bio's own round, a separate pipeline.
+ARIADNE_PIPELINE_ID = os.environ.get("EMAIL_SYNC_ARIADNE_PIPELINE_ID", "4283794618")
+
+# The fundraise pipelines this module (and daily_pipeline_digest) cover. Each
+# email is routed to exactly ONE of them by the classifier: an engagement is
+# associated only to the matched contacts' deals IN THAT pipeline, never to a
+# contact's deals in the other one. `key` is the stable routing token stored in
+# the ledger and returned by the classifier -- never rename it.
+PIPELINES = [
+    {
+        "key": "palomar",
+        "label": "Palomar",
+        "name": "PL 2027 Fundraise",
+        "id": PIPELINE_ID,
+        "context": (
+            "Palomar Labs (formerly Negev Labs) studio-level funding round. Topics: "
+            "investment amounts and allocations in Palomar Labs, re-ups by existing "
+            "Palomar/Negev investors, KYC and AML documentation, UPA (Unit Purchase "
+            "Agreement) drafts and negotiation, wire instructions and confirmations, "
+            "shareholder letters, subscription documents, data room access, cap table, "
+            "valuation, term discussions, closing timelines, scheduling of calls about "
+            "investing in Palomar Labs, and studio/portfolio updates sent to Palomar "
+            "investors as investor relations."
+        ),
+    },
+    {
+        "key": "ariadne",
+        "label": "Ariadne",
+        "name": "Ariadne 2027 Fundraise",
+        "id": ARIADNE_PIPELINE_ID,
+        "context": (
+            "Ariadne Bio's own funding round (Ariadne Bio is a CNS biotech, a Palomar "
+            "Labs portfolio company). Topics: investing directly in Ariadne Bio, its "
+            "round terms, SAFE/equity documents, Ariadne data room and diligence "
+            "(science, clinical plan, IP), Ariadne co-investors such as Tetrad VC, "
+            "MJFF (Michael J. Fox Foundation) grant co-funding, European non-dilutive "
+            "grants (FFG, EIC), Ariadne KYC/wires/closing, and scheduling of calls "
+            "about investing in Ariadne Bio."
+        ),
+    },
+]
+PIPELINES_BY_KEY = {p["key"]: p for p in PIPELINES}
 
 # Internal senders/recipients -- an email is in scope only when a roster contact
 # appears on the thread AND at least one of these addresses is present.
@@ -88,17 +132,6 @@ LEDGER_PATH = (
 # the run report flags it when hit.
 MAX_MESSAGES_PER_SEARCH = int(os.environ.get("EMAIL_SYNC_MAX_PER_SEARCH", "500"))
 
-# Fundraise context injected into the classifier prompt
-PIPELINE_CONTEXT = (
-    "PL 2027 Fundraise: Palomar Labs (formerly Negev Labs) funding round. Topics that signal deal "
-    "relevance include: investment amounts and allocations, re-ups by existing "
-    "investors, KYC and AML documentation, UPA (Unit Purchase Agreement) drafts and "
-    "negotiation, wire instructions and wire confirmations, shareholder letters, "
-    "subscription documents, data room access, cap table, valuation, MJFF "
-    "(Michael J. Fox Foundation) grant co-funding, term discussions, closing "
-    "timelines, and scheduling of calls explicitly about the investment. "
-    "Correspondence may be in English or Russian."
-)
 
 # ======================================================================
 #  HTTP HELPERS (retry on 429/5xx, shared by HubSpot and Graph)
@@ -277,11 +310,12 @@ def ledger_record(conn: sqlite3.Connection, msg: dict, outcome: str, detail: str
 # ======================================================================
 
 
-def get_stage_labels() -> dict:
+def get_stage_labels(pipeline_id: str = None) -> dict:
     """Map dealstage internal IDs to human labels for the classifier prompt."""
+    pipeline_id = pipeline_id or PIPELINE_ID
     labels = {}
     try:
-        data = hubspot_request("GET", f"/crm/v3/pipelines/deals/{PIPELINE_ID}")
+        data = hubspot_request("GET", f"/crm/v3/pipelines/deals/{pipeline_id}")
         for stage in data.get("stages") or []:
             labels[stage.get("id", "")] = stage.get("label", "")
     except Exception as e:
@@ -289,13 +323,14 @@ def get_stage_labels() -> dict:
     return labels
 
 
-def get_pipeline_deals() -> list:
+def get_pipeline_deals(pipeline_id: str = None) -> list:
     """All deals in the pipeline, every stage included."""
+    pipeline_id = pipeline_id or PIPELINE_ID
     deals, after = [], None
     while True:
         body = {
             "filterGroups": [{"filters": [
-                {"propertyName": "pipeline", "operator": "EQ", "value": PIPELINE_ID}
+                {"propertyName": "pipeline", "operator": "EQ", "value": pipeline_id}
             ]}],
             "properties": ["dealname", "dealstage", "pipeline"],
             "limit": 100,
@@ -354,23 +389,30 @@ def contact_email_addresses(props: dict) -> list:
 
 
 def build_roster() -> dict:
-    """contact email -> {contact_id, name, deals: [{id, name, stage_label}]}"""
-    stage_labels = get_stage_labels()
-    deals = get_pipeline_deals()
-    logger.info(f"Pipeline {PIPELINE_ID}: {len(deals)} deals")
+    """contact email -> {contact_id, name, deals: [{id, name, stage_label, pipeline}]}
 
+    Built across EVERY pipeline in PIPELINES, so one contact can carry deals in
+    both the Palomar and the Ariadne fundraise; routing to one of them happens
+    per email, after classification (see deals_for_pipeline)."""
     contact_to_deals = {}
     deal_info = {}
-    for deal in deals:
-        deal_id = str(deal.get("id", ""))
-        props = deal.get("properties") or {}
-        deal_info[deal_id] = {
-            "id": deal_id,
-            "name": props.get("dealname") or "",
-            "stage_label": stage_labels.get(props.get("dealstage") or "", props.get("dealstage") or ""),
-        }
-        for cid in get_associated_ids("deals", deal_id, "contacts"):
-            contact_to_deals.setdefault(cid, []).append(deal_id)
+    for pipeline in PIPELINES:
+        stage_labels = get_stage_labels(pipeline["id"])
+        deals = get_pipeline_deals(pipeline["id"])
+        logger.info(f"Pipeline {pipeline['id']} ({pipeline['name']}): {len(deals)} deals")
+        for deal in deals:
+            deal_id = str(deal.get("id", ""))
+            if deal_id in deal_info:
+                continue
+            props = deal.get("properties") or {}
+            deal_info[deal_id] = {
+                "id": deal_id,
+                "name": props.get("dealname") or "",
+                "stage_label": stage_labels.get(props.get("dealstage") or "", props.get("dealstage") or ""),
+                "pipeline": pipeline["key"],
+            }
+            for cid in get_associated_ids("deals", deal_id, "contacts"):
+                contact_to_deals.setdefault(cid, []).append(deal_id)
 
     roster = {}
     contact_count = 0
@@ -552,8 +594,77 @@ def find_logged_engagement(msg: dict, contact_id: str) -> str:
 # ======================================================================
 
 
+def _deal_pipeline(deal: dict) -> str:
+    # A deal record without a pipeline key predates the Ariadne pipeline, when
+    # the roster was Palomar-only.
+    return deal.get("pipeline") or PIPELINES[0]["key"]
+
+
+def pipelines_on_msg(msg: dict) -> list:
+    """Pipeline keys (PIPELINES order) in which a matched contact has a deal."""
+    present = {_deal_pipeline(d) for e in msg["matched_contacts"].values() for d in e["deals"]}
+    return [p["key"] for p in PIPELINES if p["key"] in present]
+
+
+def deals_for_pipeline(msg: dict, pipeline_key: str = None) -> list:
+    """Matched contacts' deals in one pipeline, deduped by id. pipeline_key None
+    means every pipeline (legacy ledger rows that carry no routing)."""
+    out, seen = [], set()
+    for entry in msg["matched_contacts"].values():
+        for deal in entry["deals"]:
+            if pipeline_key and _deal_pipeline(deal) != pipeline_key:
+                continue
+            if deal["id"] not in seen:
+                seen.add(deal["id"])
+                out.append(deal)
+    return out
+
+
+def parse_classification(text: str, msg: dict) -> tuple:
+    """Classifier reply -> (label, reason, pipeline_key).
+
+    label in DEAL_RELEVANT / NOT_RELEVANT / UNCERTAIN; pipeline_key is set only
+    for DEAL_RELEVANT. Pure -- every routing rule lives here so it is testable:
+    - no or unparseable JSON, or an unknown label -> UNCERTAIN;
+    - DEAL_RELEVANT with no valid "fundraise" -> the one pipeline the contacts
+      are in, else UNCERTAIN (never guess between two);
+    - DEAL_RELEVANT for a fundraise in which NO matched contact has a deal ->
+      UNCERTAIN for human review, never logged onto the other pipeline's deal."""
+    match = re.search(r"\{.*\}", text or "", flags=re.S)
+    if not match:
+        return "UNCERTAIN", f"classifier returned non-JSON output: {(text or '')[:120]}", None
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return "UNCERTAIN", f"classifier JSON parse failed: {(text or '')[:120]}", None
+    if not isinstance(parsed, dict):
+        return "UNCERTAIN", f"classifier returned non-object JSON: {(text or '')[:120]}", None
+    label = str(parsed.get("classification") or "").strip().upper()
+    reason = str(parsed.get("reason") or "").strip()
+    if label not in ("DEAL_RELEVANT", "NOT_RELEVANT", "UNCERTAIN"):
+        return "UNCERTAIN", f"unexpected label '{label}': {reason}", None
+    if label != "DEAL_RELEVANT":
+        return label, reason, None
+
+    present = pipelines_on_msg(msg)
+    pipeline = str(parsed.get("fundraise") or "").strip().lower()
+    if pipeline not in PIPELINES_BY_KEY:
+        if len(present) == 1:
+            pipeline = present[0]
+        else:
+            return "UNCERTAIN", f"deal-relevant but fundraise not identified: {reason}", None
+    if pipeline not in present:
+        name = PIPELINES_BY_KEY[pipeline]["name"]
+        return ("UNCERTAIN",
+                f"about the {name} but no contact on the email has a deal in that pipeline: {reason}",
+                None)
+    return "DEAL_RELEVANT", reason, pipeline
+
+
 def classify_email(msg: dict) -> tuple:
-    """Returns (label, reason). label in DEAL_RELEVANT / NOT_RELEVANT / UNCERTAIN."""
+    """Returns (label, reason, pipeline_key). label in DEAL_RELEVANT /
+    NOT_RELEVANT / UNCERTAIN; pipeline_key names the fundraise a DEAL_RELEVANT
+    email belongs to (see parse_classification), else None."""
     import anthropic
 
     api_key = os.environ.get("CLAUDE_API_KEY", "")
@@ -563,13 +674,20 @@ def classify_email(msg: dict) -> tuple:
     deal_lines = []
     for entry in msg["matched_contacts"].values():
         for deal in entry["deals"]:
-            deal_lines.append(f"- Contact {entry['name']}: deal \"{deal['name']}\" (stage: {deal['stage_label']})")
+            pname = PIPELINES_BY_KEY.get(_deal_pipeline(deal), {}).get("name", "")
+            deal_lines.append(f"- Contact {entry['name']}: deal \"{deal['name']}\" "
+                              f"in {pname} (stage: {deal['stage_label']})")
     deals_block = "\n".join(deal_lines) or "- (no deal context resolved)"
+    fundraise_block = "\n".join(f"- \"{p['key']}\" = {p['name']}: {p['context']}" for p in PIPELINES)
+    keys = "|".join(p["key"] for p in PIPELINES)
 
     body_excerpt = (msg.get("body_text") or "")[:8000]
-    prompt = f"""You are classifying whether an email belongs on a fundraising deal timeline in a CRM.
+    prompt = f"""You are classifying whether an email belongs on a fundraising deal timeline in a CRM, and if so WHICH of two separate fundraises it belongs to.
 
-Pipeline context: {PIPELINE_CONTEXT}
+The two fundraises (separate CRM pipelines):
+{fundraise_block}
+
+Correspondence may be in English or Russian.
 
 Deal context for the contact(s) on this email:
 {deals_block}
@@ -582,25 +700,33 @@ Body:
 {body_excerpt}
 
 Classify the email:
-- DEAL_RELEVANT: relates to the contact's deal in this fundraise (terms, documents, KYC, wires, scheduling investment calls, diligence, updates about the round).
-- NOT_RELEVANT: personal topics, other ventures or deals outside this pipeline, newsletters, unrelated business.
+- DEAL_RELEVANT: relates to the contact's deal in one of these fundraises (terms, documents, KYC, wires, scheduling investment calls, diligence, updates about the round).
+- NOT_RELEVANT: personal topics, other ventures or deals outside these pipelines, newsletters, unrelated business.
 - UNCERTAIN: genuinely ambiguous; a human should review.
+
+For DEAL_RELEVANT, also set "fundraise" to the ONE fundraise the email is about:
+- "ariadne" when it is about investing in Ariadne Bio itself -- its round, terms,
+  documents, diligence, grants, or calls about an Ariadne investment.
+- "palomar" when it is about investing in Palomar Labs (the studio), including
+  studio or portfolio updates (Ariadne news included) sent to a contact as
+  Palomar investor relations, when that contact has no Ariadne deal.
+- When the content fits both, prefer the fundraise in which the contact
+  actually has a deal (see deal context).
 
 Stage matters: when the contact's deal is in an early stage (Outreach, Discovery,
 Engaged), outreach from the team to the contact -- proposing an update call,
 scheduling time, re-engaging the relationship -- IS the deal activity and counts
-as DEAL_RELEVANT even when the round is not mentioned explicitly. Only treat
-team-to-contact outreach as NOT_RELEVANT when it is clearly about an unrelated
-matter (a personal topic, the contact's own other business, logistics of another
-engagement).
+as DEAL_RELEVANT even when the round is not mentioned explicitly; route it to
+the fundraise of that early-stage deal. Only treat team-to-contact outreach as
+NOT_RELEVANT when it is clearly about an unrelated matter (a personal topic, the
+contact's own other business, logistics of another engagement).
 
-Negev Labs is a venture studio: updates to fundraise contacts about its portfolio
-companies (e.g., Ariadne Bio) are investor-relations content for this round and
-count as DEAL_RELEVANT. Introductions connecting prospective investors or their
-advisors with Negev Labs also count as DEAL_RELEVANT. Only ventures unrelated to
-Negev Labs (e.g., the contact's own separate deals) are NOT_RELEVANT.
+Palomar Labs (formerly Negev Labs) is a venture studio. Introductions connecting
+prospective investors or their advisors with Palomar Labs or Ariadne Bio count as
+DEAL_RELEVANT. Only ventures unrelated to Palomar Labs and its portfolio (e.g.,
+the contact's own separate deals) are NOT_RELEVANT.
 
-Respond with ONLY a JSON object: {{"classification": "DEAL_RELEVANT|NOT_RELEVANT|UNCERTAIN", "reason": "<one sentence>"}}"""
+Respond with ONLY a JSON object: {{"classification": "DEAL_RELEVANT|NOT_RELEVANT|UNCERTAIN", "fundraise": "{keys}|null", "reason": "<one sentence>"}}"""
 
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
@@ -609,18 +735,7 @@ Respond with ONLY a JSON object: {{"classification": "DEAL_RELEVANT|NOT_RELEVANT
         messages=[{"role": "user", "content": prompt}],
     )
     text = "".join(block.text for block in response.content if hasattr(block, "text")).strip()
-    match = re.search(r"\{.*\}", text, flags=re.S)
-    if not match:
-        return "UNCERTAIN", f"classifier returned non-JSON output: {text[:120]}"
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return "UNCERTAIN", f"classifier JSON parse failed: {text[:120]}"
-    label = (parsed.get("classification") or "").strip().upper()
-    reason = (parsed.get("reason") or "").strip()
-    if label not in ("DEAL_RELEVANT", "NOT_RELEVANT", "UNCERTAIN"):
-        return "UNCERTAIN", f"unexpected label '{label}': {reason}"
-    return label, reason
+    return parse_classification(text, msg)
 
 
 # ======================================================================
@@ -636,8 +751,11 @@ def create_default_association(email_id: str, to_type: str, to_id: str):
     _request_with_retry("PUT", url, headers)
 
 
-def ensure_engagement_associations(email_id: str, msg: dict) -> list:
+def ensure_engagement_associations(email_id: str, msg: dict, pipeline_key: str = None) -> list:
     """Associate an engagement to matched contacts + their deals + companies.
+    pipeline_key restricts the DEAL links to that one fundraise pipeline (an
+    Ariadne email never lands on the contact's Palomar deal, and vice versa);
+    None links every deal (legacy ledger rows, written before routing existed).
     PUT default association is idempotent, so this doubles as the repair path
     for partial writes. Returns failed targets as 'type:id' strings."""
     failed = []
@@ -645,7 +763,8 @@ def ensure_engagement_associations(email_id: str, msg: dict) -> list:
     for entry in msg["matched_contacts"].values():
         contact_id = entry["contact_id"]
         targets = [("contacts", contact_id)]
-        targets += [("deals", deal["id"]) for deal in entry["deals"]]
+        targets += [("deals", deal["id"]) for deal in entry["deals"]
+                    if not pipeline_key or _deal_pipeline(deal) == pipeline_key]
         try:
             for company_id in get_associated_ids("contacts", contact_id, "companies")[:1]:
                 if company_id not in associated_companies:
@@ -663,7 +782,7 @@ def ensure_engagement_associations(email_id: str, msg: dict) -> list:
     return failed
 
 
-def log_email_to_hubspot(msg: dict) -> tuple:
+def log_email_to_hubspot(msg: dict, pipeline_key: str = None) -> tuple:
     """Create email engagement, associate to matched contacts + their deals + companies.
     Returns (engagement_id, failed_association_targets). Association failures do
     not abort the write -- they are recorded for retry on the next run."""
@@ -692,7 +811,7 @@ def log_email_to_hubspot(msg: dict) -> tuple:
     }
     created = hubspot_request("POST", "/crm/v3/objects/emails", {"properties": properties})
     email_id = str(created.get("id", ""))
-    failed = ensure_engagement_associations(email_id, msg)
+    failed = ensure_engagement_associations(email_id, msg, pipeline_key)
     return email_id, failed
 
 
@@ -703,11 +822,14 @@ def log_email_to_hubspot(msg: dict) -> tuple:
 
 def build_report(stats: dict, uncertain: list, skipped_mailboxes: list, caps_hit: list,
                  window: str, dry_run: bool) -> str:
+    by_pipeline = stats.get("logged_by_pipeline") or {}
+    split = ", ".join(f"{p['label']} {by_pipeline.get(p['key'], 0)}" for p in PIPELINES)
     lines = [
         f"email-pipeline-sync run report {'(DRY RUN) ' if dry_run else ''}-- window {window}",
+        "Pipelines: " + "; ".join(f"{p['name']} ({p['id']})" for p in PIPELINES),
         "",
         f"Scanned:    {stats['scanned']}",
-        f"Logged:     {stats['logged']}",
+        f"Logged:     {stats['logged']} ({split})",
         f"Duplicates: {stats['duplicates']}",
         f"Irrelevant: {stats['irrelevant']}",
         f"Uncertain:  {stats['uncertain']}",
@@ -726,7 +848,9 @@ def build_report(stats: dict, uncertain: list, skipped_mailboxes: list, caps_hit
         lines += ["", "UNCERTAIN -- human review needed (not logged):"]
         for u in uncertain:
             contacts = ", ".join(sorted(u["matched_contacts"].keys()))
-            deals = ", ".join(d["name"] for e in u["matched_contacts"].values() for d in e["deals"])
+            deals = ", ".join(
+                f"{d['name']} [{PIPELINES_BY_KEY.get(_deal_pipeline(d), {}).get('label', '?')}]"
+                for d in deals_for_pipeline(u))
             lines.append(f"  - [{u.get('received', '')[:10]}] \"{u.get('subject', '')}\"")
             lines.append(f"    contact(s): {contacts} | deal(s): {deals}")
             lines.append(f"    reason: {u.get('uncertain_reason', '')}")
@@ -753,6 +877,18 @@ def send_report_email(report: str, window: str):
 # ======================================================================
 #  RUN ORCHESTRATION
 # ======================================================================
+
+
+def _pipeline_tag(pipeline_key) -> str:
+    """'pipeline=<key>; ' for a ledger detail string, '' when unrouted."""
+    return f"pipeline={pipeline_key}; " if pipeline_key else ""
+
+
+def detail_pipeline(detail: str):
+    """Routed pipeline key recorded in a ledger detail, or None for rows
+    written before routing existed (their repair links every deal, as then)."""
+    m = re.search(r"pipeline=(\w+)", detail or "")
+    return m.group(1) if m and m.group(1) in PIPELINES_BY_KEY else None
 
 
 def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report: bool) -> dict:
@@ -788,7 +924,8 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
                 raise
 
     stats = {"scanned": 0, "logged": 0, "duplicates": 0, "irrelevant": 0,
-             "uncertain": 0, "repaired": 0, "partial": 0, "errors": 0}
+             "uncertain": 0, "repaired": 0, "partial": 0, "errors": 0,
+             "logged_by_pipeline": {}}
     uncertain_msgs = []
     internal = set(INTERNAL_TEAM_EMAILS)
 
@@ -806,15 +943,17 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
             if outcome == "logged-partial" and not dry_run:
                 m = re.search(r"engagement=(\d+)", detail or "")
                 if m:
-                    still_failed = ensure_engagement_associations(m.group(1), msg)
+                    pipeline = detail_pipeline(detail)
+                    still_failed = ensure_engagement_associations(m.group(1), msg, pipeline)
+                    tag = _pipeline_tag(pipeline)
                     if still_failed:
                         stats["partial"] += 1
                         ledger_update_outcome(conn, imid, "logged-partial",
-                                              f"engagement={m.group(1)}; failed={','.join(still_failed)}")
+                                              f"engagement={m.group(1)}; {tag}failed={','.join(still_failed)}")
                     else:
                         stats["repaired"] += 1
                         ledger_update_outcome(conn, imid, "logged",
-                                              f"engagement={m.group(1)}; associations repaired")
+                                              f"engagement={m.group(1)}; {tag}associations repaired")
                         logger.info(f"Repaired associations on engagement {m.group(1)}: \"{msg.get('subject', '')}\"")
             continue  # processed in a previous run; not counted as duplicate
 
@@ -835,18 +974,22 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
                 if existing_id:
                     break
             if existing_id:
-                expected_deals = {d["id"] for e in msg["matched_contacts"].values() for d in e["deals"]}
+                all_deals = {d["id"] for d in deals_for_pipeline(msg)}
                 linked_deals = set(get_associated_ids("emails", existing_id, "deals"))
-                if expected_deals - linked_deals:
-                    label, reason = classify_email(msg)
-                    if label == "DEAL_RELEVANT":
+                if all_deals - linked_deals:
+                    label, reason, pipeline = classify_email(msg)
+                    # Only the routed pipeline's deals are expected: a contact's
+                    # deal in the OTHER fundraise being unlinked is correct.
+                    expected = {d["id"] for d in deals_for_pipeline(msg, pipeline)}
+                    if label == "DEAL_RELEVANT" and expected - linked_deals:
                         if dry_run:
-                            logger.info(f"[dry-run] would repair deal links on engagement {existing_id}: \"{msg.get('subject', '')}\"")
+                            logger.info(f"[dry-run] would repair {pipeline} deal links on engagement {existing_id}: \"{msg.get('subject', '')}\"")
                         else:
-                            ensure_engagement_associations(existing_id, msg)
-                            logger.info(f"Repaired deal links on engagement {existing_id}: \"{msg.get('subject', '')}\"")
+                            ensure_engagement_associations(existing_id, msg, pipeline)
+                            logger.info(f"Repaired {pipeline} deal links on engagement {existing_id}: \"{msg.get('subject', '')}\"")
                         ledger_record(conn, msg, "repaired-associations",
-                                      f"engagement={existing_id}; {reason}", run_id, dry_run)
+                                      f"engagement={existing_id}; {_pipeline_tag(pipeline)}{reason}",
+                                      run_id, dry_run)
                         stats["repaired"] += 1
                         continue
                 ledger_record(conn, msg, "skipped-duplicate",
@@ -854,7 +997,8 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
                 stats["duplicates"] += 1
                 continue
 
-            label, reason = classify_email(msg)
+            label, reason, pipeline = classify_email(msg)
+            tag = _pipeline_tag(pipeline)
             if label == "NOT_RELEVANT":
                 ledger_record(conn, msg, "skipped-irrelevant", reason, run_id, dry_run)
                 stats["irrelevant"] += 1
@@ -865,21 +1009,22 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
                 stats["uncertain"] += 1
             else:
                 if dry_run:
-                    logger.info(f"[dry-run] would log: \"{msg.get('subject', '')}\" ({reason})")
-                    ledger_record(conn, msg, "logged", reason, run_id, dry_run)
+                    logger.info(f"[dry-run] would log to {pipeline}: \"{msg.get('subject', '')}\" ({reason})")
+                    ledger_record(conn, msg, "logged", f"{tag}{reason}", run_id, dry_run)
                 else:
-                    engagement_id, failed = log_email_to_hubspot(msg)
+                    engagement_id, failed = log_email_to_hubspot(msg, pipeline)
                     if failed:
                         # Engagement exists; failed associations retry next run
-                        logger.warning(f"Logged engagement {engagement_id} with failed associations {failed}: \"{msg.get('subject', '')}\"")
+                        logger.warning(f"Logged engagement {engagement_id} ({pipeline}) with failed associations {failed}: \"{msg.get('subject', '')}\"")
                         ledger_record(conn, msg, "logged-partial",
-                                      f"engagement={engagement_id}; failed={','.join(failed)}", run_id, dry_run)
+                                      f"engagement={engagement_id}; {tag}failed={','.join(failed)}", run_id, dry_run)
                         stats["partial"] += 1
                     else:
-                        logger.info(f"Logged engagement {engagement_id}: \"{msg.get('subject', '')}\"")
+                        logger.info(f"Logged engagement {engagement_id} ({pipeline}): \"{msg.get('subject', '')}\"")
                         ledger_record(conn, msg, "logged",
-                                      f"engagement={engagement_id}; {reason}", run_id, dry_run)
+                                      f"engagement={engagement_id}; {tag}{reason}", run_id, dry_run)
                 stats["logged"] += 1
+                stats["logged_by_pipeline"][pipeline] = stats["logged_by_pipeline"].get(pipeline, 0) + 1
         except Exception as e:
             logger.error(f"Error processing \"{msg.get('subject', '')}\": {e}")
             stats["errors"] += 1

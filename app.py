@@ -4181,7 +4181,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.37.0-notify-transcript-summary", "deployed": "2026-11-04"})
+    return jsonify({"version": "2.38.0-ariadne-pipeline", "deployed": "2026-11-06"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4249,7 +4249,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.37.0-notify-transcript-summary", "steps": {}}
+    results = {"version": "2.38.0-ariadne-pipeline", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()

@@ -2,9 +2,10 @@
 """
 daily-pipeline-digest -- Sara module
 
-Compiles every change and new activity in the PL 2027 Fundraise pipeline
-over the previous window (default 24h, resilient to missed runs) and emails
-Ken a single readable morning brief. Covers all deal owners, narrates deltas
+Compiles every change and new activity in each fundraise pipeline over the
+previous window (default 24h, resilient to missed runs) and emails ONE
+readable morning brief PER PIPELINE: PL 2027 Fundraise (Palomar Labs) to Ken,
+Ariadne 2027 Fundraise (Ariadne Bio) to Ken and Shlomi. Covers all deal owners, narrates deltas
 rather than state, and applies Negev operating rules deterministically
 (stale-deal, overdue-task, and wire-watch flags).
 
@@ -38,13 +39,31 @@ logger = logging.getLogger("daily-pipeline-digest")
 #  CONFIG
 # ======================================================================
 
-PIPELINE_ID = os.environ.get("DIGEST_PIPELINE_ID", eps.PIPELINE_ID)
+def _env_list(name: str, default: str) -> list:
+    return [r.strip() for r in os.environ.get(name, default).split(",") if r.strip()]
 
-DIGEST_RECIPIENTS = [
-    r.strip() for r in os.environ.get("DIGEST_RECIPIENTS", "bk@negevlabs.com").split(",") if r.strip()
-]
+
+PIPELINE_ID = os.environ.get("DIGEST_PIPELINE_ID", eps.PIPELINE_ID)
+ARIADNE_PIPELINE_ID = os.environ.get("DIGEST_ARIADNE_PIPELINE_ID", eps.ARIADNE_PIPELINE_ID)
+
+# Palomar digest recipients (env names predate the Ariadne digest -- kept)
+DIGEST_RECIPIENTS = _env_list("DIGEST_RECIPIENTS", "bk@negevlabs.com")
 # CC list (e.g. Alex Kubasov) -- empty by default, flip via env when Ken decides
-DIGEST_CC = [r.strip() for r in os.environ.get("DIGEST_CC", "").split(",") if r.strip()]
+DIGEST_CC = _env_list("DIGEST_CC", "")
+DIGEST_ARIADNE_RECIPIENTS = _env_list("DIGEST_ARIADNE_RECIPIENTS",
+                                      "bk@negevlabs.com,shlomi@negevlabs.com")
+DIGEST_ARIADNE_CC = _env_list("DIGEST_ARIADNE_CC", "")
+
+# One digest per fundraise pipeline: separate data, separate email, separate
+# recipients, and a separate resilient-window anchor in the ledger (`key` is
+# stored in digest_runs.pipeline -- never rename it). A failure in one pipeline
+# never stops the other's email.
+DIGESTS = [
+    {"key": "palomar", "label": "Palomar", "name": "PL 2027 Fundraise",
+     "id": PIPELINE_ID, "recipients": DIGEST_RECIPIENTS, "cc": DIGEST_CC},
+    {"key": "ariadne", "label": "Ariadne", "name": "Ariadne 2027 Fundraise",
+     "id": ARIADNE_PIPELINE_ID, "recipients": DIGEST_ARIADNE_RECIPIENTS, "cc": DIGEST_ARIADNE_CC},
+]
 
 COMPOSER_MODEL = os.environ.get("DIGEST_MODEL", "claude-haiku-4-5-20251001")
 
@@ -176,18 +195,27 @@ def ledger_connect() -> sqlite3.Connection:
             status TEXT
         )"""
     )
+    # Per-pipeline window anchor (added with the Ariadne digest). Rows written
+    # before it existed were all the Palomar digest, hence the default.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(digest_runs)")}
+    if "pipeline" not in cols:
+        conn.execute("ALTER TABLE digest_runs ADD COLUMN pipeline TEXT DEFAULT 'palomar'")
     conn.commit()
     return conn
 
 
-def get_window_start(conn: sqlite3.Connection, now: datetime) -> datetime:
-    """Window starts at the last successful real run's window end, so a failed
-    or skipped day is covered by the next run. Falls back to 24h; capped at
-    MAX_WINDOW_DAYS so an extended outage cannot produce an unbounded digest."""
+def get_window_start(conn: sqlite3.Connection, now: datetime,
+                     pipeline_key: str = "palomar") -> datetime:
+    """Window starts at the last successful real run's window end FOR THIS
+    PIPELINE, so a failed or skipped day is covered by the next run (and one
+    pipeline's failure never moves the other's anchor). Falls back to 24h;
+    capped at MAX_WINDOW_DAYS so an extended outage cannot produce an
+    unbounded digest."""
     default_start = now - timedelta(hours=DEFAULT_WINDOW_HOURS)
     row = conn.execute(
         "SELECT window_until FROM digest_runs WHERE status = 'ok' AND dry_run = 0 "
-        "ORDER BY window_until DESC LIMIT 1"
+        "AND pipeline = ? ORDER BY window_until DESC LIMIT 1",
+        (pipeline_key,),
     ).fetchone()
     last = _parse_ts(row[0]) if row and row[0] else None
     if last is None:
@@ -196,14 +224,17 @@ def get_window_start(conn: sqlite3.Connection, now: datetime) -> datetime:
     return max(min(last, now), earliest)
 
 
-def record_run(conn, run_id, started_at, since, until, data, quiet, sent, dry_run, status):
+def record_run(conn, run_id, started_at, since, until, data, quiet, sent, dry_run, status,
+               pipeline_key: str = "palomar"):
     counts = _data_counts(data)
     conn.execute(
-        "INSERT OR REPLACE INTO digest_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO digest_runs (run_id, started_at, finished_at, window_since, "
+        "window_until, stage_moves, activities, flags, quiet, sent, dry_run, status, pipeline) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (run_id, started_at, datetime.now(timezone.utc).isoformat(),
          since.isoformat(), until.isoformat(),
          counts["stage_moves"], counts["activities"], counts["flags"],
-         1 if quiet else 0, 1 if sent else 0, 1 if dry_run else 0, status),
+         1 if quiet else 0, 1 if sent else 0, 1 if dry_run else 0, status, pipeline_key),
     )
     conn.commit()
 
@@ -238,9 +269,9 @@ def search_objects(object_type: str, filters: list, properties: list) -> list:
     return results
 
 
-def get_pipeline_stages() -> list:
-    """[{id, label, probability, is_closed, order}] for the fundraise pipeline."""
-    data = eps.hubspot_request("GET", f"/crm/v3/pipelines/deals/{PIPELINE_ID}")
+def get_pipeline_stages(pipeline_id: str = None) -> list:
+    """[{id, label, probability, is_closed, order}] for a fundraise pipeline."""
+    data = eps.hubspot_request("GET", f"/crm/v3/pipelines/deals/{pipeline_id or PIPELINE_ID}")
     stages = []
     for s in data.get("stages") or []:
         meta = s.get("metadata") or {}
@@ -287,13 +318,13 @@ def find_closing_stage(stages: list):
     return None
 
 
-def get_pipeline_deals(closing_stage_id: str = "") -> list:
+def get_pipeline_deals(closing_stage_id: str = "", pipeline_id: str = None) -> list:
     """All deals in the pipeline with the properties the digest needs."""
     properties = ["dealname", "dealstage", "amount", "closedate", "hubspot_owner_id",
                   "hs_lastmodifieddate", "notes_last_updated", "createdate"]
     if closing_stage_id:
         properties.append(f"hs_date_entered_{closing_stage_id}")
-    filters = [{"propertyName": "pipeline", "operator": "EQ", "value": PIPELINE_ID}]
+    filters = [{"propertyName": "pipeline", "operator": "EQ", "value": pipeline_id or PIPELINE_ID}]
     return search_objects("deals", filters, properties)
 
 
@@ -925,20 +956,25 @@ Return ONLY the email body text."""
 # ======================================================================
 
 
-def send_digest_email(subject: str, body: str, content_type: str = "HTML"):
+def send_digest_email(subject: str, body: str, content_type: str = "HTML",
+                      recipients: list = None, cc: list = None):
     sender = os.environ.get("BOT_SENDER_EMAIL", "")
     if not sender:
         raise RuntimeError("BOT_SENDER_EMAIL not set -- digest not emailed")
+    recipients = DIGEST_RECIPIENTS if recipients is None else recipients
+    cc = DIGEST_CC if cc is None else cc
+    if not recipients:
+        raise RuntimeError(f"no recipients configured -- digest '{subject}' not emailed")
     message = {
         "subject": subject,
         "body": {"contentType": content_type, "content": body},
-        "toRecipients": [{"emailAddress": {"address": r}} for r in DIGEST_RECIPIENTS],
+        "toRecipients": [{"emailAddress": {"address": r}} for r in recipients],
     }
-    if DIGEST_CC:
-        message["ccRecipients"] = [{"emailAddress": {"address": r}} for r in DIGEST_CC]
+    if cc:
+        message["ccRecipients"] = [{"emailAddress": {"address": r}} for r in cc]
     eps.graph_post(f"{eps.MS_GRAPH_BASE}/users/{sender}/sendMail",
                    {"message": message, "saveToSentItems": False})
-    logger.info(f"Digest emailed to {', '.join(DIGEST_RECIPIENTS)}")
+    logger.info(f"Digest '{subject}' emailed to {', '.join(recipients)}")
 
 
 # ======================================================================
@@ -966,110 +1002,159 @@ def read_status() -> dict:
         return {"status": "error", "error": f"could not read status: {e}"}
 
 
+def digest_subject(cfg: dict, now: datetime) -> str:
+    local_date = (now + timedelta(hours=ISRAEL_UTC_OFFSET_HOURS)).strftime("%a %d %b %Y")
+    return f"[Sara] {cfg['label']} pipeline digest -- {local_date}"
+
+
+def run_pipeline_digest(cfg: dict, conn, run_id: str, started_at: str, now: datetime,
+                        since: datetime, by_owner: dict, by_user: dict, all_stage_labels: dict,
+                        portal_id: str, shared_skipped: list, dry_run: bool) -> dict:
+    """Collect, render and send ONE pipeline's digest, and record its ok ledger
+    row. The caller records the error row if this raises."""
+    until = now
+    skipped = list(shared_skipped)
+    stages = get_pipeline_stages(cfg["id"])
+    # This pipeline's own labels win; other pipelines only fill the gaps
+    stage_labels = {**all_stage_labels, **{s["id"]: s["label"] for s in stages}}
+    closing = find_closing_stage(stages)
+    closing_id = closing["id"] if closing else ""
+    if not closing:
+        logger.warning(f"{cfg['name']}: no Closing stage matched -- wire-watch flags disabled this run")
+
+    deals = [normalize_deal(r, stages, by_owner, closing_id)
+             for r in get_pipeline_deals(closing_id, pipeline_id=cfg["id"])]
+    deals_by_id = {d["id"]: d for d in deals}
+    logger.info(f"Pipeline {cfg['id']} ({cfg['name']}): {len(deals)} deals")
+
+    changed_ids = [d["id"] for d in deals
+                   if d.get("modified") and since <= d["modified"] < until]
+    stage_moves, property_changes = collect_deltas(
+        changed_ids, deals_by_id, since, until, by_user, stage_labels)
+    activity = collect_activity(since, until, deals_by_id, by_owner, skipped)
+
+    _, day_end = israel_day_bounds(now)
+    open_tasks = collect_open_tasks(deals_by_id, by_owner, day_end, skipped)
+    overdue, due_today = split_overdue_and_due_today(open_tasks, now)
+    flags = (flag_stale_deals(deals, now)
+             + flag_overdue_tasks(overdue)
+             + flag_closing_watch(deals, now))
+
+    data = build_digest_data(since, until, stage_moves, property_changes,
+                             activity, flags, due_today, deals, stages,
+                             portal_id=portal_id)
+
+    subject = digest_subject(cfg, now)
+    quiet = is_quiet(data)
+    if quiet:
+        body = ('<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;">'
+                f'No pipeline changes yesterday in {_esc(cfg["name"])}. '
+                'Nothing flagged, nothing due today.</div>')
+    else:
+        body = render_html(data)
+
+    sent = False
+    if dry_run:
+        logger.info(f"[dry-run] {cfg['key']} digest body:\n{body}")
+        print(f"\nSubject: {subject}\nTo: {', '.join(cfg['recipients'])}\n\n{body}\n")
+    elif quiet and not QUIET_DAY_SEND:
+        logger.info(f"{cfg['name']}: quiet day and DIGEST_QUIET_SEND disabled -- skipping send")
+    else:
+        send_digest_email(subject, body, recipients=cfg["recipients"], cc=cfg["cc"])
+        sent = True
+
+    record_run(conn, f"{run_id}:{cfg['key']}", started_at, since, until, data, quiet, sent,
+               dry_run, "ok", cfg["key"])
+    return {
+        "status": "ok",
+        "pipeline_id": cfg["id"],
+        "name": cfg["name"],
+        "recipients": list(cfg["recipients"]) + list(cfg["cc"]),
+        "window": {"since": since.isoformat(), "until": until.isoformat()},
+        "quiet": quiet,
+        "sent": sent,
+        "counts": _data_counts(data),
+        "skipped": skipped,
+        "subject": subject,
+        "body": body,
+        "data": data,
+    }
+
+
 def run_digest(dry_run: bool = False, since_override: datetime = None) -> dict:
+    """One digest email per pipeline in DIGESTS. Each pipeline is isolated: its
+    own window anchor, its own ledger row, and a failure in one still lets the
+    other send. Raises (after persisting status) if ANY pipeline failed, so the
+    scheduler and /digest/trigger?sync=1 surface it."""
     import traceback as _traceback
 
     run_id = uuid.uuid4().hex[:12]
     now = datetime.now(timezone.utc)
     started_at = now.isoformat()
     conn = ledger_connect()
-    since = since_override or get_window_start(conn, now)
-    until = now
-    logger.info(f"Digest run {run_id}: window {since.isoformat()} .. {until.isoformat()}, dry_run={dry_run}")
+    logger.info(f"Digest run {run_id}: pipelines {[c['key'] for c in DIGESTS]}, dry_run={dry_run}")
 
-    data, quiet, sent, body, subject = None, False, False, "", ""
-    skipped = []
+    results, errors = {}, []
+    shared_skipped = []
     try:
-        stages = get_pipeline_stages()
-        # This pipeline's own labels win; other pipelines only fill the gaps
-        stage_labels = {**get_all_stage_labels(), **{s["id"]: s["label"] for s in stages}}
-        closing = find_closing_stage(stages)
-        closing_id = closing["id"] if closing else ""
-        if not closing:
-            logger.warning("No Closing stage matched -- wire-watch flags disabled this run")
+        # Shared, pipeline-independent lookups -- each degrades on its own
+        by_owner, by_user = get_owner_maps(shared_skipped)
+        all_stage_labels = get_all_stage_labels()
+        portal_id = get_portal_id()
 
-        by_owner, by_user = get_owner_maps(skipped)
-        deals = [normalize_deal(r, stages, by_owner, closing_id)
-                 for r in get_pipeline_deals(closing_id)]
-        deals_by_id = {d["id"]: d for d in deals}
-        logger.info(f"Pipeline {PIPELINE_ID}: {len(deals)} deals")
-
-        changed_ids = [d["id"] for d in deals
-                       if d.get("modified") and since <= d["modified"] < until]
-        stage_moves, property_changes = collect_deltas(
-            changed_ids, deals_by_id, since, until, by_user, stage_labels)
-        activity = collect_activity(since, until, deals_by_id, by_owner, skipped)
-
-        _, day_end = israel_day_bounds(now)
-        open_tasks = collect_open_tasks(deals_by_id, by_owner, day_end, skipped)
-        overdue, due_today = split_overdue_and_due_today(open_tasks, now)
-        flags = (flag_stale_deals(deals, now)
-                 + flag_overdue_tasks(overdue)
-                 + flag_closing_watch(deals, now))
-
-        data = build_digest_data(since, until, stage_moves, property_changes,
-                                 activity, flags, due_today, deals, stages,
-                                 portal_id=get_portal_id())
-
-        local_date = (now + timedelta(hours=ISRAEL_UTC_OFFSET_HOURS)).strftime("%a %d %b %Y")
-        subject = f"[Sara] Pipeline digest -- {local_date}"
-        quiet = is_quiet(data)
-        if quiet:
-            body = ('<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;">'
-                    'No pipeline changes yesterday. Nothing flagged, nothing due today.</div>')
-        else:
-            body = render_html(data)
-
-        if dry_run:
-            logger.info(f"[dry-run] digest body:\n{body}")
-            print(f"\nSubject: {subject}\n\n{body}\n")
-        elif quiet and not QUIET_DAY_SEND:
-            logger.info("Quiet day and DIGEST_QUIET_SEND disabled -- skipping send")
-        else:
-            send_digest_email(subject, body)
-            sent = True
-
-        record_run(conn, run_id, started_at, since, until, data, quiet, sent, dry_run, "ok")
-        counts = _data_counts(data)
-        result = {
-            "status": "ok",
-            "run_id": run_id,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "window": {"since": since.isoformat(), "until": until.isoformat()},
-            "dry_run": dry_run,
-            "quiet": quiet,
-            "sent": sent,
-            "counts": counts,
-            "skipped": skipped,
-            "subject": subject,
-            "body": body,
-            "data": data,
-        }
-        write_status({k: result[k] for k in
-                      ("status", "run_id", "finished_at", "window", "dry_run",
-                       "quiet", "sent", "counts", "skipped", "subject", "body")})
-        return result
+        for cfg in DIGESTS:
+            since = since_override or get_window_start(conn, now, cfg["key"])
+            try:
+                results[cfg["key"]] = run_pipeline_digest(
+                    cfg, conn, run_id, started_at, now, since, by_owner, by_user,
+                    all_stage_labels, portal_id, shared_skipped, dry_run)
+            except Exception as e:
+                tb = _traceback.format_exc()
+                logger.error(f"Digest run {run_id} [{cfg['key']}] failed: {tb}")
+                record_run(conn, f"{run_id}:{cfg['key']}", started_at, since, now, None,
+                           False, False, dry_run, "error", cfg["key"])
+                errors.append(e)
+                results[cfg["key"]] = {
+                    "status": "error",
+                    "pipeline_id": cfg["id"],
+                    "name": cfg["name"],
+                    "window": {"since": since.isoformat(), "until": now.isoformat()},
+                    "sent": False,
+                    "error": str(e),
+                    "traceback": tb,
+                }
     except Exception as e:
-        record_run(conn, run_id, started_at, since, until, data, quiet, sent, dry_run, "error")
-        tb = _traceback.format_exc()
-        logger.error(f"Digest run {run_id} failed: {tb}")
-        write_status({
-            "status": "error",
-            "run_id": run_id,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "window": {"since": since.isoformat(), "until": until.isoformat()},
-            "dry_run": dry_run,
-            "skipped": skipped,
-            "error": str(e),
-            "traceback": tb,
-        })
-        raise
+        # A shared lookup itself raised -- no pipeline digest ran
+        errors.append(e)
+        results["_shared"] = {"status": "error", "sent": False, "error": str(e),
+                              "traceback": _traceback.format_exc()}
     finally:
         conn.close()
 
+    ok = not errors
+    result = {
+        "status": "ok" if ok else "error",
+        "run_id": run_id,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "dry_run": dry_run,
+        "sent": any(r.get("sent") for r in results.values()),
+        "quiet": ok and all(r.get("quiet") for r in results.values()),
+        "pipelines": results,
+    }
+    if not ok:
+        failed = {k: r for k, r in results.items() if r.get("status") == "error"}
+        result["error"] = "; ".join(f"{k}: {r['error']}" for k, r in failed.items())
+        result["traceback"] = "\n".join(r.get("traceback", "") for r in failed.values())
+    # Status file omits the raw collected data (the HTML body is kept)
+    write_status({**result, "pipelines": {
+        k: {kk: vv for kk, vv in r.items() if kk != "data"} for k, r in results.items()}})
+    if errors:
+        raise errors[0]
+    return result
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Daily PL 2027 Fundraise pipeline digest")
+    parser = argparse.ArgumentParser(description="Daily fundraise pipeline digests (Palomar + Ariadne)")
     parser.add_argument("--since", help="Window start YYYY-MM-DD (overrides ledger window)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Collect and compose but send no email; run not recorded as window anchor")
