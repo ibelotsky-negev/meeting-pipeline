@@ -65,11 +65,18 @@ def test_parse_ts_invalid_and_empty():
 #  Resilient window (ledger)
 # ----------------------------------------------------------------------
 
-def _insert_run(conn, window_until, status="ok", dry_run=0):
+def _insert_run(conn, window_until, status="ok", dry_run=0, pipeline=None):
+    # pipeline=None omits the column, i.e. a row written before the Ariadne
+    # digest existed (the column default makes it a Palomar row)
+    cols = "run_id, started_at, finished_at, window_since, window_until, stage_moves, "            "activities, flags, quiet, sent, dry_run, status"
+    vals = [f"run-{window_until}-{status}-{dry_run}-{pipeline}", "", "", "", window_until,
+            0, 0, 0, 0, 1, dry_run, status]
+    if pipeline is not None:
+        cols += ", pipeline"
+        vals.append(pipeline)
     conn.execute(
-        "INSERT OR REPLACE INTO digest_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (f"run-{window_until}-{status}-{dry_run}", "", "", "", window_until,
-         0, 0, 0, 0, 1, dry_run, status),
+        f"INSERT OR REPLACE INTO digest_runs ({cols}) VALUES ({','.join('?' * len(vals))})",
+        vals,
     )
     conn.commit()
 
@@ -555,10 +562,11 @@ def stub_collectors(monkeypatch):
     rules, quiet detection, status persistence -- with no network."""
     stage = {"id": "s2", "label": "Value Validation", "probability": 0.4,
              "is_closed": False, "order": 0}
-    monkeypatch.setattr(dpd, "get_pipeline_stages", lambda: [stage])
+    monkeypatch.setattr(dpd, "get_pipeline_stages", lambda pipeline_id=None: [stage])
     monkeypatch.setattr(dpd, "get_all_stage_labels", lambda: {})
     monkeypatch.setattr(dpd, "get_owner_maps", lambda skipped=None: ({}, {}))
-    monkeypatch.setattr(dpd, "get_pipeline_deals", lambda closing_stage_id="": [])
+    monkeypatch.setattr(dpd, "get_portal_id", lambda: "")
+    monkeypatch.setattr(dpd, "get_pipeline_deals", lambda closing_stage_id="", pipeline_id=None: [])
     monkeypatch.setattr(dpd, "collect_activity", lambda *a, **k: [])
     monkeypatch.setattr(dpd, "collect_open_tasks", lambda *a, **k: [])
 
@@ -567,7 +575,7 @@ def test_run_digest_quiet_day_sends_one_liner(ledger, monkeypatch, tmp_path, stu
     monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
     sent = {}
     monkeypatch.setattr(dpd, "send_digest_email",
-                        lambda subject, body: sent.update(subject=subject, body=body))
+                        lambda subject, body, **k: sent.update(subject=subject, body=body))
 
     result = dpd.run_digest(dry_run=False)
     assert result["status"] == "ok"
@@ -581,7 +589,7 @@ def test_run_digest_quiet_day_sends_one_liner(ledger, monkeypatch, tmp_path, stu
 def test_run_digest_dry_run_does_not_send(ledger, monkeypatch, tmp_path, stub_collectors):
     monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
     calls = []
-    monkeypatch.setattr(dpd, "send_digest_email", lambda s, b: calls.append((s, b)))
+    monkeypatch.setattr(dpd, "send_digest_email", lambda s, b, **k: calls.append((s, b)))
     result = dpd.run_digest(dry_run=True)
     assert result["sent"] is False
     assert calls == []
@@ -589,8 +597,11 @@ def test_run_digest_dry_run_does_not_send(ledger, monkeypatch, tmp_path, stub_co
 
 def test_run_digest_records_error_with_traceback(ledger, monkeypatch, tmp_path):
     monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
+    monkeypatch.setattr(dpd, "get_owner_maps", lambda skipped=None: ({}, {}))
+    monkeypatch.setattr(dpd, "get_all_stage_labels", lambda: {})
+    monkeypatch.setattr(dpd, "get_portal_id", lambda: "")
     monkeypatch.setattr(dpd, "get_pipeline_stages",
-                        lambda: (_ for _ in ()).throw(RuntimeError("boom-400")))
+                        lambda pipeline_id=None: (_ for _ in ()).throw(RuntimeError("boom-400")))
     with pytest.raises(RuntimeError):
         dpd.run_digest(dry_run=False)
     status = dpd.read_status()
@@ -632,22 +643,116 @@ def test_run_digest_labels_stage_move_from_other_pipeline(ledger, monkeypatch, t
     monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
     stage = {"id": "s1", "label": "Discovery", "probability": 0.1,
              "is_closed": False, "order": 0}
-    monkeypatch.setattr(dpd, "get_pipeline_stages", lambda: [stage])
+    monkeypatch.setattr(dpd, "get_pipeline_stages", lambda pipeline_id=None: [stage])
     monkeypatch.setattr(dpd, "get_all_stage_labels",
                         lambda: {"old5": "PL 2026 Fundraise / Closing",
                                  "s1": "PL 2027 Fundraise / Discovery"})
     raw = {"id": "d1", "properties": {
         "dealname": "Rolled Over", "dealstage": "s1", "hubspot_owner_id": "",
         "hs_lastmodifieddate": (NOW - timedelta(hours=1)).isoformat()}}
-    monkeypatch.setattr(dpd, "get_pipeline_deals", lambda closing_stage_id="": [raw])
+    monkeypatch.setattr(dpd, "get_pipeline_deals", lambda closing_stage_id="", pipeline_id=None: [raw])
     seen = {}
 
     def fake_deltas(changed_ids, deals_by_id, since, until, by_user, stage_labels):
         seen.update(stage_labels)
         return [], []
     monkeypatch.setattr(dpd, "collect_deltas", fake_deltas)
-    monkeypatch.setattr(dpd, "send_digest_email", lambda s, b: None)
+    monkeypatch.setattr(dpd, "send_digest_email", lambda s, b, **k: None)
     dpd.run_digest(dry_run=True)
     assert seen["old5"] == "PL 2026 Fundraise / Closing"
     # The current pipeline's own (unprefixed) label wins over the all-pipelines map
     assert seen["s1"] == "Discovery"
+
+
+# ----------------------------------------------------------------------
+#  Per-pipeline digests (Palomar -> Ken, Ariadne -> Ken + Shlomi)
+# ----------------------------------------------------------------------
+
+def test_digests_configured():
+    by_key = {c["key"]: c for c in dpd.DIGESTS}
+    assert by_key["palomar"]["id"] == "4252440818"
+    assert by_key["palomar"]["recipients"] == ["bk@negevlabs.com"]
+    assert by_key["ariadne"]["id"] == "4283794618"
+    assert by_key["ariadne"]["recipients"] == ["bk@negevlabs.com", "shlomi@negevlabs.com"]
+
+
+def test_window_is_per_pipeline(ledger):
+    # Legacy row (pipeline column left to its default) anchors Palomar only
+    _insert_run(ledger, (NOW - timedelta(hours=30)).isoformat())
+    _insert_run(ledger, (NOW - timedelta(hours=40)).isoformat(), pipeline="ariadne")
+    assert dpd.get_window_start(ledger, NOW, "palomar") == NOW - timedelta(hours=30)
+    assert dpd.get_window_start(ledger, NOW, "ariadne") == NOW - timedelta(hours=40)
+
+
+def test_window_new_pipeline_defaults_to_24h(ledger):
+    _insert_run(ledger, (NOW - timedelta(hours=30)).isoformat())
+    assert dpd.get_window_start(ledger, NOW, "ariadne") == NOW - timedelta(hours=24)
+
+
+def test_ledger_migrates_old_schema(monkeypatch, tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    monkeypatch.setattr(eps, "LEDGER_PATH", path)
+    old = sqlite3.connect(path)
+    old.execute("""CREATE TABLE digest_runs (run_id TEXT PRIMARY KEY, started_at TEXT,
+        finished_at TEXT, window_since TEXT, window_until TEXT, stage_moves INTEGER,
+        activities INTEGER, flags INTEGER, quiet INTEGER, sent INTEGER, dry_run INTEGER,
+        status TEXT)""")
+    until = (NOW - timedelta(hours=26)).isoformat()
+    old.execute("INSERT INTO digest_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("r1", "", "", "", until, 0, 0, 0, 0, 1, 0, "ok"))
+    old.commit()
+    old.close()
+    conn = dpd.ledger_connect()
+    try:
+        assert dpd.get_window_start(conn, NOW, "palomar") == NOW - timedelta(hours=26)
+        assert dpd.get_window_start(conn, NOW, "ariadne") == NOW - timedelta(hours=24)
+    finally:
+        conn.close()
+
+
+def test_run_digest_sends_one_email_per_pipeline(ledger, monkeypatch, tmp_path, stub_collectors):
+    monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
+    queried = []
+    monkeypatch.setattr(dpd, "get_pipeline_deals",
+                        lambda closing_stage_id="", pipeline_id=None: queried.append(pipeline_id) or [])
+    sent = []
+    monkeypatch.setattr(dpd, "send_digest_email",
+                        lambda subject, body, recipients=None, cc=None, **k:
+                        sent.append((subject, tuple(recipients))))
+    result = dpd.run_digest(dry_run=False)
+    assert queried == ["4252440818", "4283794618"]
+    assert len(sent) == 2
+    assert sent[0][0].startswith("[Sara] Palomar pipeline digest")
+    assert sent[0][1] == ("bk@negevlabs.com",)
+    assert sent[1][0].startswith("[Sara] Ariadne pipeline digest")
+    assert sent[1][1] == ("bk@negevlabs.com", "shlomi@negevlabs.com")
+    assert set(result["pipelines"]) == {"palomar", "ariadne"}
+    # Each pipeline anchored its own window
+    rows = ledger.execute("SELECT pipeline, status FROM digest_runs").fetchall()
+    assert sorted(rows) == [("ariadne", "ok"), ("palomar", "ok")]
+
+
+def test_run_digest_one_pipeline_failure_still_sends_other(ledger, monkeypatch, tmp_path, stub_collectors):
+    monkeypatch.setattr(dpd, "STATUS_PATH", str(tmp_path / "status.json"))
+    stage = {"id": "s2", "label": "Value Validation", "probability": 0.4,
+             "is_closed": False, "order": 0}
+
+    def stages(pipeline_id=None):
+        if pipeline_id == "4283794618":
+            raise RuntimeError("ariadne-403")
+        return [stage]
+    monkeypatch.setattr(dpd, "get_pipeline_stages", stages)
+    sent = []
+    monkeypatch.setattr(dpd, "send_digest_email",
+                        lambda subject, body, **k: sent.append(subject))
+    with pytest.raises(RuntimeError, match="ariadne-403"):
+        dpd.run_digest(dry_run=False)
+    assert len(sent) == 1 and "Palomar" in sent[0]
+    status = dpd.read_status()
+    assert status["status"] == "error"
+    assert status["pipelines"]["palomar"]["sent"] is True
+    assert "ariadne: ariadne-403" in status["error"]
+    # The failure is recorded against Ariadne only, so its window is not advanced
+    rows = ledger.execute("SELECT pipeline, status FROM digest_runs").fetchall()
+    assert sorted(rows) == [("ariadne", "error"), ("palomar", "ok")]

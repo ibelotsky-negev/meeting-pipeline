@@ -195,3 +195,166 @@ def test_log_email_all_associations_ok(monkeypatch):
     assert ("contacts", "c1") in calls
     assert ("deals", "d1") in calls
     assert ("companies", "comp1") in calls
+
+
+# ----------------------------------------------------------------------
+#  Two-pipeline routing (Palomar vs Ariadne fundraise)
+# ----------------------------------------------------------------------
+
+PALOMAR_DEAL = {"id": "dp", "name": "Tetrad - PL 2027", "stage_label": "Discovery", "pipeline": "palomar"}
+ARIADNE_DEAL = {"id": "da", "name": "Tetrad - Ariadne 2027", "stage_label": "Closing", "pipeline": "ariadne"}
+
+
+def _two_pipeline_msg(deals=None):
+    msg = _msg()
+    msg["matched_contacts"]["anna@tetrad.vc"]["deals"] = (
+        [dict(PALOMAR_DEAL), dict(ARIADNE_DEAL)] if deals is None else deals)
+    return msg
+
+
+def test_pipelines_configured_with_ids():
+    by_key = {p["key"]: p["id"] for p in eps.PIPELINES}
+    assert by_key == {"palomar": "4252440818", "ariadne": "4283794618"}
+
+
+def test_parse_classification_routes_to_named_fundraise():
+    msg = _two_pipeline_msg()
+    text = '{"classification": "DEAL_RELEVANT", "fundraise": "ariadne", "reason": "Ariadne SAFE"}'
+    assert eps.parse_classification(text, msg) == ("DEAL_RELEVANT", "Ariadne SAFE", "ariadne")
+    text = 'Sure: {"classification": "DEAL_RELEVANT", "fundraise": "Palomar", "reason": "UPA"}'
+    assert eps.parse_classification(text, msg) == ("DEAL_RELEVANT", "UPA", "palomar")
+
+
+def test_parse_classification_missing_fundraise_single_pipeline_infers_it():
+    msg = _two_pipeline_msg(deals=[dict(ARIADNE_DEAL)])
+    text = '{"classification": "DEAL_RELEVANT", "fundraise": null, "reason": "wire"}'
+    assert eps.parse_classification(text, msg) == ("DEAL_RELEVANT", "wire", "ariadne")
+
+
+def test_parse_classification_missing_fundraise_two_pipelines_is_uncertain():
+    msg = _two_pipeline_msg()
+    text = '{"classification": "DEAL_RELEVANT", "reason": "wire"}'
+    label, reason, pipeline = eps.parse_classification(text, msg)
+    assert (label, pipeline) == ("UNCERTAIN", None)
+    assert "fundraise not identified" in reason
+
+
+def test_parse_classification_fundraise_without_deal_is_uncertain():
+    """An Ariadne email to a contact who only has a Palomar deal is never
+    logged onto the Palomar deal -- it goes to human review."""
+    msg = _two_pipeline_msg(deals=[dict(PALOMAR_DEAL)])
+    text = '{"classification": "DEAL_RELEVANT", "fundraise": "ariadne", "reason": "Ariadne terms"}'
+    label, reason, pipeline = eps.parse_classification(text, msg)
+    assert (label, pipeline) == ("UNCERTAIN", None)
+    assert "Ariadne 2027 Fundraise" in reason
+
+
+def test_parse_classification_legacy_deal_without_pipeline_is_palomar():
+    msg = _msg()  # deal dict carries no "pipeline" key
+    text = '{"classification": "DEAL_RELEVANT", "reason": "KYC"}'
+    assert eps.parse_classification(text, msg) == ("DEAL_RELEVANT", "KYC", "palomar")
+
+
+@pytest.mark.parametrize("text,expected_label,expected_reason", [
+    ('{"classification": "NOT_RELEVANT", "fundraise": "ariadne", "reason": "personal"}',
+     "NOT_RELEVANT", "personal"),
+    ("no json here", "UNCERTAIN", None),
+    ('{"classification": "MAYBE", "reason": "x"}', "UNCERTAIN", None),
+    ('["DEAL_RELEVANT"]', "UNCERTAIN", None),
+])
+def test_parse_classification_non_routed_outcomes(text, expected_label, expected_reason):
+    label, reason, pipeline = eps.parse_classification(text, _two_pipeline_msg())
+    assert label == expected_label
+    assert pipeline is None
+    if expected_reason is not None:
+        assert reason == expected_reason
+
+
+def test_associations_restricted_to_routed_pipeline(monkeypatch):
+    monkeypatch.setattr(eps, "get_associated_ids", lambda *a: ["comp1"])
+    calls = []
+    monkeypatch.setattr(eps, "create_default_association",
+                        lambda email_id, to_type, to_id: calls.append((to_type, to_id)))
+    failed = eps.ensure_engagement_associations("999", _two_pipeline_msg(), "ariadne")
+    assert failed == []
+    assert ("deals", "da") in calls
+    assert ("deals", "dp") not in calls
+    assert ("contacts", "c1") in calls and ("companies", "comp1") in calls
+
+
+def test_associations_unrouted_links_every_deal(monkeypatch):
+    monkeypatch.setattr(eps, "get_associated_ids", lambda *a: [])
+    calls = []
+    monkeypatch.setattr(eps, "create_default_association",
+                        lambda email_id, to_type, to_id: calls.append((to_type, to_id)))
+    eps.ensure_engagement_associations("999", _two_pipeline_msg(), None)
+    assert {("deals", "da"), ("deals", "dp")} <= set(calls)
+
+
+def test_detail_pipeline_roundtrip():
+    assert eps.detail_pipeline("engagement=42; pipeline=ariadne; failed=deals:da") == "ariadne"
+    assert eps.detail_pipeline("engagement=42; failed=deals:d1") is None
+    assert eps.detail_pipeline("engagement=42; pipeline=bogus; x") is None
+
+
+def test_build_roster_tags_deals_with_pipeline(monkeypatch):
+    deals_by_pipeline = {
+        "4252440818": [{"id": "dp", "properties": {"dealname": "P deal", "dealstage": "s1"}}],
+        "4283794618": [{"id": "da", "properties": {"dealname": "A deal", "dealstage": "s9"}}],
+    }
+    monkeypatch.setattr(eps, "get_stage_labels", lambda pid=None: {"s1": "Discovery", "s9": "Closing"})
+    monkeypatch.setattr(eps, "get_pipeline_deals", lambda pid=None: deals_by_pipeline[pid])
+    monkeypatch.setattr(eps, "get_associated_ids", lambda f, i, t: ["c1"])
+    monkeypatch.setattr(eps, "batch_read_contacts", lambda ids: [
+        {"id": "c1", "properties": {"email": "anna@tetrad.vc", "firstname": "Anna"}}])
+    roster = eps.build_roster()
+    deals = {d["id"]: d for d in roster["anna@tetrad.vc"]["deals"]}
+    assert deals["dp"]["pipeline"] == "palomar"
+    assert deals["da"]["pipeline"] == "ariadne"
+    assert deals["da"]["stage_label"] == "Closing"
+
+
+def _stub_run(monkeypatch, msg, classification):
+    entry = msg["matched_contacts"]["anna@tetrad.vc"]
+    monkeypatch.setattr(eps, "build_roster", lambda: {"anna@tetrad.vc": entry})
+    monkeypatch.setattr(eps, "scan_mailbox", lambda *a: {msg["internet_message_id"]: msg})
+    monkeypatch.setattr(eps, "find_logged_engagement", lambda m, cid: "")
+    monkeypatch.setattr(eps, "classify_email", lambda m: classification)
+    logged = []
+    monkeypatch.setattr(eps, "log_email_to_hubspot",
+                        lambda m, pipeline_key=None: logged.append(pipeline_key) or ("777", []))
+    return logged
+
+
+def test_run_sync_logs_to_routed_pipeline(ledger, monkeypatch):
+    msg = _two_pipeline_msg()
+    logged = _stub_run(monkeypatch, msg, ("DEAL_RELEVANT", "Ariadne SAFE", "ariadne"))
+    stats = eps.run_sync("2026-11-01", "2026-11-07", ["bk@negevlabs.com"],
+                         dry_run=False, send_report=False)
+    assert logged == ["ariadne"]
+    assert stats["logged"] == 1
+    assert stats["logged_by_pipeline"] == {"ariadne": 1}
+    outcome, detail = eps.ledger_get(ledger, msg["internet_message_id"])
+    assert outcome == "logged" and "pipeline=ariadne" in detail
+
+
+def test_run_sync_partial_retry_keeps_routed_pipeline(ledger, monkeypatch):
+    msg = _two_pipeline_msg()
+    _stub_run(monkeypatch, msg, ("DEAL_RELEVANT", "x", "ariadne"))
+    eps.ledger_record(ledger, msg, "logged-partial",
+                      "engagement=777; pipeline=ariadne; failed=deals:da", "run0")
+    seen = []
+    monkeypatch.setattr(eps, "ensure_engagement_associations",
+                        lambda eid, m, pipeline_key=None: seen.append((eid, pipeline_key)) or [])
+    stats = eps.run_sync("2026-11-01", "2026-11-07", ["bk@negevlabs.com"],
+                         dry_run=False, send_report=False)
+    assert seen == [("777", "ariadne")]
+    assert stats["repaired"] == 1
+
+
+def test_build_report_splits_logged_by_pipeline():
+    stats = {"scanned": 3, "logged": 3, "duplicates": 0, "irrelevant": 0, "uncertain": 0,
+             "errors": 0, "logged_by_pipeline": {"palomar": 2, "ariadne": 1}}
+    report = eps.build_report(stats, [], [], [], "w", False)
+    assert "Logged:     3 (Palomar 2, Ariadne 1)" in report
+    assert "4283794618" in report and "4252440818" in report
