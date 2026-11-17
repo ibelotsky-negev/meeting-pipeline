@@ -189,6 +189,7 @@ contacts' deals in that one pipeline. Full spec: `email-pipeline-sync-spec.md`.
 - `--dry-run` -- no HubSpot writes, no report email, no ledger message rows
 - Reuses existing env vars: HUBSPOT_API_KEY, CLAUDE_API_KEY, MS_GRAPH_CLIENT_ID/SECRET/TENANT_ID, BOT_SENDER_EMAIL
 - Requires app-only Graph auth (Mail.Read application permission) for multi-mailbox scan; inaccessible mailboxes (e.g. shlomi@ariadnebio.com, separate tenant) are skipped and reported, not fatal
+- **Team identity is domain-based** (`is_team_address` -> `config.is_internal_email`, i.e. `INTERNAL_DOMAINS`), never a hardcoded address list. It drives the in-scope check (a thread needs one team party), roster exclusion, and EMAIL vs INCOMING_EMAIL direction. Through 2.38.0 it was a pre-rename list with no @palomar-labs.com address, so the team's real mailboxes went unscanned and a 1:1 from ken@palomar-labs.com to an investor was dropped as `no internal party on thread` (reported as Irrelevant). Scanned mailboxes: `DEFAULT_MAILBOXES` (the four @palomar-labs.com team boxes + legacy negevlabs/negevcap/ariadnebio boxes), overridable with `EMAIL_SYNC_MAILBOXES` (comma-separated)
 - Ledger: SQLite at `/data/email_pipeline_sync.db` (Railway volume) or project dir locally
 - UNCERTAIN classifications are never auto-logged -- they go to the run report for human review
 - **Pipeline routing** (`parse_classification`, pure + tested): the classifier returns a
