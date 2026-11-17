@@ -358,3 +358,72 @@ def test_build_report_splits_logged_by_pipeline():
     report = eps.build_report(stats, [], [], [], "w", False)
     assert "Logged:     3 (Palomar 2, Ariadne 1)" in report
     assert "4283794618" in report and "4252440818" in report
+
+
+# ----------------------------------------------------------------------
+#  Team identity after the Negev -> Palomar rename
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("addr", [
+    "ken@palomar-labs.com", "Dan@Palomar-Labs.com", "kostia@palomar-labs.com",
+    "bk@negevlabs.com", "vu@negevcap.com", "shlomi@ariadnebio.com",
+])
+def test_is_team_address_covers_every_internal_domain(addr):
+    assert eps.is_team_address(addr)
+
+
+@pytest.mark.parametrize("addr", ["anna@tetrad.vc", "mark.r.garber@gmail.com", "", None])
+def test_is_team_address_rejects_external(addr):
+    assert not eps.is_team_address(addr)
+
+
+def test_default_mailboxes_include_palomar_team():
+    for box in ("ken@palomar-labs.com", "shlomi@palomar-labs.com",
+                "dan@palomar-labs.com", "kostia@palomar-labs.com"):
+        assert box in eps.DEFAULT_MAILBOXES
+    assert len(eps.DEFAULT_MAILBOXES) == len(set(eps.DEFAULT_MAILBOXES))
+
+
+def test_run_sync_palomar_sender_is_in_scope(ledger, monkeypatch):
+    # A 1:1 from ken@palomar-labs.com to an investor used to be dropped as
+    # "no internal party on thread" before the classifier ever saw it.
+    msg = _two_pipeline_msg()
+    msg["from"] = "ken@palomar-labs.com"
+    msg["mailbox"] = "ken@palomar-labs.com"
+    msg["participants"] = {"ken@palomar-labs.com", "anna@tetrad.vc"}
+    logged = _stub_run(monkeypatch, msg, ("DEAL_RELEVANT", "follow-up", "palomar"))
+    stats = eps.run_sync("2026-11-14", "2026-11-18", ["ken@palomar-labs.com"],
+                         dry_run=False, send_report=False)
+    assert logged == ["palomar"]
+    assert stats["irrelevant"] == 0
+
+
+def test_log_email_palomar_sender_is_outgoing(monkeypatch):
+    posted = {}
+
+    def fake_request(method, endpoint, data=None, params=None):
+        posted["data"] = data
+        return {"id": "999"}
+
+    monkeypatch.setattr(eps, "hubspot_request", fake_request)
+    monkeypatch.setattr(eps, "get_associated_ids", lambda *a: [])
+    monkeypatch.setattr(eps, "create_default_association", lambda *a: None)
+    msg = _msg()
+    msg["from"] = "ken@palomar-labs.com"
+    msg["participants"] = {"ken@palomar-labs.com", "anna@tetrad.vc"}
+    eps.log_email_to_hubspot(msg)
+    assert posted["data"]["properties"]["hs_email_direction"] == "EMAIL"
+
+
+def test_build_roster_excludes_palomar_team_contact(monkeypatch):
+    monkeypatch.setattr(eps, "get_stage_labels", lambda pid=None: {})
+    monkeypatch.setattr(eps, "get_pipeline_deals", lambda pid=None: [
+        {"id": "d" + pid, "properties": {"dealname": "x", "dealstage": "s"}}])
+    monkeypatch.setattr(eps, "get_associated_ids", lambda f, i, t: ["c1", "c2"])
+    monkeypatch.setattr(eps, "batch_read_contacts", lambda ids: [
+        {"id": "c1", "properties": {"email": "anna@tetrad.vc"}},
+        {"id": "c2", "properties": {"email": "ken@palomar-labs.com"}}])
+    roster = eps.build_roster()
+    assert "anna@tetrad.vc" in roster
+    assert "ken@palomar-labs.com" not in roster

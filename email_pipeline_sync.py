@@ -37,6 +37,8 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+from config import is_internal_email
+
 # Local testing convenience: load credentials from .env in the project dir
 # (Railway injects real env vars in production; .env is gitignored)
 try:
@@ -102,21 +104,39 @@ PIPELINES = [
 ]
 PIPELINES_BY_KEY = {p["key"]: p for p in PIPELINES}
 
-# Internal senders/recipients -- an email is in scope only when a roster contact
-# appears on the thread AND at least one of these addresses is present.
-INTERNAL_TEAM_EMAILS = [
+# Team identity is DOMAIN-based (config.INTERNAL_DOMAINS), not a hardcoded
+# address list. The old list predated the Negev -> Palomar rename and held no
+# @palomar-labs.com address, so mail sent from ken@palomar-labs.com was dropped
+# as "no internal party on thread", logged as INCOMING, and the palomar-labs.com
+# mailboxes -- where the team actually works -- were never scanned.
+
+
+def is_team_address(address) -> bool:
+    """True for any address on an internal domain (any team alias)."""
+    return is_internal_email((address or "").strip())
+
+
+# Mailboxes scanned each run. Override with EMAIL_SYNC_MAILBOXES
+# (comma-separated). Legacy negevlabs/negevcap boxes stay in the list: a box
+# that no longer exists 403/404s and is reported as skipped, never fatal, and
+# cross-mailbox copies are merged on internetMessageId. shlomi@ariadnebio.com
+# is a separate tenant and may be skipped the same way.
+_DEFAULT_MAILBOXES = [
+    "ken@palomar-labs.com",
+    "shlomi@palomar-labs.com",
+    "dan@palomar-labs.com",
+    "kostia@palomar-labs.com",
+    "shlomi@ariadnebio.com",
     "bk@negevlabs.com",
+    "shlomi@negevlabs.com",
     "bk@negevcap.com",
     "ak@negevcap.com",
     "vu@negevcap.com",
-    "shlomi@negevlabs.com",
-    "shlomi@ariadnebio.com",
 ]
-
-# Mailboxes scanned each run. shlomi@ariadnebio.com is a separate tenant and may
-# fail with 403/404 until access is arranged -- the run degrades gracefully and
-# reports which mailboxes were skipped.
-DEFAULT_MAILBOXES = list(INTERNAL_TEAM_EMAILS)
+_MAILBOXES_ENV = os.environ.get("EMAIL_SYNC_MAILBOXES", "")
+DEFAULT_MAILBOXES = list(dict.fromkeys(
+    m.strip().lower() for m in (_MAILBOXES_ENV.split(",") if _MAILBOXES_ENV.strip() else _DEFAULT_MAILBOXES)
+    if m.strip()))
 
 REPORT_RECIPIENT = os.environ.get("EMAIL_SYNC_REPORT_TO", "bk@negevlabs.com")
 CLASSIFIER_MODEL = os.environ.get("EMAIL_SYNC_MODEL", "claude-haiku-4-5-20251001")
@@ -416,12 +436,11 @@ def build_roster() -> dict:
 
     roster = {}
     contact_count = 0
-    internal = set(INTERNAL_TEAM_EMAILS)
     for contact in batch_read_contacts(list(contact_to_deals.keys())):
         cid = str(contact.get("id", ""))
         props = contact.get("properties") or {}
         # Internal team members associated to deals are not roster contacts
-        addresses = [a for a in contact_email_addresses(props) if a not in internal]
+        addresses = [a for a in contact_email_addresses(props) if not is_team_address(a)]
         if not addresses:
             continue
         name = " ".join(p for p in [props.get("firstname"), props.get("lastname")] if p) or addresses[0]
@@ -791,7 +810,7 @@ def log_email_to_hubspot(msg: dict, pipeline_key: str = None) -> tuple:
     except (ValueError, TypeError):
         ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-    direction = "EMAIL" if msg.get("from", "") in INTERNAL_TEAM_EMAILS else "INCOMING_EMAIL"
+    direction = "EMAIL" if is_team_address(msg.get("from", "")) else "INCOMING_EMAIL"
     to_addrs = sorted(a for a in msg.get("participants") or set() if a != msg.get("from", ""))
     headers_json = json.dumps({
         "from": {"email": msg.get("from", "")},
@@ -927,7 +946,6 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
              "uncertain": 0, "repaired": 0, "partial": 0, "errors": 0,
              "logged_by_pipeline": {}}
     uncertain_msgs = []
-    internal = set(INTERNAL_TEAM_EMAILS)
 
     # Date-ordered processing (oldest first) for backfill sanity
     ordered = sorted(messages.values(), key=lambda m: m.get("received", ""))
@@ -958,7 +976,7 @@ def run_sync(since: str, until: str, mailboxes: list, dry_run: bool, send_report
             continue  # processed in a previous run; not counted as duplicate
 
         # Scope check: at least one internal party on the thread
-        if not (msg.get("participants") or set()) & internal:
+        if not any(is_team_address(a) for a in (msg.get("participants") or set())):
             ledger_record(conn, msg, "skipped-irrelevant", "no internal party on thread", run_id, dry_run)
             stats["irrelevant"] += 1
             continue
