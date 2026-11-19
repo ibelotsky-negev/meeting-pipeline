@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Config and config-domain primitives live in config.py. Re-exported here
 # so existing references and tests (app_module.X) keep resolving. ASCII-only.
-from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_API_KEY, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_REFRESH_TOKEN, MS_GRAPH_AUTH_MODE, ASANA_WORKSPACE_GID, ASANA_PROJECT_GID, HUBSPOT_OWNER_ID, POLL_INTERVAL_MINUTES, APP_BASE_URL, NOTIFY_VIA, SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, BOT_SENDER_EMAIL, BOT_SENDER_NAME, INTERNAL_DOMAINS, HUBSPOT_OWNER_MAP_RAW, HUBSPOT_OWNER_MAP, TEAM_MEMBER_NAMES_RAW, TEAM_MEMBER_NAMES, TEAM_MEMBERS_LIST, EMAIL_ALIAS_MAP, EMAIL_ALIAS_MAP_RAW, DATA_DIR, PROCESSED_FILE, PENDING_FILE, SYNC_MAP_FILE, TODO_LIST_NAME, TODO_POLL_INTERVAL, RAILWAY_PUBLIC_URL, TEAMS_WEBHOOK_SECRET, TEAMS_TRANSCRIPT_ENABLED, TEAMS_ORGANIZER_USER_ID, TEAMS_POLL_USER_IDS, TEAMS_POLL_INTERVAL, SUBSCRIPTION_FILE, PULSE_RECIPIENTS, PULSE_SENDER, PULSE_DOMAINS, PULSE_ARCHIVE_DIR, PULSE_LOOKBACK_DAYS, PULSE_MAX_INPUT_CHARS, PULSE_MAX_CHUNKS, PULSE_RATE_LIMIT_SECONDS, PULSE_TEAM_DOMAINS, PULSE_SKIP_CHAT_TYPES, PULSE_CHAT_PAGE_LIMIT, PULSE_MESSAGE_PAGE_LIMIT, BRIEFING_BOOK_PATH, BRIEFING_BOOK_REPO, PULSE_SKIP_SENDERS, PULSE_SKIP_DOMAINS, PULSE_SKIP_SUBJECTS, normalize_team_email, load_briefing_book, is_internal_email, resolve_internal_organizer)  # noqa: F401
+from config import (FIREFLIES_API_KEY, CLAUDE_API_KEY, HUBSPOT_API_KEY, ASANA_API_KEY, MS_GRAPH_CLIENT_ID, MS_GRAPH_CLIENT_SECRET, MS_GRAPH_TENANT_ID, MS_GRAPH_REFRESH_TOKEN, MS_GRAPH_AUTH_MODE, ASANA_WORKSPACE_GID, ASANA_PROJECT_GID, HUBSPOT_OWNER_ID, POLL_INTERVAL_MINUTES, APP_BASE_URL, NOTIFY_VIA, SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, BOT_SENDER_EMAIL, BOT_SENDER_NAME, INTERNAL_DOMAINS, HUBSPOT_OWNER_MAP_RAW, HUBSPOT_OWNER_MAP, TEAM_MEMBER_NAMES_RAW, TEAM_MEMBER_NAMES, TEAM_MEMBERS_LIST, EMAIL_ALIAS_MAP, EMAIL_ALIAS_MAP_RAW, DATA_DIR, PROCESSED_FILE, PENDING_FILE, SYNC_MAP_FILE, TODO_LIST_NAME, TODO_POLL_INTERVAL, RAILWAY_PUBLIC_URL, TEAMS_WEBHOOK_SECRET, TEAMS_TRANSCRIPT_ENABLED, TEAMS_ORGANIZER_USER_ID, TEAMS_POLL_USER_IDS, TEAMS_POLL_INTERVAL, SUBSCRIPTION_FILE, PULSE_RECIPIENTS, PULSE_SENDER, PULSE_DOMAINS, PULSE_ARCHIVE_DIR, PULSE_LOOKBACK_DAYS, PULSE_MAX_INPUT_CHARS, PULSE_MAX_CHUNKS, PULSE_RATE_LIMIT_SECONDS, PULSE_TEAM_DOMAINS, PULSE_SKIP_CHAT_TYPES, PULSE_CHAT_PAGE_LIMIT, PULSE_MESSAGE_PAGE_LIMIT, BRIEFING_BOOK_PATH, BRIEFING_BOOK_REPO, PULSE_SKIP_SENDERS, PULSE_SKIP_DOMAINS, PULSE_SKIP_SUBJECTS, normalize_team_email, load_briefing_book, is_internal_email, resolve_internal_organizer, delivery_addresses)  # noqa: F401
 from prompts import (PULSE_SCOPE, PULSE_ANTI_HALLUCINATION, PULSE_EMAIL_PROMPT, PULSE_TEAMS_PROMPT, PULSE_MEETINGS_PROMPT, PULSE_SYNTHESIS_PROMPT, PULSE_BRIEFING_UPDATE_PROMPT)  # noqa: F401
 from templates import REVIEW_TEMPLATE, RESULT_TEMPLATE  # noqa: F401
 from datetime_utils import to_hubspot_ms, to_graph_datetime, resolve_due_date  # noqa: F401
@@ -1498,7 +1498,7 @@ def pulse_send_email(report_markdown, period_start, period_end, recipients=None)
 
     token = get_ms_graph_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    to_list = [{"emailAddress": {"address": r}} for r in to_addrs]
+    to_list = [{"emailAddress": {"address": r}} for r in delivery_addresses(to_addrs)]
     send_payload = {
         "message": {
             "subject": subject,
@@ -2141,7 +2141,7 @@ def notify_organizer(recipients, approval_id: str, meeting_title: str, intellige
                         "contentType": "HTML",
                         "content": email_html,
                     },
-                    "toRecipients": [{"emailAddress": {"address": r}} for r in recipients],
+                    "toRecipients": [{"emailAddress": {"address": r}} for r in delivery_addresses(recipients)],
                 },
             }
             if transcript_attachment:
@@ -4181,7 +4181,7 @@ def corrections_delete():
 
 @app.route("/version", methods=["GET"])
 def version():
-    return jsonify({"version": "2.38.1-email-sync-palomar-team", "deployed": "2026-11-17"})
+    return jsonify({"version": "2.38.2-deliver-palomar", "deployed": "2026-11-19"})
 
 
 @app.route("/config", methods=["GET"])
@@ -4249,7 +4249,7 @@ def test_pipeline():
     """Dry-run: fetch transcript, extract intelligence, test To-Do API, report pass/fail."""
     import time as _time
     import traceback as _tb
-    results = {"version": "2.38.1-email-sync-palomar-team", "steps": {}}
+    results = {"version": "2.38.2-deliver-palomar", "steps": {}}
     try:
         # Step 1: Fetch recent transcript
         t0 = _time.time()
@@ -5079,7 +5079,7 @@ def pulse_weekly_run():
                         "contentType": "Text",
                         "content": f"Weekly pulse generation failed.\n\nError: {str(e)}\n\nCheck Railway logs for details.",
                     },
-                    "toRecipients": [{"emailAddress": {"address": r}} for r in PULSE_RECIPIENTS],
+                    "toRecipients": [{"emailAddress": {"address": r}} for r in delivery_addresses(PULSE_RECIPIENTS)],
                     "from": {"emailAddress": {"name": BOT_SENDER_NAME, "address": PULSE_SENDER}},
                 },
             }

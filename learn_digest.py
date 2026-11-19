@@ -42,6 +42,7 @@ from datetime import datetime, timezone, timedelta
 
 # Shared Graph helpers (app-only token, retrying GET/POST, html_to_text).
 import email_pipeline_sync as eps
+from config import delivery_addresses
 # Generic Asana request helper (project + section routing done here).
 import asana_client
 
@@ -51,7 +52,7 @@ logger = logging.getLogger("learn-digest")
 #  CONFIG
 # ======================================================================
 
-MAILBOX = "bk@negevlabs.com"
+MAILBOX = os.environ.get("LEARN_MAILBOX", "ken@palomar-labs.com")
 
 # The "/" in "read/learn" defeats Graph display-name lookup -- address by the
 # cached folder ID (seeded with the known ID; never look up by name).
@@ -1774,7 +1775,7 @@ def send_digest_email(subject: str, body: str, content_type: str = "HTML"):
     message = {
         "subject": subject,
         "body": {"contentType": content_type, "content": body},
-        "toRecipients": [{"emailAddress": {"address": r}} for r in LEARN_RECIPIENTS],
+        "toRecipients": [{"emailAddress": {"address": r}} for r in delivery_addresses(LEARN_RECIPIENTS)],
     }
     eps.graph_post(f"{eps.MS_GRAPH_BASE}/users/{sender}/sendMail",
                    {"message": message, "saveToSentItems": False})

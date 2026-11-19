@@ -1402,7 +1402,8 @@ def _send_email(to_list: list, subject: str, html_body: str):
         "message": {
             "subject": subject,
             "body": {"contentType": "HTML", "content": html_body},
-            "toRecipients": [{"emailAddress": {"address": a}} for a in to_list],
+            "toRecipients": [{"emailAddress": {"address": a}}
+                             for a in config.delivery_addresses(to_list)],
         },
         "saveToSentItems": False,
     }

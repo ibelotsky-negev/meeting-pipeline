@@ -37,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from config import is_internal_email
+from config import is_internal_email, delivery_addresses
 
 # Local testing convenience: load credentials from .env in the project dir
 # (Railway injects real env vars in production; .env is gitignored)
@@ -885,7 +885,7 @@ def send_report_email(report: str, window: str):
         "message": {
             "subject": f"[email-pipeline-sync] Run report {window}",
             "body": {"contentType": "text", "content": report},
-            "toRecipients": [{"emailAddress": {"address": REPORT_RECIPIENT}}],
+            "toRecipients": [{"emailAddress": {"address": a}} for a in delivery_addresses(REPORT_RECIPIENT)],
         },
         "saveToSentItems": False,
     }

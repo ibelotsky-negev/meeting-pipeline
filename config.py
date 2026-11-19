@@ -132,6 +132,56 @@ def normalize_team_email(email: str) -> str:
     return EMAIL_ALIAS_MAP.get(email_lower, email_lower)
 
 
+# Mail DELIVERY map: canonical identity -> the mailbox the person actually reads.
+# DELIBERATELY SEPARATE from EMAIL_ALIAS_MAP, which runs the other way: identity
+# (HubSpot owner map, Asana, To-Do sync, TEAM_MEMBER_NAMES) stays on the
+# canonical @negevlabs.com addresses, but after the Palomar rename the team
+# reads @palomar-labs.com. Before this map every Sara email went to the
+# canonical address -- i.e. the old mailbox. Apply it ONLY where an address is
+# used as a mail recipient (`delivery_addresses`), never to identity lookups.
+MAIL_DELIVERY_MAP = {
+    "bk@negevlabs.com": "ken@palomar-labs.com",
+    "shlomi@negevlabs.com": "shlomi@palomar-labs.com",
+    "dan@negevlabs.com": "dan@palomar-labs.com",
+    "ka@negevlabs.com": "kostia@palomar-labs.com",
+}
+_MAIL_DELIVERY_MAP_RAW = os.environ.get("MAIL_DELIVERY_MAP", "")
+if _MAIL_DELIVERY_MAP_RAW:
+    try:
+        MAIL_DELIVERY_MAP.update(
+            {str(k).strip().lower(): str(v).strip()
+             for k, v in json.loads(_MAIL_DELIVERY_MAP_RAW).items()})
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        logger.warning("MAIL_DELIVERY_MAP env var is not a JSON object -- ignored")
+
+
+def delivery_address(email: str) -> str:
+    """Address to SEND to for `email`: any team alias resolves to its canonical
+    identity, then to that person's delivery mailbox. Non-team addresses pass
+    through unchanged (stripped)."""
+    if not email:
+        return email
+    raw = email.strip()
+    canonical = normalize_team_email(raw)
+    return MAIL_DELIVERY_MAP.get(canonical, raw)
+
+
+def delivery_addresses(emails) -> list:
+    """`delivery_address` over a list (or a single string), dropping blanks and
+    de-duplicating case-insensitively while keeping order -- an env list naming
+    both bk@negevlabs.com and ken@palomar-labs.com must not send twice."""
+    if isinstance(emails, str):
+        emails = [emails]
+    out, seen = [], set()
+    for e in emails or []:
+        addr = delivery_address(e)
+        if not addr or addr.lower() in seen:
+            continue
+        seen.add(addr.lower())
+        out.append(addr)
+    return out
+
+
 # Track processed transcripts and pending approvals
 # Railway volume mount: attach a volume at /data for persistence across deploys
 DATA_DIR = os.environ.get("DATA_DIR", "/data")

@@ -23,6 +23,10 @@ def fue_files(monkeypatch, tmp_path):
     monkeypatch.setattr(fue, "REGISTRY_PATH", str(tmp_path / "followups.json"))
     monkeypatch.setattr(fue, "PROCESSED_PATH", str(tmp_path / "processed.json"))
     monkeypatch.setattr(fue, "STATUS_PATH", str(tmp_path / "status.json"))
+    # These tests pin owner ROUTING on canonical identities; the separate
+    # canonical -> @palomar-labs.com delivery rewrite is pinned in
+    # tests/test_mail_delivery.py, so it is switched off here.
+    monkeypatch.setattr(config, "MAIL_DELIVERY_MAP", {})
     return tmp_path
 
 
