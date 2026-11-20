@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 
 # Shared Graph auth + HTTP helpers (retry, token cache)
 import email_pipeline_sync as eps
+from config import delivery_addresses
 
 logger = logging.getLogger("biweekly-business-update")
 
@@ -331,7 +332,7 @@ def send_update_email(subject: str, html_body: str, recipients: list = None):
     sender = os.environ.get("BOT_SENDER_EMAIL", "")
     if not sender:
         raise RuntimeError("BOT_SENDER_EMAIL not set -- update not emailed")
-    recipients = recipients or BIWEEKLY_RECIPIENTS
+    recipients = delivery_addresses(recipients or BIWEEKLY_RECIPIENTS)
     message = {
         "subject": subject,
         "body": {"contentType": "HTML", "content": html_body},

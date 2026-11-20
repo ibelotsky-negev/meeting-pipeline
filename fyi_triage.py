@@ -50,6 +50,7 @@ from datetime import datetime, timezone, timedelta
 
 # Shared Graph helpers (app-only token, retrying GET/POST, html_to_text).
 import email_pipeline_sync as eps
+from config import delivery_addresses
 
 logger = logging.getLogger("fyi-triage")
 
@@ -57,7 +58,7 @@ logger = logging.getLogger("fyi-triage")
 #  CONFIG
 # ======================================================================
 
-MAILBOX = os.environ.get("FYI_MAILBOX", "bk@negevlabs.com")
+MAILBOX = os.environ.get("FYI_MAILBOX", "ken@palomar-labs.com")
 
 # Folders are addressed by DISPLAY NAME, resolved live via Graph at run time
 # (resolve_folder_map). IDs are NEVER hardcoded for addressing.
@@ -69,6 +70,10 @@ DEST_FOLDER_NAME = "2: FYI"
 # below, it logs a loud warning (a folder may have been renamed/recreated) but
 # still uses the live value. These are NOT used for addressing and NOT a fallback.
 # The "-" in the FYI id is the URL-safe base64 form of "/" (raw Graph id).
+# Folder ids are per-MAILBOX: they were confirmed in the old bk@negevlabs.com
+# box, so the cross-check only runs when MAILBOX is that box. After the move to
+# ken@palomar-labs.com it would warn on every run for no reason.
+EXPECTED_FOLDER_IDS_MAILBOX = "bk@negevlabs.com"
 EXPECTED_FOLDER_IDS = {
     "2: FYI": "AAMkAGY0Nzc0N2Q0LWU2NWYtNDFlMi05MmM3LWI5ZWIwODY5ZDA4YwAuAAAAAAD2HZAEgE0dQ6DKSpP8o42sAQBxq2Btx8bBQbRoRXyUmqLCAAbaALi-AAA=",
     "4: notification": "AAMkAGY0Nzc0N2Q0LWU2NWYtNDFlMi05MmM3LWI5ZWIwODY5ZDA4YwAuAAAAAAD2HZAEgE0dQ6DKSpP8o42sAQBxq2Btx8bBQbRoRXyUmqLCAAbaALi9AAA=",
@@ -420,7 +425,8 @@ def resolve_folder_map(force: bool = False) -> dict:
             missing.append(name)
             continue
         resolved[name] = fid
-        expected = EXPECTED_FOLDER_IDS.get(name)
+        expected = (EXPECTED_FOLDER_IDS.get(name)
+                    if MAILBOX.strip().lower() == EXPECTED_FOLDER_IDS_MAILBOX else None)
         if expected and fid != expected:
             logger.warning(
                 f"[fyi] Folder '{name}' resolved to a DIFFERENT id than expected "
@@ -763,7 +769,7 @@ def send_summary_email(subject: str, body: str):
     message = {
         "subject": subject,
         "body": {"contentType": "HTML", "content": body},
-        "toRecipients": [{"emailAddress": {"address": r}} for r in FYI_RECIPIENTS],
+        "toRecipients": [{"emailAddress": {"address": r}} for r in delivery_addresses(FYI_RECIPIENTS)],
     }
     eps.graph_post(f"{eps.MS_GRAPH_BASE}/users/{sender}/sendMail",
                    {"message": message, "saveToSentItems": False})

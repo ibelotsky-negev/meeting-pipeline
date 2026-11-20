@@ -176,11 +176,13 @@ class TestSendEmailRecipients:
 
     def test_override_replaces_the_distribution_list(self, monkeypatch):
         to = self._send(monkeypatch, ["bk@negevlabs.com"])
-        assert to == ["bk@negevlabs.com"]
+        # Canonical identity is DELIVERED to the person's current mailbox.
+        assert to == ["ken@palomar-labs.com"]
         assert "vu@negevcap.com" not in to
 
     def test_default_is_the_configured_list(self, monkeypatch):
-        assert self._send(monkeypatch, None) == list(app_module.PULSE_RECIPIENTS)
+        assert self._send(monkeypatch, None) == app_module.delivery_addresses(
+            app_module.PULSE_RECIPIENTS)
 
 
 # ----------------------------------------------------------------------

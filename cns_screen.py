@@ -1309,7 +1309,8 @@ def send_digest(subject: str, html: str, recipients=None) -> bool:
     if not sender:
         logger.warning("[cns] BOT_SENDER_EMAIL not set -- digest not emailed")
         return False
-    to = recipients or CNS_RECIPIENTS
+    from config import delivery_addresses
+    to = delivery_addresses(recipients or CNS_RECIPIENTS)
     if not to:
         logger.warning("[cns] no CNS_RECIPIENTS configured -- digest not emailed")
         return False

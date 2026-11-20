@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 
 # Shared HTTP helpers (retry, auth), pipeline id, ledger path, html_to_text
 import email_pipeline_sync as eps
+from config import delivery_addresses
 
 logger = logging.getLogger("daily-pipeline-digest")
 
@@ -963,6 +964,8 @@ def send_digest_email(subject: str, body: str, content_type: str = "HTML",
         raise RuntimeError("BOT_SENDER_EMAIL not set -- digest not emailed")
     recipients = DIGEST_RECIPIENTS if recipients is None else recipients
     cc = DIGEST_CC if cc is None else cc
+    recipients = delivery_addresses(recipients)
+    cc = delivery_addresses(cc)
     if not recipients:
         raise RuntimeError(f"no recipients configured -- digest '{subject}' not emailed")
     message = {

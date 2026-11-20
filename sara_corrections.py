@@ -49,7 +49,7 @@ SARA_MAILBOX = os.environ.get("BOT_SENDER_EMAIL", "sara@palomar-labs.com")
 CORRECTIONS_ALLOW = {
     a.strip().lower()
     for a in os.environ.get(
-        "CORRECTIONS_ALLOW", "bk@negevlabs.com,ibelotsky@gmail.com").split(",")
+        "CORRECTIONS_ALLOW", "bk@negevlabs.com,ken@palomar-labs.com,ibelotsky@gmail.com").split(",")
     if a.strip()
 }
 
